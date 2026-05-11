@@ -38,8 +38,6 @@ cd tools/search && make
 cp ak_search ../../server/bin/ak_search
 ```
 
-Source is vendored in [`tools/search/`](tools/search/) (mirrored from upstream [AlgoKiller/tools/search](https://github.com/lidongyooo/AlgoKiller/tree/main/tools/search)). The repo ships an arm64-macOS prebuilt binary; rebuild with the command above for other platforms.
-
 ---
 
 ## Install
@@ -157,19 +155,6 @@ printf '%s\n' \
 ```
 
 Expect: `initialize` response + `tools/list` advertising 7 tools.
-
----
-
-## Design rationale
-
-Thin-shell variant — Claude Desktop is the agent; this plugin contributes only:
-
-- native `ak_search` engine (GB-scale mmap + 1-based line index + ASCII case-insensitive substring search + daemon mode)
-- `trace_search` byte-reversal / leading-zero-trim fallback on 0x-prefixed hex queries
-- methodology transplanted from the original harness + augmented with VMP / OLLVM / white-box / GM-crypto / AEAD / anti-debug fingerprints
-- per-tool-return discipline reinjection (replaces the original `system_reinjection_interval` loop)
-
-**Intentionally NOT carried over**: in-harness agent loop / note-compaction agent / ask-user reviewer / session persistence / LiteLLM provider config.
 
 ---
 

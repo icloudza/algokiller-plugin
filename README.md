@@ -38,8 +38,6 @@ cd tools/search && make
 cp ak_search ../../server/bin/ak_search
 ```
 
-源码已内置在 [`tools/search/`](tools/search/)（上游 [AlgoKiller/tools/search](https://github.com/lidongyooo/AlgoKiller/tree/main/tools/search) 镜像）。仓库默认带 arm64-macOS 预编译产物，其他平台用上面命令重编即可。
-
 ---
 
 ## 安装
@@ -157,19 +155,6 @@ printf '%s\n' \
 ```
 
 期望：`initialize` 响应 + `tools/list` 返回 7 个工具。
-
----
-
-## 设计取舍
-
-薄壳变体 —— Claude Desktop 当 agent，plugin 只贡献：
-
-- native `ak_search` 引擎（GB 级 mmap + 行号索引 + ASCII case-insensitive + daemon）
-- `trace_search` 的 0x hex 字节反序 / 剥前导零 fallback
-- 方法论：从原 harness 移植 + 补强 VMP / OLLVM / 白盒密码 / 国密 / AEAD / setoken / 反调试
-- 每工具返回的纪律重注入（替代原 `system_reinjection_interval` loop）
-
-**不带过来**：原 agent loop / note-compactor / ask-user reviewer / session 持久化 / LiteLLM 配置。
 
 ---
 
