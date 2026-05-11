@@ -200,6 +200,95 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "trace_callgraph",
+        "description": (
+            "Caller/callee analysis over 'call func: NAME(args)' lines. Two modes: "
+            "--to NAME returns every line that calls a function matching NAME (substring "
+            "match on the call symbol). --top N returns the Top-K most-called symbols with "
+            "counts. Use --to to find every call site of a specific helper (e.g. 'objc_retain', "
+            "'__memcpy_aarch64_simd'); use --top to discover hot dependencies before deep dive."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "to": {"type": "string", "description": "Function name substring to filter by."},
+                "top": {"type": "integer", "minimum": 1, "maximum": 200, "description": "Top-K most-called names; mutually exclusive with --to."},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Max xref rows when --to is set (default 100)."},
+            },
+        },
+    },
+    {
+        "name": "trace_modgraph",
+        "description": (
+            "Cross-module transition graph. Scans adjacent module-tagged lines and emits "
+            "directed edges (from_module -> to_module) with transition counts. Top-K edges "
+            "highlight the cross-module hot path. Each module also reports total line count. "
+            "Use this to identify which modules bridge to which (e.g. WeChat <-> mmcronet) "
+            "before drilling into a specific call boundary."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "top": {"type": "integer", "minimum": 1, "maximum": 200, "description": "Top-K edges by count (default 30)."},
+            },
+        },
+    },
+    {
+        "name": "trace_hexblock",
+        "description": (
+            "Parse a 'call func: NAME(args)' block at the given line and return structured JSON: "
+            "call name, args, optional ObjC class label, optional hexdumps (address + length + "
+            "concatenated bytes_hex), and ret value. Replaces multi-step trace_context + manual "
+            "row stitching when the agent needs the bytes flowing through a memcpy / sprintf / "
+            "encryption helper. ASCII preview is not emitted — use the bytes_hex directly."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "line": {"type": "integer", "minimum": 1, "description": "1-based file line of the 'call func:' header."},
+                "max_lines": {"type": "integer", "minimum": 1, "maximum": 10000, "description": "Max lines to scan forward looking for ret (default 1024)."},
+            },
+            "required": ["line"],
+        },
+    },
+    {
+        "name": "trace_constscan",
+        "description": (
+            "Scan the trace for known cryptographic constants (MD5 / SHA1 / SHA256 init values, "
+            "CRC32 polynomials, FNV-1a constants, AES sbox leading words, SM4 sbox + FK, "
+            "Bernstein multiplier). Returns a list of fingerprints with hit counts and sample "
+            "line numbers. Use right after bind_trace to identify which crypto primitives the "
+            "binary is exercising before sinking analysis tokens into the wrong region. "
+            "Categories: hash / cipher / cipher_hint / crc."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "samples": {"type": "integer", "minimum": 1, "maximum": 16, "description": "Sample line numbers per fingerprint (default 5)."},
+            },
+        },
+    },
+    {
+        "name": "trace_bytes",
+        "description": (
+            "Hex-literal search with automatic byte-reverse and leading-zero-strip variants. "
+            "Like trace_search but specialised for 0xVAL queries: emits ALL hit line numbers "
+            "(no 100-row cap), reports which variant matched. Use this when chasing a specific "
+            "value across the whole trace and trace_search's limit is too tight. Pass "
+            "--with-text to also include the instruction line, otherwise output is "
+            "token-frugal (just line + variant)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Hex literal, e.g. '0x67452301' or '0xa1b2c3d4'."},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 10000, "description": "Max total hits across all variants (default 100)."},
+                "with_text": {"type": "boolean", "description": "Include the matched instruction line text (default false)."},
+            },
+            "required": ["query"],
+        },
+    },
+    {
         "name": "trace_lint",
         "description": (
             "Single-pass health-check of the bound trace. Returns JSON: line count, average line "
@@ -559,6 +648,113 @@ def tool_trace_semop(args: dict[str, Any]) -> dict:
     return STATE.daemon.run_cli("semop", cli_args)
 
 
+def tool_trace_callgraph(args: dict[str, Any]) -> dict:
+    err = _require_bound()
+    if err is not None:
+        return err
+    has_to = "to" in args and str(args.get("to", "")).strip()
+    has_top = "top" in args
+    if has_to and has_top:
+        return {"status": "error", "error": "provide exactly one of 'to' or 'top'"}
+    if not has_to and not has_top:
+        return {"status": "error", "error": "provide 'to' (substring) or 'top' (Top-K)"}
+    cli: list[str] = []
+    if has_to:
+        cli += ["--to", str(args["to"]).strip()]
+        if "limit" in args:
+            try:
+                limit = int(args["limit"])
+            except (TypeError, ValueError):
+                return {"status": "error", "error": "limit must be an integer"}
+            if not (1 <= limit <= 1000):
+                return {"status": "error", "error": "limit must be in [1, 1000]"}
+            cli += ["--limit", str(limit)]
+    else:
+        try:
+            top = int(args["top"])
+        except (TypeError, ValueError):
+            return {"status": "error", "error": "top must be an integer"}
+        if not (1 <= top <= 200):
+            return {"status": "error", "error": "top must be in [1, 200]"}
+        cli += ["--top", str(top)]
+    return STATE.daemon.run_cli("callgraph", cli, timeout=120)
+
+
+def tool_trace_modgraph(args: dict[str, Any]) -> dict:
+    err = _require_bound()
+    if err is not None:
+        return err
+    cli: list[str] = []
+    if "top" in args:
+        try:
+            top = int(args["top"])
+        except (TypeError, ValueError):
+            return {"status": "error", "error": "top must be an integer"}
+        if not (1 <= top <= 200):
+            return {"status": "error", "error": "top must be in [1, 200]"}
+        cli += ["--top", str(top)]
+    return STATE.daemon.run_cli("modgraph", cli, timeout=120)
+
+
+def tool_trace_hexblock(args: dict[str, Any]) -> dict:
+    err = _require_bound()
+    if err is not None:
+        return err
+    try:
+        line = int(args.get("line", 0))
+    except (TypeError, ValueError):
+        return {"status": "error", "error": "line must be an integer"}
+    if line < 1:
+        return {"status": "error", "error": "line must be >= 1"}
+    cli: list[str] = ["--line", str(line)]
+    if "max_lines" in args:
+        try:
+            ml = int(args["max_lines"])
+        except (TypeError, ValueError):
+            return {"status": "error", "error": "max_lines must be an integer"}
+        if not (1 <= ml <= 10000):
+            return {"status": "error", "error": "max_lines must be in [1, 10000]"}
+        cli += ["--max-lines", str(ml)]
+    return STATE.daemon.run_cli("hexblock", cli, timeout=60)
+
+
+def tool_trace_constscan(args: dict[str, Any]) -> dict:
+    err = _require_bound()
+    if err is not None:
+        return err
+    cli: list[str] = []
+    if "samples" in args:
+        try:
+            s = int(args["samples"])
+        except (TypeError, ValueError):
+            return {"status": "error", "error": "samples must be an integer"}
+        if not (1 <= s <= 16):
+            return {"status": "error", "error": "samples must be in [1, 16]"}
+        cli += ["--samples", str(s)]
+    return STATE.daemon.run_cli("constscan", cli, timeout=300, max_output_chars=200_000)
+
+
+def tool_trace_bytes(args: dict[str, Any]) -> dict:
+    err = _require_bound()
+    if err is not None:
+        return err
+    query = str(args.get("query", "")).strip()
+    if not query or not query.lower().startswith("0x"):
+        return {"status": "error", "error": "query must be a 0x-prefixed hex literal"}
+    cli: list[str] = ["--query", query]
+    if "limit" in args:
+        try:
+            lim = int(args["limit"])
+        except (TypeError, ValueError):
+            return {"status": "error", "error": "limit must be an integer"}
+        if not (1 <= lim <= 10000):
+            return {"status": "error", "error": "limit must be in [1, 10000]"}
+        cli += ["--limit", str(lim)]
+    if args.get("with_text"):
+        cli.append("--with-text")
+    return STATE.daemon.run_cli("bytes", cli, timeout=120)
+
+
 def tool_trace_lint(args: dict[str, Any]) -> dict:
     err = _require_bound()
     if err is not None:
@@ -633,6 +829,11 @@ HANDLERS = {
     "trace_semop": tool_trace_semop,
     "trace_lint": tool_trace_lint,
     "trace_fold": tool_trace_fold,
+    "trace_callgraph": tool_trace_callgraph,
+    "trace_modgraph": tool_trace_modgraph,
+    "trace_hexblock": tool_trace_hexblock,
+    "trace_constscan": tool_trace_constscan,
+    "trace_bytes": tool_trace_bytes,
     "write_artifact": tool_write_artifact,
     "list_artifacts": tool_list_artifacts,
     "read_artifact": tool_read_artifact,

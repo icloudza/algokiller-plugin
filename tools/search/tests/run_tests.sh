@@ -240,6 +240,101 @@ assert_eq "block-fold above threshold: 24 lines" "24" "$out_lines"
 rm -f "$FOLD_BLOCK_OUT"
 
 # -----------------------------------------------------------------------------
+echo "[test] new: callgraph"
+
+S34=tests/fixtures/sprint34.trace
+
+# 4 call func lines in fixture: __memcpy / objc_retain / objc_msgSend / objc_msgSend... wait, we have 3.
+# Lines: __memcpy_aarch64_simd, objc_retain, objc_msgSend
+out=$($BIN callgraph --file "$S34" --top 10)
+assert_contains "callgraph reports 3 total_calls" '"total_calls":3' "$out"
+assert_contains "callgraph names __memcpy" '"name":"__memcpy_aarch64_simd"' "$out"
+assert_contains "callgraph names objc_retain" '"name":"objc_retain"' "$out"
+assert_contains "callgraph names objc_msgSend" '"name":"objc_msgSend"' "$out"
+
+# xref --to filter
+out=$($BIN callgraph --file "$S34" --to "objc_retain" --limit 10)
+assert_contains "callgraph xref total_hits=1" '"total_hits":1' "$out"
+count=$(printf '%s\n' "$out" | grep -c '"type":"callgraph_xref"' || true)
+assert_eq "callgraph xref emits 1 row" "1" "$count"
+
+# xref miss
+out=$($BIN callgraph --file "$S34" --to "nonexistent_fn" --limit 10)
+assert_contains "callgraph xref miss → 0 hits" '"total_hits":0' "$out"
+
+# -----------------------------------------------------------------------------
+echo "[test] new: modgraph"
+
+out=$($BIN modgraph --file "$S34" --top 10)
+assert_contains "modgraph sees WeChat module" '"name":"WeChat"' "$out"
+assert_contains "modgraph sees mmcronet module" '"name":"mmcronet"' "$out"
+# fixture: WeChat → mmcronet 1, mmcronet → WeChat 1 = 2 transitions
+assert_contains "modgraph WeChat→mmcronet edge" '"from":"WeChat","to":"mmcronet"' "$out"
+assert_contains "modgraph mmcronet→WeChat edge" '"from":"mmcronet","to":"WeChat"' "$out"
+assert_contains "modgraph total_transitions=2" '"total_transitions":2' "$out"
+
+# -----------------------------------------------------------------------------
+echo "[test] new: hexblock"
+
+# Find the __memcpy line in sprint34.trace
+MEMCPY_LINE=$(grep -n "^call func: __memcpy" "$S34" | head -1 | cut -d: -f1)
+out=$($BIN hexblock --file "$S34" --line "$MEMCPY_LINE")
+assert_contains "hexblock parses __memcpy" '"call":"__memcpy_aarch64_simd"' "$out"
+assert_contains "hexblock captures args" '"args_raw":"0x300001000, 0x400001000, 0x10"' "$out"
+assert_contains "hexblock parses hexdump addr" '"address":"0x400001000"' "$out"
+assert_contains "hexblock parses hexdump length" '"length":"0x10"' "$out"
+assert_contains "hexblock captures hex bytes" '4142434445464748494a4b4c4d4e4f50' "$out"
+assert_contains "hexblock captures ret" '"ret":"0x300001000"' "$out"
+
+# Find an objc_retain line (has class : but no hexdump)
+RETAIN_LINE=$(grep -n "^call func: objc_retain" "$S34" | head -1 | cut -d: -f1)
+out=$($BIN hexblock --file "$S34" --line "$RETAIN_LINE")
+assert_contains "hexblock objc_retain call" '"call":"objc_retain"' "$out"
+assert_contains "hexblock objc_retain class" '"class":"NSDictionary"' "$out"
+assert_contains "hexblock objc_retain ret" '"ret":"0x500000000"' "$out"
+
+# Calling hexblock on a non-call line should error
+err=$($BIN hexblock --file "$S34" --line 1 2>&1 >/dev/null || true)
+assert_contains "hexblock rejects non-call line" "is not a 'call func:' line" "$err"
+
+# -----------------------------------------------------------------------------
+echo "[test] new: constscan"
+
+out=$($BIN constscan --file "$S34" --samples 3)
+assert_contains "constscan finds MD5.A" '"fingerprint":"MD5.A"' "$out"
+assert_contains "constscan finds MD5.B" '"fingerprint":"MD5.B"' "$out"
+assert_contains "constscan finds MD5.C" '"fingerprint":"MD5.C"' "$out"
+assert_contains "constscan finds MD5.D" '"fingerprint":"MD5.D"' "$out"
+assert_contains "constscan finds SHA256.h0" '"fingerprint":"SHA256.h0"' "$out"
+assert_contains "constscan categories include hash" '"category":"hash"' "$out"
+
+# A trace with no fingerprints should yield empty hits
+out=$($BIN constscan --file "$FIXTURE" --samples 3)
+# mini.trace has Bernstein 0x83 in madd operand range — that fingerprint may match.
+# Make sure constscan completes without error.
+assert_contains "constscan on mini.trace returns valid JSON" '"type":"constscan"' "$out"
+
+# -----------------------------------------------------------------------------
+echo "[test] new: bytes"
+
+out=$($BIN bytes --file "$S34" --query 0x67452301 --limit 5)
+assert_contains "bytes finds MD5.A literal" '"variant":"0x67452301"' "$out"
+assert_contains "bytes also tries byte-reversed" '"0x01234567"' "$out"
+
+# Boundary check: 0x67452301 in mov w0 (full match)
+count=$(printf '%s\n' "$out" | grep -c '"line":1' || true)
+[ "$count" -ge 1 ] && { echo "  PASS  bytes hits line 1"; PASS=$((PASS+1)); } || { echo "  FAIL  bytes does not hit line 1"; FAIL=$((FAIL+1)); }
+
+# bytes on a value that doesn't exist
+out=$($BIN bytes --file "$S34" --query 0xfeedfacedeadbeef --limit 5)
+count=$(printf '%s\n' "$out" | grep -c '"line":' || true)
+assert_eq "bytes nonexistent → 0 hits" "0" "$count"
+
+# bytes --with-text emits instr field
+out=$($BIN bytes --file "$S34" --query 0xa1b2c3d4 --with-text --limit 3)
+assert_contains "bytes --with-text emits instr" '"instr":' "$out"
+
+# -----------------------------------------------------------------------------
 echo ""
 echo "==================================================="
 echo "  PASS=$PASS  FAIL=$FAIL"

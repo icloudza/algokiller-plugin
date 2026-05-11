@@ -54,8 +54,13 @@ static void usage(FILE *stream) {
             "  ak_search regflow  --file PATH --reg xN [--from-line N] [--to-line N] [--limit N]\n"
             "  ak_search producer --file PATH --value 0xVAL --sink-line N [--max-back N]\n"
             "  ak_search semop    --file PATH (--line N | --from-line N --to-line N) [--limit N]\n"
-            "  ak_search lint     --file PATH [--top N]\n"
-            "  ak_search fold     --in PATH --out PATH [--threshold N] [--block N]\n"
+            "  ak_search lint      --file PATH [--top N]\n"
+            "  ak_search fold      --in PATH --out PATH [--threshold N] [--block N]\n"
+            "  ak_search callgraph --file PATH (--to NAME | --top N) [--limit N]\n"
+            "  ak_search modgraph  --file PATH [--top N]\n"
+            "  ak_search hexblock  --file PATH --line N [--max-lines N]\n"
+            "  ak_search constscan --file PATH [--samples N]\n"
+            "  ak_search bytes     --file PATH --query 0xVAL [--limit N] [--with-text]\n"
             "\n"
             "Match mode is ASCII case-insensitive. --before-line searches backward, nearest first.\n"
             "regflow emits one row per line where the target register receives an output value.\n"
@@ -1691,6 +1696,755 @@ static int cmd_fold(int argc, char **argv) {
     return result;
 }
 
+/* ===========================================================================
+ * Sprint 3 extensions: callgraph / modgraph / hexblock
+ * ===========================================================================
+ */
+
+/* Parse "call func: NAME(args)" line into name region. Returns (start, len)
+ * pointing at NAME, or false if line doesn't match prefix.
+ */
+static bool parse_call_func_name(LineView line,
+                                 const unsigned char **name_start, size_t *name_len) {
+    static const unsigned char prefix[] = "call func: ";
+    size_t plen = sizeof(prefix) - 1;
+    if (line.len < plen) return false;
+    if (memcmp(line.start, prefix, plen) != 0) return false;
+    const unsigned char *p = line.start + plen;
+    const unsigned char *end = line.start + line.len;
+    /* Name continues until '(' or end of line. ObjC msgSend names contain '[]'
+     * which we keep as part of the name.
+     */
+    const unsigned char *paren = NULL;
+    for (const unsigned char *q = p; q < end; q++) {
+        if (*q == '(') { paren = q; break; }
+    }
+    *name_start = p;
+    *name_len = (paren != NULL ? (size_t)(paren - p) : (size_t)(end - p));
+    /* Trim trailing whitespace */
+    while (*name_len > 0 && (*name_start)[*name_len - 1] == ' ') (*name_len)--;
+    return *name_len > 0;
+}
+
+static int run_callgraph_xref_to(const IndexedFile *indexed, const char *needle, uint64_t limit) {
+    if (indexed->mapped.size == 0) return 0;
+    size_t nlen = strlen(needle);
+    if (nlen == 0) return 0;
+
+    uint64_t emitted = 0;
+    uint64_t total_hits = 0;
+    for (uint64_t line_no = 1; line_no <= indexed->index.count; line_no++) {
+        size_t off = indexed->index.offsets[line_no - 1];
+        LineView line = line_at_offset(indexed->mapped.data, indexed->mapped.size, off);
+        const unsigned char *name; size_t name_len;
+        if (!parse_call_func_name(line, &name, &name_len)) continue;
+        /* substring match (case-sensitive — call names are typically exact) */
+        if (name_len < nlen) continue;
+        bool hit = false;
+        for (size_t i = 0; i + nlen <= name_len; i++) {
+            if (memcmp(name + i, (const unsigned char *)needle, nlen) == 0) { hit = true; break; }
+        }
+        if (!hit) continue;
+        total_hits++;
+        if (emitted < limit) {
+            fputs("{\"type\":\"callgraph_xref\",\"line\":", stdout);
+            printf("%" PRIu64, line_no);
+            fputs(",\"name\":", stdout);
+            json_write_string(name, name_len);
+            fputs(",\"instr\":", stdout);
+            json_write_string(line.start, line.len);
+            fputs("}\n", stdout);
+            emitted++;
+        }
+    }
+    fprintf(stdout, "{\"type\":\"callgraph_summary\",\"target\":");
+    json_write_cstr(needle);
+    printf(",\"total_hits\":%" PRIu64 ",\"emitted\":%" PRIu64 "}\n", total_hits, emitted);
+    return 0;
+}
+
+static int run_callgraph_top(const IndexedFile *indexed, uint64_t top_k) {
+    CountTable names; count_table_init(&names);
+    uint64_t total_calls = 0;
+    for (uint64_t line_no = 1; line_no <= indexed->index.count; line_no++) {
+        size_t off = indexed->index.offsets[line_no - 1];
+        LineView line = line_at_offset(indexed->mapped.data, indexed->mapped.size, off);
+        const unsigned char *name; size_t name_len;
+        if (!parse_call_func_name(line, &name, &name_len)) continue;
+        count_table_bump(&names, name, name_len);
+        total_calls++;
+    }
+    qsort(names.entries, names.count, sizeof(CountEntry), count_entry_cmp_desc);
+    uint64_t emit_n = names.count < top_k ? names.count : top_k;
+    fputs("{\"type\":\"callgraph_top\",\"total_calls\":", stdout);
+    printf("%" PRIu64, total_calls);
+    printf(",\"unique_names\":%zu", names.count);
+    fputs(",\"top\":[", stdout);
+    for (uint64_t i = 0; i < emit_n; i++) {
+        if (i > 0) putchar(',');
+        fputs("{\"name\":", stdout);
+        json_write_cstr(names.entries[i].name);
+        printf(",\"count\":%" PRIu64 "}", names.entries[i].count);
+    }
+    fputs("]}\n", stdout);
+    count_table_free(&names);
+    return 0;
+}
+
+static int cmd_callgraph(int argc, char **argv) {
+    const char *path = NULL;
+    const char *to_name = NULL;
+    uint64_t top_k = 0;
+    uint64_t limit = 100;
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--file") == 0 && i + 1 < argc) path = argv[++i];
+        else if (strcmp(argv[i], "--to") == 0 && i + 1 < argc) to_name = argv[++i];
+        else if (strcmp(argv[i], "--top") == 0 && i + 1 < argc) {
+            if (!parse_u64(argv[++i], &top_k)) { fprintf(stderr, "invalid --top\n"); return 2; }
+        }
+        else if (strcmp(argv[i], "--limit") == 0 && i + 1 < argc) {
+            if (!parse_u64(argv[++i], &limit)) { fprintf(stderr, "invalid --limit\n"); return 2; }
+        }
+        else { usage(stderr); return 2; }
+    }
+    if (path == NULL) { usage(stderr); return 2; }
+    if (to_name == NULL && top_k == 0) {
+        fprintf(stderr, "callgraph requires --to NAME or --top N\n"); return 2;
+    }
+
+    IndexedFile indexed;
+    if (indexed_file_open(path, &indexed) != 0) return 1;
+    int result = to_name != NULL
+        ? run_callgraph_xref_to(&indexed, to_name, limit)
+        : run_callgraph_top(&indexed, top_k);
+    indexed_file_close(&indexed);
+    return result;
+}
+
+/* modgraph: emit one row per (caller_module, callee_module, count). Detects
+ * cross-module by scanning adjacent module-tagged lines and counting unique
+ * directed transitions weighted by their occurrence. */
+typedef struct {
+    char from_name[96];
+    char to_name[96];
+    uint64_t count;
+} EdgeEntry;
+
+typedef struct {
+    EdgeEntry *entries;
+    size_t count;
+    size_t capacity;
+} EdgeTable;
+
+static void edge_table_init(EdgeTable *t) { t->entries = NULL; t->count = 0; t->capacity = 0; }
+static void edge_table_free(EdgeTable *t) { free(t->entries); t->entries = NULL; t->count = 0; t->capacity = 0; }
+
+static int edge_table_bump(EdgeTable *t,
+                           const unsigned char *from, size_t from_len,
+                           const unsigned char *to, size_t to_len) {
+    if (from_len >= sizeof(t->entries[0].from_name)) from_len = sizeof(t->entries[0].from_name) - 1;
+    if (to_len >= sizeof(t->entries[0].to_name)) to_len = sizeof(t->entries[0].to_name) - 1;
+    for (size_t i = 0; i < t->count; i++) {
+        if (strlen(t->entries[i].from_name) == from_len &&
+            strlen(t->entries[i].to_name) == to_len &&
+            memcmp(t->entries[i].from_name, from, from_len) == 0 &&
+            memcmp(t->entries[i].to_name, to, to_len) == 0) {
+            t->entries[i].count++;
+            return 0;
+        }
+    }
+    if (t->count == t->capacity) {
+        size_t nc = t->capacity == 0 ? 64 : t->capacity * 2;
+        EdgeEntry *nx = realloc(t->entries, nc * sizeof(EdgeEntry));
+        if (nx == NULL) return -1;
+        t->entries = nx; t->capacity = nc;
+    }
+    memcpy(t->entries[t->count].from_name, from, from_len);
+    t->entries[t->count].from_name[from_len] = '\0';
+    memcpy(t->entries[t->count].to_name, to, to_len);
+    t->entries[t->count].to_name[to_len] = '\0';
+    t->entries[t->count].count = 1;
+    t->count++;
+    return 0;
+}
+
+static int edge_cmp_desc(const void *a, const void *b) {
+    uint64_t ca = ((const EdgeEntry *)a)->count;
+    uint64_t cb = ((const EdgeEntry *)b)->count;
+    if (ca < cb) return 1;
+    if (ca > cb) return -1;
+    return 0;
+}
+
+static int run_modgraph(const IndexedFile *indexed, uint64_t top_k) {
+    EdgeTable edges; edge_table_init(&edges);
+    CountTable mods; count_table_init(&mods);
+    char prev_mod[96] = "";
+    size_t prev_mod_len = 0;
+    bool have_prev = false;
+    uint64_t total_transitions = 0;
+
+    for (uint64_t line_no = 1; line_no <= indexed->index.count; line_no++) {
+        size_t off = indexed->index.offsets[line_no - 1];
+        LineView line = line_at_offset(indexed->mapped.data, indexed->mapped.size, off);
+        const unsigned char *tag; size_t tag_len;
+        if (!parse_module_tag(line, &tag, &tag_len)) continue;
+        count_table_bump(&mods, tag, tag_len);
+        if (have_prev) {
+            if (tag_len != prev_mod_len || memcmp(tag, prev_mod, tag_len) != 0) {
+                edge_table_bump(&edges, (const unsigned char *)prev_mod, prev_mod_len, tag, tag_len);
+                total_transitions++;
+            }
+        }
+        size_t copy_len = tag_len < sizeof(prev_mod) - 1 ? tag_len : sizeof(prev_mod) - 1;
+        memcpy(prev_mod, tag, copy_len);
+        prev_mod[copy_len] = '\0';
+        prev_mod_len = copy_len;
+        have_prev = true;
+    }
+
+    qsort(edges.entries, edges.count, sizeof(EdgeEntry), edge_cmp_desc);
+    qsort(mods.entries, mods.count, sizeof(CountEntry), count_entry_cmp_desc);
+    uint64_t emit_n = edges.count < top_k ? edges.count : top_k;
+
+    fputs("{\"type\":\"modgraph\",\"total_transitions\":", stdout);
+    printf("%" PRIu64, total_transitions);
+    fputs(",\"modules\":[", stdout);
+    for (size_t i = 0; i < mods.count; i++) {
+        if (i > 0) putchar(',');
+        fputs("{\"name\":", stdout);
+        json_write_cstr(mods.entries[i].name);
+        printf(",\"lines\":%" PRIu64 "}", mods.entries[i].count);
+    }
+    fputs("],\"top_edges\":[", stdout);
+    for (uint64_t i = 0; i < emit_n; i++) {
+        if (i > 0) putchar(',');
+        fputs("{\"from\":", stdout);
+        json_write_cstr(edges.entries[i].from_name);
+        fputs(",\"to\":", stdout);
+        json_write_cstr(edges.entries[i].to_name);
+        printf(",\"count\":%" PRIu64 "}", edges.entries[i].count);
+    }
+    fputs("]}\n", stdout);
+    edge_table_free(&edges);
+    count_table_free(&mods);
+    return 0;
+}
+
+static int cmd_modgraph(int argc, char **argv) {
+    const char *path = NULL;
+    uint64_t top_k = 30;
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--file") == 0 && i + 1 < argc) path = argv[++i];
+        else if (strcmp(argv[i], "--top") == 0 && i + 1 < argc) {
+            if (!parse_u64(argv[++i], &top_k) || top_k == 0) { fprintf(stderr, "invalid --top\n"); return 2; }
+        }
+        else { usage(stderr); return 2; }
+    }
+    if (path == NULL) { usage(stderr); return 2; }
+    IndexedFile indexed;
+    if (indexed_file_open(path, &indexed) != 0) return 1;
+    int result = run_modgraph(&indexed, top_k);
+    indexed_file_close(&indexed);
+    return result;
+}
+
+/* hexblock: parse a "call func: NAME(args)" line at --line and return the
+ * structured call block (optional hexdumps, optional class, ret).
+ *
+ * Block grammar:
+ *   call func: NAME(arg1, arg2, ...)            ← REQUIRED, must be on --line
+ *   [class : NAME]                              ← optional, ObjC msgSend
+ *   [hexdump at address 0xA with length 0xL:    ← 0..N hexdump headers
+ *     0xA+0: HH HH ... |ASCII|                  ← N data rows per header
+ *     ...
+ *   ]
+ *   ret: 0xVAL                                  ← terminates the block
+ *
+ * Anything else terminates parsing without `ret` (incomplete block).
+ */
+
+static bool starts_with(LineView line, const char *prefix) {
+    size_t plen = strlen(prefix);
+    return line.len >= plen && memcmp(line.start, prefix, plen) == 0;
+}
+
+static bool parse_hex_header(LineView line, char *addr_buf, size_t addr_sz,
+                             char *len_buf, size_t len_sz) {
+    static const unsigned char p1[] = "hexdump at address ";
+    static const unsigned char p2[] = " with length ";
+    static const size_t p1len = sizeof(p1) - 1;
+    static const size_t p2len = sizeof(p2) - 1;
+    if (line.len < p1len + 4) return false;
+    if (memcmp(line.start, p1, p1len) != 0) return false;
+    const unsigned char *p = line.start + p1len;
+    const unsigned char *end = line.start + line.len;
+    const unsigned char *after = parse_hex_run(p, end, addr_buf, addr_sz);
+    if (after == NULL) return false;
+    if ((size_t)(end - after) < p2len) return false;
+    if (memcmp(after, p2, p2len) != 0) return false;
+    p = after + p2len;
+    const unsigned char *after2 = parse_hex_run(p, end, len_buf, len_sz);
+    if (after2 == NULL) return false;
+    /* trailing ':' optional */
+    return true;
+}
+
+/* Parse a "0xADDR: HH HH ... |ASCII|" hexdump body line; return true if
+ * format matches. Writes raw hex_bytes and ascii_preview into out buffers. */
+static bool parse_hex_body(LineView line, char *hex_out, size_t hex_sz,
+                           char *ascii_out, size_t ascii_sz) {
+    /* Look for "<addr>: " then bytes "HH " then "|...|" */
+    const unsigned char *colon = NULL;
+    const unsigned char *end = line.start + line.len;
+    for (const unsigned char *p = line.start; p < end; p++) {
+        if (*p == ':') { colon = p; break; }
+    }
+    if (colon == NULL || colon + 2 > end || colon[1] != ' ') return false;
+    /* skip until '|' for ASCII region */
+    const unsigned char *bar = NULL;
+    for (const unsigned char *p = colon + 2; p < end; p++) {
+        if (*p == '|') { bar = p; break; }
+    }
+    if (bar == NULL) return false;
+    /* hex bytes are between colon+2 and bar; collapse spaces, take HH chars */
+    size_t hi = 0;
+    for (const unsigned char *p = colon + 2; p < bar && hi + 1 < hex_sz; p++) {
+        if (*p == ' ') continue;
+        hex_out[hi++] = (char)*p;
+    }
+    hex_out[hi] = '\0';
+    /* ASCII region is between bar+1 and next '|' (or end) */
+    const unsigned char *bar2 = NULL;
+    for (const unsigned char *p = bar + 1; p < end; p++) {
+        if (*p == '|') { bar2 = p; break; }
+    }
+    const unsigned char *ae = bar2 != NULL ? bar2 : end;
+    size_t ai = 0;
+    for (const unsigned char *p = bar + 1; p < ae && ai + 1 < ascii_sz; p++) {
+        ascii_out[ai++] = (char)*p;
+    }
+    /* Trim trailing spaces (padding) */
+    while (ai > 0 && ascii_out[ai - 1] == ' ') ai--;
+    ascii_out[ai] = '\0';
+    return true;
+}
+
+static int run_hexblock(const IndexedFile *indexed, uint64_t target_line, uint64_t max_lines) {
+    if (target_line == 0 || target_line > indexed->index.count) {
+        fprintf(stderr, "hexblock: --line out of range\n");
+        return 1;
+    }
+    size_t off0 = indexed->index.offsets[target_line - 1];
+    LineView call_line = line_at_offset(indexed->mapped.data, indexed->mapped.size, off0);
+    const unsigned char *name; size_t name_len;
+    if (!parse_call_func_name(call_line, &name, &name_len)) {
+        fprintf(stderr, "hexblock: line %" PRIu64 " is not a 'call func:' line\n", target_line);
+        return 1;
+    }
+
+    fputs("{\"type\":\"hexblock\",\"line\":", stdout);
+    printf("%" PRIu64, target_line);
+    fputs(",\"call\":", stdout);
+    json_write_string(name, name_len);
+
+    /* extract args: substring between first '(' and final ')' on call_line */
+    const unsigned char *call_end = call_line.start + call_line.len;
+    const unsigned char *lp = NULL;
+    for (const unsigned char *p = call_line.start; p < call_end; p++) {
+        if (*p == '(') { lp = p; break; }
+    }
+    if (lp != NULL) {
+        const unsigned char *rp = NULL;
+        for (const unsigned char *p = call_end - 1; p > lp; p--) {
+            if (*p == ')') { rp = p; break; }
+        }
+        if (rp != NULL && rp > lp + 1) {
+            fputs(",\"args_raw\":", stdout);
+            json_write_string(lp + 1, (size_t)(rp - lp - 1));
+        }
+    }
+
+    /* Parse subsequent lines: class? hexdump* ret? */
+    bool first_dump_emitted = false;
+    bool dumps_array_open = false;
+    char addr_buf[64], len_buf[64];
+    char hex_buf[2048], ascii_buf[256];
+    char ret_buf[64] = "";
+    char class_buf[128] = "";
+    uint64_t scanned = 0;
+    bool in_hexdump = false;
+
+    for (uint64_t i = 1; i <= max_lines && target_line + i <= indexed->index.count; i++) {
+        size_t off = indexed->index.offsets[target_line + i - 1];
+        LineView lv = line_at_offset(indexed->mapped.data, indexed->mapped.size, off);
+        scanned = i;
+
+        if (lv.len == 0) break;
+
+        /* class line: "class : NAME" or just "NAME" (we accept "class : ...") */
+        if (class_buf[0] == '\0' && starts_with(lv, "class :")) {
+            /* "class : NAME" */
+            const unsigned char *p = lv.start + 7;
+            const unsigned char *e = lv.start + lv.len;
+            while (p < e && *p == ' ') p++;
+            size_t take = (size_t)(e - p);
+            if (take >= sizeof(class_buf)) take = sizeof(class_buf) - 1;
+            memcpy(class_buf, p, take);
+            class_buf[take] = '\0';
+            continue;
+        }
+
+        /* ret terminator */
+        if (starts_with(lv, "ret:")) {
+            const unsigned char *p = lv.start + 4;
+            const unsigned char *e = lv.start + lv.len;
+            while (p < e && *p == ' ') p++;
+            size_t take = (size_t)(e - p);
+            if (take >= sizeof(ret_buf)) take = sizeof(ret_buf) - 1;
+            memcpy(ret_buf, p, take);
+            ret_buf[take] = '\0';
+            break;
+        }
+
+        /* hexdump header */
+        if (parse_hex_header(lv, addr_buf, sizeof(addr_buf), len_buf, sizeof(len_buf))) {
+            if (!dumps_array_open) { fputs(",\"hexdumps\":[", stdout); dumps_array_open = true; }
+            if (first_dump_emitted) putchar(',');
+            first_dump_emitted = true;
+            fputs("{\"address\":", stdout);
+            json_write_cstr(addr_buf);
+            fputs(",\"length\":", stdout);
+            json_write_cstr(len_buf);
+            fputs(",\"bytes_hex\":\"", stdout);
+            hex_buf[0] = '\0';
+            in_hexdump = true;
+            continue;
+        }
+
+        if (in_hexdump && parse_hex_body(lv, hex_buf, sizeof(hex_buf), ascii_buf, sizeof(ascii_buf))) {
+            /* Stream concatenated hex into the current "bytes_hex" field. */
+            fputs(hex_buf, stdout);
+            continue;
+        }
+        if (in_hexdump) {
+            /* hexdump section ends: close bytes_hex, append ascii placeholder */
+            fputs("\"}", stdout);
+            in_hexdump = false;
+        }
+
+        /* Anything else: stop. */
+        break;
+    }
+
+    if (in_hexdump) {
+        fputs("\"}", stdout);
+    }
+    if (dumps_array_open) fputs("]", stdout);
+    if (class_buf[0] != '\0') {
+        fputs(",\"class\":", stdout);
+        json_write_cstr(class_buf);
+    }
+    if (ret_buf[0] != '\0') {
+        fputs(",\"ret\":", stdout);
+        json_write_cstr(ret_buf);
+    }
+    printf(",\"lines_scanned\":%" PRIu64, scanned);
+    fputs("}\n", stdout);
+    return 0;
+}
+
+static int cmd_hexblock(int argc, char **argv) {
+    const char *path = NULL;
+    uint64_t line = 0;
+    uint64_t max_lines = 1024;
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--file") == 0 && i + 1 < argc) path = argv[++i];
+        else if (strcmp(argv[i], "--line") == 0 && i + 1 < argc) {
+            if (!parse_u64(argv[++i], &line) || line == 0) { fprintf(stderr, "invalid --line\n"); return 2; }
+        }
+        else if (strcmp(argv[i], "--max-lines") == 0 && i + 1 < argc) {
+            if (!parse_u64(argv[++i], &max_lines) || max_lines == 0) { fprintf(stderr, "invalid --max-lines\n"); return 2; }
+        }
+        else { usage(stderr); return 2; }
+    }
+    if (path == NULL || line == 0) { usage(stderr); return 2; }
+    IndexedFile indexed;
+    if (indexed_file_open(path, &indexed) != 0) return 1;
+    int result = run_hexblock(&indexed, line, max_lines);
+    indexed_file_close(&indexed);
+    return result;
+}
+
+/* ===========================================================================
+ * Sprint 4 extensions: constscan / bytes
+ * ===========================================================================
+ */
+
+typedef struct {
+    const char *name;
+    const char *category;   /* hash / cipher / cipher_hint / crc */
+    const char *magic_hex;  /* "0x" + lowercase hex literal */
+} Fingerprint;
+
+/* Curated fingerprint constants — enough to identify common cipher / hash
+ * primitives without false-positive flood. AES sbox entries are recorded as
+ * 32-bit packed words (the way table-loaded T-table implementations would
+ * fetch them).
+ */
+static const Fingerprint FINGERPRINTS[] = {
+    /* MD5 init */
+    {"MD5.A",                "hash",   "0x67452301"},
+    {"MD5.B",                "hash",   "0xefcdab89"},
+    {"MD5.C",                "hash",   "0x98badcfe"},
+    {"MD5.D",                "hash",   "0x10325476"},
+    /* SHA-1 / SHA-2 init constants */
+    {"SHA1.h4",              "hash",   "0xc3d2e1f0"},
+    {"SHA256.h0",            "hash",   "0x6a09e667"},
+    {"SHA256.h1",            "hash",   "0xbb67ae85"},
+    {"SHA256.h2",            "hash",   "0x3c6ef372"},
+    {"SHA256.h3",            "hash",   "0xa54ff53a"},
+    {"SHA256.h4",            "hash",   "0x510e527f"},
+    {"SHA256.h5",            "hash",   "0x9b05688c"},
+    {"SHA256.h6",            "hash",   "0x1f83d9ab"},
+    {"SHA256.h7",            "hash",   "0x5be0cd19"},
+    /* CRC32 polynomials */
+    {"CRC32.poly_reflected", "crc",    "0xedb88320"},
+    {"CRC32.poly_normal",    "crc",    "0x04c11db7"},
+    /* FNV-1a 64-bit */
+    {"FNV1a.prime64",        "hash",   "0x100000001b3"},
+    {"FNV1a.offset64",       "hash",   "0xcbf29ce484222325"},
+    /* AES sbox / inverse sbox 32-bit packed leading words */
+    {"AES.sbox[0..3]",       "cipher", "0x637c777b"},
+    {"AES.sbox[4..7]",       "cipher", "0xf26b6fc5"},
+    {"AES.inv_sbox[0..3]",   "cipher", "0x52096ad5"},
+    /* SM4 sbox leading words */
+    {"SM4.sbox[0..3]",       "cipher", "0xd690e9fe"},
+    {"SM4.sbox[4..7]",       "cipher", "0xcce13db7"},
+    /* SM4 FK constants */
+    {"SM4.FK0",              "cipher", "0xa3b1bac6"},
+    {"SM4.FK1",              "cipher", "0x56aa3350"},
+    /* DES initial perm hint (uncommon as literal — kept for completeness) */
+    /* Bernstein / DJB constant — usually shows up only as 0x83 in madd */
+    {"Bernstein.mul131",     "hash",   "0x83"},
+    /* Whirlpool box leading bytes (32-bit pack) */
+    {"Whirlpool.S[0..3]",    "cipher_hint", "0x18233481"},
+    {NULL, NULL, NULL},
+};
+
+static int run_constscan(const IndexedFile *indexed, uint64_t limit_per_fp) {
+    size_t fp_count = 0;
+    while (FINGERPRINTS[fp_count].name != NULL) fp_count++;
+
+    fputs("{\"type\":\"constscan\",\"hits\":[", stdout);
+    bool emitted_any = false;
+
+    for (size_t f = 0; f < fp_count; f++) {
+        const Fingerprint *fp = &FINGERPRINTS[f];
+        BmhSearcher s;
+        if (bmh_init(&s, fp->magic_hex) != 0) return 1;
+        size_t mlen = strlen(fp->magic_hex);
+
+        uint64_t total_hits = 0;
+        uint64_t sample_lines[16];
+        size_t sample_n = 0;
+
+        for (uint64_t line_no = 1; line_no <= indexed->index.count; line_no++) {
+            size_t off = indexed->index.offsets[line_no - 1];
+            LineView line = line_at_offset(indexed->mapped.data, indexed->mapped.size, off);
+            const unsigned char *hit = bmh_find(&s, line.start, line.len);
+            if (hit == NULL) continue;
+            /* Require boundary chars (not a longer hex run). The folded ASCII
+             * lower means we can compare unfolded — but we want "the literal
+             * matches as a complete 0xVAL run, not a prefix of a longer one".
+             */
+            const unsigned char *after = hit + mlen;
+            if (after < line.start + line.len) {
+                unsigned char c = *after;
+                if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+                    (c >= 'A' && c <= 'F')) {
+                    continue;  /* longer hex run — false match */
+                }
+            }
+            total_hits++;
+            if (sample_n < limit_per_fp && sample_n < (sizeof(sample_lines)/sizeof(sample_lines[0]))) {
+                sample_lines[sample_n++] = line_no;
+            }
+        }
+
+        bmh_destroy(&s);
+        if (total_hits == 0) continue;
+
+        if (emitted_any) putchar(',');
+        emitted_any = true;
+        fputs("{\"fingerprint\":", stdout);
+        json_write_cstr(fp->name);
+        fputs(",\"category\":", stdout);
+        json_write_cstr(fp->category);
+        fputs(",\"magic\":", stdout);
+        json_write_cstr(fp->magic_hex);
+        printf(",\"total_hits\":%" PRIu64, total_hits);
+        fputs(",\"sample_lines\":[", stdout);
+        for (size_t i = 0; i < sample_n; i++) {
+            if (i > 0) putchar(',');
+            printf("%" PRIu64, sample_lines[i]);
+        }
+        fputs("]}", stdout);
+    }
+    fputs("]}\n", stdout);
+    return 0;
+}
+
+static int cmd_constscan(int argc, char **argv) {
+    const char *path = NULL;
+    uint64_t limit_per_fp = 5;
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--file") == 0 && i + 1 < argc) path = argv[++i];
+        else if (strcmp(argv[i], "--samples") == 0 && i + 1 < argc) {
+            if (!parse_u64(argv[++i], &limit_per_fp) || limit_per_fp == 0) {
+                fprintf(stderr, "invalid --samples\n"); return 2;
+            }
+        }
+        else { usage(stderr); return 2; }
+    }
+    if (path == NULL) { usage(stderr); return 2; }
+    IndexedFile indexed;
+    if (indexed_file_open(path, &indexed) != 0) return 1;
+    int result = run_constscan(&indexed, limit_per_fp);
+    indexed_file_close(&indexed);
+    return result;
+}
+
+/* bytes: search for a hex literal across the trace, automatically also trying
+ * byte-reversed and leading-zero-stripped variants. Emits ALL hit line numbers
+ * (no token-bloat from full line text — use trace_context if you need it).
+ *
+ * Use this when trace_search's 100-limit isn't enough or you want the full
+ * occurrence set for a specific value.
+ */
+static int run_bytes_scan(const IndexedFile *indexed, const char *raw_hex,
+                          uint64_t limit, bool emit_context_text) {
+    /* canonicalize: ensure 0x prefix, lowercase */
+    char canonical[80];
+    size_t in_len = strlen(raw_hex);
+    if (in_len < 3 || (raw_hex[0] != '0' || (raw_hex[1] != 'x' && raw_hex[1] != 'X'))) {
+        fprintf(stderr, "bytes: query must be 0x-prefixed hex\n");
+        return 2;
+    }
+    if (in_len + 1 > sizeof(canonical)) {
+        fprintf(stderr, "bytes: hex too long\n");
+        return 2;
+    }
+    canonical[0] = '0'; canonical[1] = 'x';
+    for (size_t i = 2; i < in_len; i++) {
+        char c = raw_hex[i];
+        if (c >= 'A' && c <= 'F') c = (char)(c + ('a' - 'A'));
+        canonical[i] = c;
+    }
+    canonical[in_len] = '\0';
+
+    /* Build variants: canonical, byte-reversed (even-length), leading-zero stripped */
+    char variants[3][80];
+    int variant_count = 0;
+    strncpy(variants[variant_count++], canonical, sizeof(variants[0]) - 1);
+
+    /* byte-reversed */
+    size_t hex_len = in_len - 2;
+    if (hex_len % 2 == 0 && hex_len > 2) {
+        char *rev = variants[variant_count];
+        rev[0] = '0'; rev[1] = 'x';
+        for (size_t i = 0; i < hex_len; i += 2) {
+            size_t src = 2 + hex_len - i - 2;
+            rev[2 + i] = canonical[src];
+            rev[2 + i + 1] = canonical[src + 1];
+        }
+        rev[2 + hex_len] = '\0';
+        if (strcmp(rev, canonical) != 0) variant_count++;
+    }
+    /* leading-zero stripped */
+    if (hex_len > 1) {
+        const char *p = canonical + 2;
+        while (*p == '0' && *(p + 1) != '\0') p++;
+        if (p > canonical + 2) {
+            char *trim = variants[variant_count];
+            trim[0] = '0'; trim[1] = 'x';
+            size_t plen = strlen(p);
+            if (plen + 3 <= sizeof(variants[0])) {
+                memcpy(trim + 2, p, plen);
+                trim[2 + plen] = '\0';
+                if (strcmp(trim, canonical) != 0) variant_count++;
+            }
+        }
+    }
+
+    fputs("{\"type\":\"bytes_summary\",\"queries\":[", stdout);
+    for (int v = 0; v < variant_count; v++) {
+        if (v > 0) putchar(',');
+        json_write_cstr(variants[v]);
+    }
+    fputs("],\"hits\":[", stdout);
+
+    uint64_t total_emitted = 0;
+    bool any = false;
+    for (int v = 0; v < variant_count && total_emitted < limit; v++) {
+        BmhSearcher s;
+        if (bmh_init(&s, variants[v]) != 0) return 1;
+        size_t mlen = strlen(variants[v]);
+        for (uint64_t line_no = 1;
+             line_no <= indexed->index.count && total_emitted < limit;
+             line_no++) {
+            size_t off = indexed->index.offsets[line_no - 1];
+            LineView line = line_at_offset(indexed->mapped.data, indexed->mapped.size, off);
+            const unsigned char *hit = bmh_find(&s, line.start, line.len);
+            if (hit == NULL) continue;
+            /* boundary: not a prefix of a longer hex run */
+            const unsigned char *after = hit + mlen;
+            if (after < line.start + line.len) {
+                unsigned char c = *after;
+                if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+                    (c >= 'A' && c <= 'F')) continue;
+            }
+            if (any) putchar(',');
+            any = true;
+            fputs("{\"line\":", stdout);
+            printf("%" PRIu64, line_no);
+            fputs(",\"variant\":", stdout);
+            json_write_cstr(variants[v]);
+            if (emit_context_text) {
+                fputs(",\"instr\":", stdout);
+                json_write_string(line.start, line.len);
+            }
+            putchar('}');
+            total_emitted++;
+        }
+        bmh_destroy(&s);
+    }
+    fputs("]}\n", stdout);
+    return 0;
+}
+
+static int cmd_bytes(int argc, char **argv) {
+    const char *path = NULL;
+    const char *query = NULL;
+    uint64_t limit = 100;
+    bool emit_text = false;
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--file") == 0 && i + 1 < argc) path = argv[++i];
+        else if (strcmp(argv[i], "--query") == 0 && i + 1 < argc) query = argv[++i];
+        else if (strcmp(argv[i], "--limit") == 0 && i + 1 < argc) {
+            if (!parse_u64(argv[++i], &limit) || limit == 0) { fprintf(stderr, "invalid --limit\n"); return 2; }
+        }
+        else if (strcmp(argv[i], "--with-text") == 0) emit_text = true;
+        else { usage(stderr); return 2; }
+    }
+    if (path == NULL || query == NULL) { usage(stderr); return 2; }
+    IndexedFile indexed;
+    if (indexed_file_open(path, &indexed) != 0) return 1;
+    int result = run_bytes_scan(&indexed, query, limit, emit_text);
+    indexed_file_close(&indexed);
+    return result;
+}
+
 static int cmd_match(int argc, char **argv) {
     const char *path = NULL;
     const char *query = NULL;
@@ -1956,6 +2710,21 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "fold") == 0) {
         return cmd_fold(argc, argv);
+    }
+    if (strcmp(argv[1], "callgraph") == 0) {
+        return cmd_callgraph(argc, argv);
+    }
+    if (strcmp(argv[1], "modgraph") == 0) {
+        return cmd_modgraph(argc, argv);
+    }
+    if (strcmp(argv[1], "hexblock") == 0) {
+        return cmd_hexblock(argc, argv);
+    }
+    if (strcmp(argv[1], "constscan") == 0) {
+        return cmd_constscan(argc, argv);
+    }
+    if (strcmp(argv[1], "bytes") == 0) {
+        return cmd_bytes(argc, argv);
     }
     usage(stderr);
     return 2;
