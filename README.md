@@ -177,8 +177,8 @@ trace 看"发生了什么"，BN 看"代码长什么样"。装任一 BN MCP 自�
 
 | Plugin | License | Transport |
 |---|---|---|
-| [fosdickio/binary_ninja_mcp](https://github.com/fosdickio/binary_ninja_mcp) (348⭐) | GPL-3.0 | stdio |
-| [jtang613/BinAssistMCP](https://github.com/jtang613/BinAssistMCP) (33⭐) | MIT | HTTP/SSE |
+| [fosdickio/binary_ninja_mcp](https://github.com/fosdickio/binary_ninja_mcp) | GPL-3.0 | stdio |
+| [jtang613/BinAssistMCP](https://github.com/jtang613/BinAssistMCP) | MIT | HTTP/SSE |
 
 均为 Binary Ninja plugin，要求本机有 BN 商业 license。SKILL 通过 namespace（`binary_ninja_mcp.*` / `binassist.*`）自动识别，无需配置。BN 不在线时 plugin 仍可单跑——SKILL 不会假装调 BN 工具，且会在交付的"未确认缺口"里建议补做静态分析。
 

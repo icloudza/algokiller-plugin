@@ -177,8 +177,8 @@ Trace tools show *what happened*; BN shows *what the code looks like*. Install e
 
 | Plugin | License | Transport |
 |---|---|---|
-| [fosdickio/binary_ninja_mcp](https://github.com/fosdickio/binary_ninja_mcp) (348⭐) | GPL-3.0 | stdio |
-| [jtang613/BinAssistMCP](https://github.com/jtang613/BinAssistMCP) (33⭐) | MIT | HTTP/SSE |
+| [fosdickio/binary_ninja_mcp](https://github.com/fosdickio/binary_ninja_mcp) | GPL-3.0 | stdio |
+| [jtang613/BinAssistMCP](https://github.com/jtang613/BinAssistMCP) | MIT | HTTP/SSE |
 
 Both are Binary Ninja plugins and require a BN commercial license. The SKILLs detect the online side by namespace (`binary_ninja_mcp.*` / `binassist.*`); no extra config. With BN offline the plugin still runs (slower but viable) — the SKILLs won't pretend BN tools exist, and the final deliverable recommends static follow-up.
 
