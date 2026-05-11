@@ -674,6 +674,47 @@ class HypothesisLedger:
                          f"{falsify_tag}{rev_tag}{ratio_tag})")
         return "\n".join(lines)
 
+    # FIX gap 1 (v0.9.3, surfaced by real TikTok trace audit on
+    # trace_1009_main.log):
+    # When the agent labels a deliverable claim "高置信推断" /
+    # "high-confidence inference", the v0.9.0+v0.9.1 anti-hallucination
+    # scaffold expects [H<n>] backing. Pre-v0.9.3 general mode was a soft
+    # rule ("not required, but recommended") — agents routinely emitted
+    # 7+ such claims with zero ledger citations. This list of markers is
+    # scanned in validate_artifact_references; if any marker is present
+    # and no [H<n>] is cited, the artifact is rejected.
+    #
+    # Deliberately narrow: only catches the explicit *tier label*, not
+    # incidental occurrences of "confirmed" / "确认". Agents who don't
+    # use these tier labels can still ship reports — they just lose the
+    # tier-level signal.
+    HIGH_CONFIDENCE_TIER_MARKERS = (
+        # Chinese tier labels
+        "高置信推断",
+        "高置信",
+        # English tier labels (case-insensitive match below)
+        "high-confidence inference",
+        "high-confidence",
+        "high confidence",
+    )
+
+    @classmethod
+    def _detect_high_confidence_tier(cls, content: str) -> list[str]:
+        """Return the list of HIGH_CONFIDENCE_TIER_MARKERS found in content.
+
+        Case-insensitive substring match. Returns empty list if no marker
+        is present. The caller uses the absence/presence to decide
+        whether [H<n>] backing is required.
+        """
+        if not content:
+            return []
+        lower = content.lower()
+        found: list[str] = []
+        for marker in cls.HIGH_CONFIDENCE_TIER_MARKERS:
+            if marker.lower() in lower:
+                found.append(marker)
+        return found
+
     def validate_artifact_references(self, content: str) -> dict:
         # FIX A-8: bracketed [H<n>] is the canonical citation form.
         # The pre-v0.9.1 regex \bH(\d+)\b silently false-matched on:
@@ -708,4 +749,9 @@ class HypothesisLedger:
             if not h.supporting:
                 errors.append(f"{hid} has empty supporting evidence list")
                 continue
-        return {"ok": not errors, "errors": errors, "referenced_ids": referenced}
+        return {
+            "ok": not errors,
+            "errors": errors,
+            "referenced_ids": referenced,
+            "high_confidence_markers_found": self._detect_high_confidence_tier(content),
+        }

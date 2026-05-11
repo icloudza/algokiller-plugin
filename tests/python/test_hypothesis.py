@@ -607,6 +607,164 @@ class TestArtifactBracketCitation(unittest.TestCase):
             self.assertTrue(check["ok"])
 
 
+class TestHighConfidenceTierGate(unittest.TestCase):
+    """FIX gap 1 (v0.9.3) — '高置信推断' / 'high-confidence inference' tier
+    marker detection in artifact content. Closes the bypass surfaced by the
+    real TikTok trace audit (trace_1009_main.log) where the agent shipped 7+
+    high-confidence claims with zero [H<n>] backing."""
+
+    def _make_ledger(self, td: str):
+        return _make_ledger(Path(td))
+
+    def test_no_marker_returns_empty_list(self):
+        with tempfile.TemporaryDirectory() as td:
+            ledger, _ = self._make_ledger(td)
+            check = ledger.validate_artifact_references(
+                "# Findings\n\nObservation: line 8872 contains 4192-byte hexdump.")
+            self.assertEqual(check["high_confidence_markers_found"], [])
+
+    def test_chinese_marker_detected(self):
+        with tempfile.TemporaryDirectory() as td:
+            ledger, _ = self._make_ledger(td)
+            check = ledger.validate_artifact_references(
+                "## 6. 关键发现\n\n**高置信推断**: SM3 是本 SO 的核心 hash 原语。")
+            self.assertIn("高置信推断", check["high_confidence_markers_found"])
+
+    def test_english_marker_detected_case_insensitive(self):
+        with tempfile.TemporaryDirectory() as td:
+            ledger, _ = self._make_ledger(td)
+            check = ledger.validate_artifact_references(
+                "## Findings\n\n**High-Confidence Inference**: binary computes MD5.")
+            self.assertIn("high-confidence inference",
+                          check["high_confidence_markers_found"])
+
+    def test_both_zh_and_en_markers_detected(self):
+        with tempfile.TemporaryDirectory() as td:
+            ledger, _ = self._make_ledger(td)
+            check = ledger.validate_artifact_references(
+                "高置信推断: SM3. high-confidence inference: AES T-table.")
+            self.assertGreaterEqual(len(check["high_confidence_markers_found"]), 2)
+
+    def test_artifact_with_marker_and_citation_passes(self):
+        with tempfile.TemporaryDirectory() as td:
+            ledger, counter = self._make_ledger(td)
+            cid1 = _record_tool_call(ledger.tool_log, counter,
+                                     "trace_constscan", "SM3 T_j magic hit")
+            cid2 = _record_tool_call(ledger.tool_log, counter,
+                                     "trace_callgraph", "call func: sm3_compress")
+            r = ledger.add(statement="binary computes SM3",
+                           confidence="low",
+                           falsification_plan="cryptoinstr would show sha256h",
+                           supporting=[
+                               {"tool_call_id": cid1, "excerpt": "SM3 T_j magic hit"},
+                               {"tool_call_id": cid2, "excerpt": "call func: sm3_compress"},
+                           ])
+            hid = r["hypothesis"]["id"]
+            ledger.conclude(hid, "SM3 confirmed", final_confidence="medium")
+            # Artifact uses tier marker AND cites [H<n>] — passes validation
+            check = ledger.validate_artifact_references(
+                f"**高置信推断**: binary 用 SM3 (见 [{hid}])。")
+            self.assertTrue(check["ok"], check)
+            self.assertIn(hid, check["referenced_ids"])
+            # 高置信推断 contains 高置信 as a prefix; both markers register.
+            # That's intentional — variations like '高置信判断' also trip.
+            self.assertIn("高置信推断", check["high_confidence_markers_found"])
+
+
+class TestWriteArtifactHighConfGate(unittest.TestCase):
+    """End-to-end gate test through the handler layer (without JSON-RPC).
+
+    This is the test that nails the real TikTok-trace audit case: ledger is
+    empty (agent never called hypothesis_add), but the artifact contains
+    '高置信推断' tier claims. Pre-v0.9.3 this would silently write the file.
+    v0.9.3 must reject.
+    """
+
+    def setUp(self):
+        from state import STATE
+        from artifacts import ArtifactStore  # noqa: F401
+        self.td = tempfile.TemporaryDirectory()
+        STATE.trace_file = Path("/dev/null")
+        STATE.trace_basename = "test"
+        STATE.mode = "general"
+        STATE.tool_call_count = 0
+        STATE.artifacts_dir = Path(self.td.name)
+        from hypothesis import HypothesisLedger, ToolCallLog
+        STATE.tool_log = ToolCallLog(STATE.artifacts_dir)
+        STATE.ledger = HypothesisLedger(
+            artifacts_dir=STATE.artifacts_dir,
+            get_tool_call_count=lambda: STATE.tool_call_count,
+            tool_call_log=STATE.tool_log,
+        )
+        self.state = STATE
+
+    def tearDown(self):
+        from state import STATE
+        STATE.trace_file = None
+        STATE.daemon = None
+        STATE.ledger = None
+        STATE.tool_log = None
+        STATE.artifacts_dir = None
+        STATE.tool_call_count = 0
+        self.td.cleanup()
+
+    def test_high_conf_marker_no_citation_rejected(self):
+        from tools.handlers import tool_write_artifact
+        body = (
+            "# 完整分析报告\n\n"
+            + "## 6. 关键发现\n\n"
+            + "**高置信推断**: binary 在做 SM3 主压缩循环.\n\n"
+            + "(详细 hexdump 略)" * 20
+        )
+        result = tool_write_artifact({"path": "report.md", "content": body})
+        self.assertEqual(result["status"], "error")
+        self.assertIn("high-confidence", result["error"])
+        self.assertIn("高置信推断", result["high_confidence_markers_found"])
+        self.assertIn("instruction", result)
+
+    def test_no_marker_passes_even_empty_ledger(self):
+        from tools.handlers import tool_write_artifact
+        body = (
+            "# 体检报告\n\n"
+            + "**已确认**: trace 长度 7,145,157 行.\n\n"
+            + "(纯观察叙事 padding)" * 30
+        )
+        result = tool_write_artifact({"path": "obs.md", "content": body})
+        self.assertEqual(result["status"], "ok", result)
+        self.assertTrue(Path(result["path"]).exists())
+
+    def test_high_conf_marker_with_citation_passes(self):
+        from tools.handlers import tool_write_artifact
+        ledger = self.state.ledger
+        counter = [0]
+
+        def record(tool: str, payload: str) -> int:
+            counter[0] += 1
+            self.state.tool_call_count = counter[0]
+            ledger.tool_log.record(counter[0], tool, {},
+                                    {"status": "ok", "stdout": payload})
+            return counter[0]
+        c1 = record("trace_constscan", "SM3 T_j magic hit 1")
+        c2 = record("trace_callgraph", "call func: sm3_compress symbol")
+        r = ledger.add(statement="binary computes SM3 hash",
+                       confidence="low",
+                       falsification_plan="cryptoinstr would show sha256h instead",
+                       supporting=[
+                           {"tool_call_id": c1, "excerpt": "SM3 T_j magic hit 1"},
+                           {"tool_call_id": c2, "excerpt": "call func: sm3_compress symbol"},
+                       ])
+        hid = r["hypothesis"]["id"]
+        ledger.conclude(hid, "SM3 confirmed via multi-tool",
+                        final_confidence="medium")
+        body = (
+            "# 完整分析\n\n"
+            + f"**高置信推断**: binary 在做 SM3 (见 [{hid}]).\n\n"
+            + "(详细 hexdump 略)" * 20
+        )
+        result = tool_write_artifact({"path": "report-cited.md", "content": body})
+        self.assertEqual(result["status"], "ok", result)
+
+
 class TestAbandonCascade(unittest.TestCase):
     """abandon() must surface active hypotheses that depended on the
     abandoned one so the agent re-evaluates them."""

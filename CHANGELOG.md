@@ -6,6 +6,90 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.9.3] — Close general-mode ledger bypass (real-trace audit gap 1)
+
+The first real-world production run of algokiller (a 684 MB / 7.1M-line
+TikTok `libmetasec_ov.so` trace, `trace_1009_main.log`) shipped two
+analysis reports and surfaced a hole the v0.9.0/v0.9.1
+anti-hallucination scaffold could not close on its own:
+
+> The general-mode artifact contained 7+ "高置信推断" / "high-confidence
+> inference" tier claims (signature pipeline order, AES mode, hash
+> object semantics, MD5 sentinel interpretation) with **zero `[H<n>]`
+> ledger backing**. The agent never called `hypothesis_add`, so the
+> existing "concluded but unreferenced" gate didn't trigger. The skill
+> doc said "general 模式不强制走 Hypothesis Ledger" — agent obeyed
+> literally and bypassed the entire FIX#1-#7 layer.
+
+### Added — High-confidence tier marker gate
+
+- **`HypothesisLedger.HIGH_CONFIDENCE_TIER_MARKERS`** — explicit list of
+  tier label phrases (`高置信推断`, `高置信`, `high-confidence
+  inference`, `high-confidence`, `high confidence`) that signal a
+  cross-evidence-synthesis claim, not a raw observation.
+- **`HypothesisLedger._detect_high_confidence_tier(content)`** —
+  case-insensitive substring scan. Returned in
+  `validate_artifact_references()` as `high_confidence_markers_found`.
+- **`tool_write_artifact` new hard gate** — if `len(content) > 200` and
+  any marker is found and no `[H<n>]` is cited, rejected with explicit
+  instruction listing the markers and the two remediation paths
+  (run the ledger loop OR downgrade the tier label).
+- **General-mode discipline reminder** — added to
+  `GENERAL_SHORT_REMINDERS` so the agent learns the protocol before
+  hitting the gate.
+
+### Why marker-based, not catch-all
+
+Deliberately narrow: the gate fires only on **explicit tier labels**,
+not incidental occurrences of `confirmed` / `确认` / `结论`. Reports
+that only contain observation-tier (`已确认`) and tentative-tier
+(`推断`) language are unaffected. The point is to enforce discipline
+on the *claim tier the agent itself chose to label* — agents who never
+type the high-confidence label can still ship narratives, they just
+forfeit the tier-signal in their deliverable.
+
+### Skill doc rewrite
+
+`skills/trace-analysis/SKILL.md` now carries a v0.9.3 "Hypothesis
+Ledger 使用纪律" section spelling out the three-tier model:
+
+| 档位 | 是否要 [H<n>] | 例 |
+|---|---|---|
+| 已确认 (wire boundary confirmed) | 否 | line 8872 hexdump 4192 字节 = HTTP header |
+| 高置信推断 (high-confidence inference) | **是** | binary 在做 SM3 主压缩循环 |
+| 推断 / 猜测 (inference / hypothesis) | 推荐 | AES 模式可能是 CBC (open thread) |
+
+The old "general 模式不强制" wording is deleted.
+
+### Tests
+
+- `tests/python/test_hypothesis.py` — 8 new assertions across two new
+  test classes (`TestHighConfidenceTierGate`,
+  `TestWriteArtifactHighConfGate`):
+  - Empty content / observation-only content: no marker, no rejection.
+  - Chinese marker detected (`高置信推断`).
+  - English marker detected case-insensitively
+    (`High-Confidence Inference`).
+  - Mixed zh+en markers both flagged.
+  - Marker + `[H<n>]` citation → passes.
+  - Marker + empty ledger + no citation → rejected (the real-trace
+    audit case).
+  - No marker + empty ledger → ships (observation-only artifacts work).
+  - Marker + valid `[H<n>]` from full hypothesis_add → conclude loop →
+    ships (the happy path).
+- Python test count: 75 → 83.
+- Native tests unchanged at 146 PASS (no C engine work).
+
+### Notes — what this does NOT address
+
+The 0.9.3 batch is **deliberately scoped to gap 1** (general-mode
+bypass). The C-engine deferred items (F-4 adrp+ldr / F-6 hexblock
+nested depth / F-9 fold samples_per_fold / F-15 hexblock direction /
+A-3 daemon extcall) are now **rebadged 0.9.4** — they require deeper
+work and warrant their own focused release. Real-iOS-trace sample
+collection (to validate F-4) is still the prerequisite gate for that
+release.
+
 ## [0.9.2] — Loop-body crypto constants + trace-ui borrowed algorithms
 
 Comparative analysis against [imj01y/trace-ui](https://github.com/imj01y/trace-ui)
