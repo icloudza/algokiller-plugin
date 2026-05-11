@@ -86,7 +86,7 @@ jobs:
           assert 1 in got, f'no response to initialize; got ids={sorted(got)}'
           assert 2 in got, f'no response to tools/list; got ids={sorted(got)}'
           tools = got[2]['result']['tools']
-          assert len(tools) == 23, f'expected 23 tools, got {len(tools)}'
+          assert len(tools) == 25, f'expected 25 tools (v0.9.1: +mark_hypothesis_reviewed +hypothesis_archive), got {len(tools)}'
           pv = got[1]['result']['protocolVersion']
           print(f'MCP smoke ok: protocolVersion={pv}, tools={len(tools)}')
           PY
