@@ -357,6 +357,37 @@ def tool_write_artifact(args: dict[str, Any]) -> dict:
                         "cites none of them. Either cite the relevant H<id> in your "
                         "claims, or abandon those hypotheses if they no longer apply."),
                     }
+        # FIX gap 1 (v0.9.3, real-trace audit closure):
+        # If the deliverable labels any claim as "高置信推断" / "high-confidence
+        # inference" tier, [H<n>] backing is mandatory regardless of whether
+        # the ledger currently has any concluded hypothesis. Pre-v0.9.3 this
+        # check was a soft skill rule; in production (the trace_1009_main.log
+        # TikTok audit) the agent emitted 7+ such claims with zero ledger
+        # citations, bypassing the entire v0.9.0/v0.9.1 anti-hallucination
+        # scaffold. The hard gate forces the agent to either (a) actually run
+        # the hypothesis_add → conclude → [H<n>] loop, or (b) downgrade the
+        # claim's tier label.
+        high_conf_markers = check.get("high_confidence_markers_found", [])
+        if high_conf_markers and not check["referenced_ids"] and len(content) > 200:
+            return {"status": "error",
+                    "error": ("artifact contains 'high-confidence inference' tier "
+                              "claims but cites no [H<n>] backing"),
+                    "high_confidence_markers_found": high_conf_markers,
+                    "instruction": (
+                        f"The deliverable uses tier marker(s) {high_conf_markers!r} "
+                        "but no [H<n>] hypothesis is cited. v0.9.3 anti-hallucination "
+                        "rule (general mode): any 'high-confidence inference' tier "
+                        "claim must trace back to a concluded hypothesis in the "
+                        "ledger. Either:\n"
+                        "  1) Run hypothesis_add → gather evidence → "
+                        "hypothesis_conclude(>=medium) → cite as [H<n>] in the "
+                        "narrative, OR\n"
+                        "  2) Downgrade the marker to '推断' / 'inference' / "
+                        "'tentative' if you don't have the evidence to back high "
+                        "confidence. Don't ship a high-confidence label without a "
+                        "ledger entry — that's exactly what the FIX#1-#7 scaffold "
+                        "is built to prevent."),
+                    }
     store = ArtifactStore(STATE.artifacts_dir, mode=STATE.mode)
     return store.write(
         rel_path=str(args.get("path", "")),

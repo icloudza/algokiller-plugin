@@ -32,6 +32,11 @@ GENERAL_SHORT_REMINDERS = [
     "hexdump ASCII = search hint; field boundaries = left-side hex + address + length.",
     "TIME-BOX: >20 calls on single-question task → start degraded delivery.",
     "STATIC-AID: algokiller.run_static_tool available — file / rabin2 -Iz / strings / rg / jq / class-dump / r2 (bounded). Priority: BN MCP > run_static_tool > trace-only.",
+    # FIX gap 1 (v0.9.3): nudge ledger usage in general mode. Real TikTok
+    # trace audit showed agents shipping 7+ '高置信推断' claims with zero
+    # [H<n>] backing — write_artifact now hard-rejects this, but the agent
+    # should learn the protocol before hitting the gate.
+    "LEDGER (v0.9.3): any '高置信推断' / 'high-confidence inference' tier claim in your deliverable MUST be backed by a concluded [H<n>] hypothesis. write_artifact rejects high-conf labels without [H<n>] citation. '已确认' (raw observation) and '推断' (tentative) tiers don't require ledger.",
 ]
 
 CIPHERTEXT_FULL_BLOCK = """[Full-rule reinjection — ciphertext mode]

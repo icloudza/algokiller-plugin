@@ -47,19 +47,65 @@ description: ARM64 trace 通用证据分析方法论。当用户给出一段 ARM
 
 ---
 
-## Sub-agent: hypothesis-reviewer (v0.9.0+, 可选)
+## Hypothesis Ledger 使用纪律 (v0.9.3+ 真 trace audit 后收紧)
 
-general 模式不强制走 Hypothesis Ledger,但当任务**会驱动一个具体技术决策**（例如"这个 buffer 是被算法 X 加密的"会决定后续如何还原数据流）时, 推荐:
+**底层逻辑变更**:v0.9.2 真实 TikTok trace audit 暴露了一个 general 模式盲点 ——
+旧版 SKILL 写 "general 模式不强制走 Hypothesis Ledger",导致 agent 在交付物里
+放 7+ 条"高置信推断"档结论但 **零 `[H<n>]` 引用**,绕过了 v0.9.0/v0.9.1
+反幻觉硬 gate。v0.9.3 起 general 模式规则收紧:
 
-1. 用 `hypothesis_add` 记录关键判断
-2. 想把它升为 `conclude(high)` 之前, spawn `hypothesis-reviewer` agent 做独立蓝军审查:
-   ```
-   Agent(subagent_type="hypothesis-reviewer",
-         prompt="Review H<N>. Statement: '<…>'. Bound trace: <path> (mode=general)")
-   ```
-3. reviewer 返回 `confirm` / `refute` / `abandon` + reason, 主 agent 按推荐执行 conclude / 补证据 / abandon
+### 三档 claim 分类(交付物撰写时必须严格遵守)
 
-详见 `algokiller:ciphertext-recovery` skill 的 "conclude(high) 必经蓝军审查" 章节。
+| 档位 | 定义 | 是否要 [H<n>] 引用 | 示例 |
+|---|---|---|---|
+| **已确认** (wire boundary confirmed) | trace 直接观察到的事实 | 否(观察级,不算推断) | "line 8872 hexdump 4192 字节 = HTTP header" |
+| **高置信推断** (high-confidence inference) | 跨多条证据综合的算法/语义判断 | **是,必须 [H<n>]** | "binary 在做 SM3 主压缩循环",必须有 hypothesis_conclude(>=medium) |
+| **推断** / **猜测** (inference / hypothesis) | 单点 / 间接证据 | 推荐 [H<n>] | "AES 模式可能是 CBC"(open thread) |
+
+### 何时建 hypothesis
+
+凡是交付物里准备打"**高置信推断**"标签的结论,**写到 artifact 之前**必须:
+
+1. `hypothesis_add(statement, confidence='low', falsification_plan, supporting=[...])`
+   —— `supporting` 必须包含 ≥1 个 evidence(tool_call_id + verbatim excerpt)
+2. 继续收集证据到 supporting >= 2 且来自 ≥2 个不同 tool(FIX#3 diversity)
+3. 跑 falsification_plan,把 result 作为 `falsification_evidence` update 进去
+   (FIX#5)
+4. `hypothesis_conclude(id, final_statement, final_confidence='medium')`
+5. artifact 里用 `[H<n>]` 引用(v0.9.1 起 bracket 格式;裸 H<n> 不再识别)
+
+### conclude(high) 必经蓝军 (沿用 v0.9.0)
+
+当任务**会驱动一个具体技术决策**(例如"这个 buffer 是被算法 X 加密的"会决定
+后续如何还原数据流)且需要 `conclude(high)` 时,**必须** spawn
+`hypothesis-reviewer` 做独立蓝军审查:
+
+```
+Agent(subagent_type="hypothesis-reviewer",
+      prompt="Review H<N>. Statement: '<…>'. Bound trace: <path> (mode=general)")
+```
+
+reviewer 自己会调 `mark_hypothesis_reviewed`,server 端 FIX#6 hard gate 检查
+verdict='confirm' 且 ≤30 tool 调用陈旧。详见 `algokiller:ciphertext-recovery`
+skill 的 "conclude(high) 必经蓝军审查" 章节。
+
+### v0.9.3 write_artifact 新增 gate
+
+如果交付物 content 含以下 **"高置信推断" tier marker**(中英任意),server 端
+扫一遍,**只要 marker 出现就要求 [H<n>] 引用至少一个 concluded 假设**:
+
+中文: `高置信推断` `high-confidence inference` `high confidence` (大小写不敏感)
+英文: `high-confidence inference` `high-confidence` `high confidence`
+
+**没引用 = 直接拒**,错误信息会告诉你具体哪段含 marker。**这是 v0.9.3 关闭真
+trace audit gap 1 的硬抓手**,不是建议,是 enforce。
+
+### 例外:已确认 / 推断 tier 不受影响
+
+只要你不打"高置信推断"档标签,可以自由叙述。例如 §4 hexdump 解 ASCII 后
+回写出 HTTP header 字段值是"已确认"档,不需要 [H<n>]。但**一旦你在叙事里
+说"binary 在做 SM3" / "AES 用 CBC 模式" / "MD5 输入是 sentinel"这种跨证据
+综合判断,必须先走 ledger 闭环**。
 
 ---
 
