@@ -48,3 +48,7 @@ artifacts/
 .python-version
 *.egg
 .eggs/
+
+# ak_search build artifact in source dir (server/bin/ak_search is the
+# canonical runtime binary; tools/search/ak_search is a transient `make` output)
+tools/search/ak_search

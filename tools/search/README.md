@@ -14,11 +14,12 @@ High-throughput trace-evidence engine for very large ARM64 trace files.
 
 Source of the native engine, vendored into the plugin repo so non-arm64-macOS users can build their own `ak_search` binary without cloning the upstream repo separately.
 
-- `./ak_search`  — prebuilt **arm64-macOS** binary (same hash as `server/bin/ak_search`, kept for reference / direct run)
-- `./search.c`   — full source (single C11 translation unit, ~2800 lines after extension)
+- `./search.c`   — full source (single C11 translation unit, ~3 K lines after extension)
 - `./Makefile`   — minimal builder
 - `./build.sh`   — thin wrapper around `make`
-- `./tests/`     — POSIX-sh harness, 97 assertions across all subcommands, hand-crafted fixtures
+- `./tests/`     — POSIX-sh harness, 108 assertions across all subcommands, hand-crafted fixtures
+
+The prebuilt runtime binary lives at [`../../server/bin/ak_search`](../../server/bin/ak_search) (arm64-macOS). The `tools/search/ak_search` produced by `make` here is a local build artifact and is git-ignored.
 
 ### Build for your platform
 
