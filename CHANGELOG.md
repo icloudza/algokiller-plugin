@@ -6,12 +6,68 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
-## [0.9.3] — Close general-mode ledger bypass (real-trace audit gap 1)
+## [0.9.4] — Brand hygiene: strip app-specific names from skill / code / fixtures
+
+algokiller's mission is **algorithm-domain-agnostic** trace analysis ——
+"秒杀一切算法", not "reverse a specific app". Prior releases accidentally
+embedded specific app/product names (TikTok / WeChat / libmetasec / X-Sign
+header families / `抖音/微信/支付宝/淘宝/京东` SDK list / `mmcronet` /
+`trace_1009_main.log`) into SKILL docs, code comments, MCP schema
+descriptions, test fixtures, and discipline reminders.
+
+This is a real anti-hallucination concern: when the AI agent loads an
+algokiller skill and sees brand-specific exemplars, it biases prior
+toward that brand's tech stack — exactly the hallucination vector
+FIX#1-#7 are built to suppress. Brand contamination in skill text =
+priming the agent for false positives on any unrelated trace.
+
+### Changed — generic identifiers across the board
+
+| Surface | Before | After |
+|---|---|---|
+| SKILL.md modgraph examples | `WeChat ↔ mmcronet / libmetasec ↔ libc++` | `app_main ↔ lib_net / target_sign ↔ libc++` |
+| SKILL.md fold example | `WeChat 启动 trace 实测 115MB → 1.1MB` | `大型移动应用启动 trace 实测 115MB → 1.1MB` |
+| SKILL.md constscan example | `wechat TEA delta 28 命中` | `ARM64 trace TEA delta 28 命中` |
+| SKILL.md VM detection list | `抖音/微信/支付宝/淘宝/京东` | `大型应用厂商自研 VM (各家社交/支付/电商客户端)` |
+| SKILL.md table row | `看 WeChat 调没调 mmcronet` | `看主模块调没调子模块` |
+| Server comments | `real TikTok trace audit on trace_1009_main.log` | `real-world large-trace audit (684 MB / 7.1M-line production ARM64 trace)` |
+| schemas.py modgraph desc | `WeChat <-> mmcronet` | `app_main <-> lib_net` |
+| schemas.py fold desc | `Real WeChat startup trace` | `Real production startup trace` |
+| search.c GumTrace example | `[WeChat]` | `[Module]` |
+| tools/search/README.md | `WeChat startup trace` | `a production startup trace` |
+| Test fixtures (5 .trace files) | `[WeChat]` / `[mmcronet]` | `[app_main]` / `[lib_net]` |
+| Test assertions (4 lines) | mentions of `WeChat` / `mmcronet` | `app_main` / `lib_net` |
+
+### Changed — CHANGELOG narrative softened
+
+v0.9.3 entry's "TikTok / libmetasec / trace_1009_main.log" references
+generalised to "real-world large-trace audit (684 MB / 7.1M-line
+production ARM64 trace)". The specific brand provided the empirical
+ground truth for the gap-1 fix; the gap-1 fix itself is brand-agnostic
+and should be documented that way going forward.
+
+v0.9.2 entry's `WeChat-style X-Sign / X-Token` softened to generic
+"API-auth signing header reverse-engineering target".
+
+### Notes
+
+- Git commit messages preceding this release contain the original
+  brand references and are NOT rewritten — rewriting public history
+  would force-push downstream consumers and is not worth the
+  blast-radius.
+- Going forward, **no new commit / SKILL / comment / schema description
+  / test fixture may introduce specific app or product names**. Use
+  generic identifiers (`app_main`, `lib_net`, `target_sign`, "production
+  trace", "large internet app SDK") in their place.
+- Native tests: 146 PASS (unchanged after fixture rename).
+- Python tests: 83 PASS (unchanged).
+
+## [0.9.3] — Close general-mode ledger bypass (real-world large-trace audit gap 1)
 
 The first real-world production run of algokiller (a 684 MB / 7.1M-line
-TikTok `libmetasec_ov.so` trace, `trace_1009_main.log`) shipped two
-analysis reports and surfaced a hole the v0.9.0/v0.9.1
-anti-hallucination scaffold could not close on its own:
+production ARM64 trace) shipped two analysis reports and surfaced a
+hole the v0.9.0/v0.9.1 anti-hallucination scaffold could not close on
+its own:
 
 > The general-mode artifact contained 7+ "高置信推断" / "high-confidence
 > inference" tier claims (signature pipeline order, AES mode, hash
@@ -119,7 +175,7 @@ This release closes that strategy gap.
   (GM/T 0004-2012 §5.4). Two round constants covering all 64 rounds.
 - **HMAC.ipad** = `0x36363636`, **HMAC.opad** = `0x5c5c5c5c`
   (RFC 2104 §2). Token-signing / API-auth signal — high-value for the
-  common WeChat-style X-Sign / X-Token reverse-engineering target.
+  API-auth signing header reverse-engineering target.
 - **DES** (FIPS 46-3) — `DES.const0` / `const1` / `shifted0` /
   `shifted1` + `DES.sbox_word[0..3]`. Imported from trace-ui's 28-magic
   table; marked **FP_WEAK** (const0/const1/shifted0/shifted1) and
@@ -484,7 +540,7 @@ release (commit `b59125b`):
 ### Added
 - `trace_lint` — single-pass JSON health-check for bound traces.
 - `trace_fold` — block-aware repeated-region folding; 115 MB → 1.1 MB
-  on WeChat startup trace at `--block 4 --threshold 100`.
+  on a production startup trace at `--block 4 --threshold 100`.
 
 ## [0.2.0] — Sprint 1: regflow / producer / semop
 

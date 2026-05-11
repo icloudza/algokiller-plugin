@@ -20,7 +20,7 @@ description: ARM64 trace 密文还原方法论。当用户给出一段 ARM64 执
 - `algokiller.trace_constscan`：扫 **95 个**密码学常数指纹（MD5 init+T 表/SHA-1/SHA-256 init+K 表/SHA-512/SM3 init+T_j 轮常数/SHA-3/CRC32/FNV1a/AES sbox/AES Te0/SM4/ChaCha20/TEA/DES SP-box/Whirlpool/Poly1305/SipHash/**HMAC ipad-opad** + P-256/secp256k1/Ed25519/Curve25519）。**v0.9.2 关键升级**:除 IV 外还扫**主循环常数**(MD5 T 表 / SHA-256 K 表 / SM3 T_j),它们每个 block 命中 64 次而 IV 只命中 1 次——活跃 hash trace 的真实信号密度由这些主循环常数主导。**必看 `verdict` 字段而不是 `total_hits`**：`real` = load_imm 或 mem_r 真信号；`alu_only` = ALU 运算碰撞假阳，必须忽略；`weak` = 仅 mem_w/mem_r_addr 间接信号。每个命中带 `evidence` 分项（load_imm / mem_r / alu / ...）和 `sample_lines` 锚点。`category` 分类：hash / cipher_sym / ecc / crc / mac；`confidence` 分级：strong / medium / weak。
 - `algokiller.trace_cryptoinstr`：扫 ARM Crypto Extensions 硬件加密指令（AES `aese/aesmc/aesd/aesimc`、SHA-1 `sha1c/m/p/h/su0/su1`、SHA-256 `sha256h/h2/su0/su1`、SHA-512 `sha512h/h2/su0/su1`、SHA-3 `eor3/rax1/xar/bcax`、GHASH `pmull/pmull2`、SM3 `sm3*`、SM4 `sm4e/sm4ekey`）。**这是 constscan 的盲区补丁**：当 binary 走硬件加密（iOS CryptoKit / BoringSSL ARM / libsodium-arm / Android Keystore HW path / iPhone 5s+ 默认），软件 sbox/常数完全消失——只有硬件指令本身能识别。**必须 constscan + cryptoinstr 一起跑**：如果 constscan 报 AES.Te0 = 0 但 cryptoinstr 报 aese hits > 0，那就是 AES-NI 在跑，不是没加密。
 - `algokiller.trace_callgraph --top N`：Top-K 最常被调的 `call func: NAME(args)` 符号 + 计数。一眼看见热路径（malloc/memcpy/objc_msgSend/CCCrypt/...）。
-- `algokiller.trace_modgraph --top N`：跨模块跳转矩阵。看 caller_mod → callee_mod 邻接 + 边权重，定位密码学边界（如 WeChat → openssl / metasec → libc++）。
+- `algokiller.trace_modgraph --top N`：跨模块跳转矩阵。看 caller_mod → callee_mod 邻接 + 边权重，定位密码学边界(如 app_main → openssl / target_sign → libc++)。
 
 **🔬 精准搜索与上下文**
 - `algokiller.trace_search`：大小写不敏感精确子串搜索（BMH 引擎）。`limit ≤ 100`，须二选一 `from_line` / `before_line`。
@@ -36,7 +36,7 @@ description: ARM64 trace 密文还原方法论。当用户给出一段 ARM64 执
 - `algokiller.trace_hexblock --line N`：解析 `call func: NAME(args)` 块——返回 call、args、可选 `class:` 标签、可选 `hexdumps[]`（每段 `{address, length, bytes_hex}`，bytes_hex 已拼接所有 hexdump 行）、`ret`。替代手动凑 `trace_context` + 拼字节。memcpy/sprintf/CCCrypt 后取数据流首选。
 
 **📉 体量管理**
-- `algokiller.trace_fold --out_path PATH --block 4 --threshold 100`：写一份新 trace，连续 W 行相同 signature 的重复块折叠为 first-block + sentinel + last-block。WeChat 启动 trace 实测 115MB → 1.1MB（99% 压缩），保留首末块数据流证据。Hash loop（madd / ldrsb / subs / b.ne 4 条交替）用 `--block 4`，单指令重复用 `--block 1`。
+- `algokiller.trace_fold --out_path PATH --block 4 --threshold 100`：写一份新 trace，连续 W 行相同 signature 的重复块折叠为 first-block + sentinel + last-block。大型移动应用启动 trace 实测 115MB → 1.1MB(99% 压缩),保留首末块数据流证据。Hash loop(madd / ldrsb / subs / b.ne 4 条交替)用 `--block 4`,单指令重复用 `--block 1`。
 
 **📦 交付物**
 - `algokiller.write_artifact`：写最终交付物（`.py` 源码 / `.md` 分析报告）到本次会话 artifacts 目录。
@@ -197,7 +197,7 @@ constscan + cryptoinstr 都缺信号时（**两者都 0 命中或全 `alu_only`*
 | **硬件加密** (AES-NI/SHA-NI/SM-Crypto-Ext) | cryptoinstr 命中 `aese/sha256h/...` | 看 cryptoinstr 输出即可定算法候选 |
 | **bitsliced / 常时实现** (BearSSL, HACL\*, fiat-crypto) | 大量 `eor`/`bic`/`and`/`orr` 算术堆叠，无表查找，无 sbox | trace_semop 标 `crypto_candidate`/`alu`；trace_modgraph 找 BearSSL/HACL 符号；BN/r2 静态匹配函数 prologue |
 | **runtime-generated tables** (启动期算 Te[]) | trace_search 找 `0x63 0x7c 0x77 0x7b` 等 sbox 字节字面量；找 `xtime` 模式（`x << 1` + 条件 `^0x1b`） | trace_regflow 追 table 基址 → trace_bytes 搜首字节序列 |
-| **compiler constant splitting** (movz/movk 4 段拼) | `movz/movk` 拼装时 trace 行有完整 `-> wN=0xMAGIC`（GumTrace 记寄存器值, 仍能被 constscan 命中）；但 LTO/IPO 后整段消失 | constscan 实际能抓 movz+movk 拼装结果（实测 wechat TEA delta 28 命中）；LTO 抹掉的情况要靠 hash / xref 函数级匹配 |
+| **compiler constant splitting** (movz/movk 4 段拼) | `movz/movk` 拼装时 trace 行有完整 `-> wN=0xMAGIC`(GumTrace 记寄存器值, 仍能被 constscan 命中);但 LTO/IPO 后整段消失 | constscan 实际能抓 movz+movk 拼装结果(实测 ARM64 trace TEA delta 28 命中);LTO 抹掉的情况要靠 hash / xref 函数级匹配 |
 | **dynamic-linked crypto** (CCCrypt/CommonCrypto, OpenSSL via libcrypto.dylib) | trace 主 binary 0 命中，但 `call func: CCCrypt`/`call func: EVP_*`/`call func: SecKeyEncrypt` | trace_callgraph --to CCCrypt / EVP_ / Sec ；hexblock 取 call args/hexdump |
 | **委派给 SEP / dyld_shared_cache / TrustZone** | 看到 `mach_msg_send` → SEP；`call func: BoringSSL_*` 在 cache 内 | 这部分超出 trace 范围；只能从 args/return 推 |
 | **白盒密码 (T-box, wide encoding)** | 无 constscan + nested `ldr` 模式（一次 ldr 输出立刻成下一次 ldr 的 index）+ 表项熵高 + 表间有 affine mask XOR | trace_regflow 追 index 寄存器；trace_search "mem_r=" 找 table 基址；BN 静态看 table 大小 + 引用 |
@@ -317,7 +317,7 @@ constants          (constscan verdict=real)
 | 取 memcpy 后那段字节流 | `trace_context` × N + 手拼 hex 行 | `trace_hexblock --line <memcpy行>` 返结构化 + bytes_hex |
 | 看 metasec 在调谁 | `trace_search "call func:"` 翻 | `trace_callgraph --top 20` 直接 Top-K |
 | 谁调过 `objc_retain` | `trace_search "call func: objc_retain"` × limit | `trace_callgraph --to objc_retain` 全部命中 |
-| 看 WeChat 调没调 mmcronet | LLM 数 `[mmcronet]` 行 | `trace_modgraph --top 30` 返跨模块矩阵 |
+| 看主模块调没调子模块 | LLM 数 `[ModuleName]` 行 | `trace_modgraph --top 30` 返跨模块矩阵 |
 | 找全 trace 0x67452301 出现 | `trace_search` 受 limit 100 制约 | `trace_bytes --query 0x67452301 --limit 10000` 全量 + 反序变体 |
 | 110MB hash loop trace 看不动 | 苦撑 | `trace_fold --out_path /tmp/fold.trace --block 4 --threshold 100` 压 99%，再 bind_trace 折叠版 |
 
@@ -512,7 +512,7 @@ open thread: <一句话描述发现>
 4. 不必管这些算子是 dispatcher 直接执行还是 handler 中执行——只要 trace 证明它影响了 IO buffer 即可。
 5. 把语义算子序列归到候选算法族（XOR-add-rotate / Feistel / ARX / table-driven 等），按现有"候选穷举"流程继续。
 
-国内厂自研 VM（抖音/微信/支付宝/淘宝/京东等都有过）指纹比 VMP 弱：handler 数量更少（10-50 个 vs VMP 100+）、opcode 多为 1-2 字节、VM context 通常 < 256 字节、常和 OLLVM fla 混合使用。处置规则相同。
+大型应用厂商自研 VM(各家社交/支付/电商客户端历史上都有过)指纹比 VMP 弱:handler 数量更少(10-50 个 vs VMP 100+)、opcode 多为 1-2 字节、VM context 通常 < 256 字节、常和 OLLVM fla 混合使用。处置规则相同。
 
 ### OLLVM 三大 pass 指纹与归约
 

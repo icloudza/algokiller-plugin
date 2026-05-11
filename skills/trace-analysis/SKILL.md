@@ -19,7 +19,7 @@ description: ARM64 trace 通用证据分析方法论。当用户给出一段 ARM
 - `algokiller.trace_lint`：单遍扫 trace 得 JSON 体检——行数 / 模块分布 / Top-K mnemonic / call_func 块数 / 寄存器观察率 / `format_ok` / `warnings`。先调一次确认 trace 格式可用 + 结构画像清晰；非 GumTrace 格式立即停止。
 - `algokiller.trace_callgraph --top N`：Top-K 最常被调的 `call func: NAME(args)` 符号 + 计数，一眼看见执行流热点（malloc / objc_msgSend / __memcpy / pthread_mutex_unlock / ...）。
 - `algokiller.trace_callgraph --to NAME`：查询哪些行调用了指定函数（substring 匹配）。比手动 `trace_search "call func: NAME"` 干净。
-- `algokiller.trace_modgraph --top N`：跨模块跳转矩阵——caller_mod → callee_mod 边权重 + 每模块行数。看模块边界跳转密度（如 WeChat ↔ mmcronet、libmetasec ↔ libc++）。
+- `algokiller.trace_modgraph --top N`：跨模块跳转矩阵——caller_mod → callee_mod 边权重 + 每模块行数。看模块边界跳转密度(如 app_main ↔ lib_net、target_sign ↔ libc++)。
 - `algokiller.trace_constscan`：扫 71 个密码学常数指纹。**必看 `verdict` 字段而不是 `total_hits`**：`real` = 真信号；`alu_only` = ALU 碰撞假阳必须忽略；`weak` = 间接信号。即使 general 模式，constscan 也能快速回答"代码里有没有 hash / 加密"。
 - `algokiller.trace_cryptoinstr`：扫 ARM Crypto Extensions 硬件加密指令（aese/sha256h/sm4e/pmull/...）。constscan 看软件，cryptoinstr 看硬件——必须配对：constscan 0 + cryptoinstr 命中 = 硬件加密；constscan 命中 + cryptoinstr 0 = 软件加密；两者都 0 = 无加密 OR 白盒/混淆。
 
@@ -49,10 +49,11 @@ description: ARM64 trace 通用证据分析方法论。当用户给出一段 ARM
 
 ## Hypothesis Ledger 使用纪律 (v0.9.3+ 真 trace audit 后收紧)
 
-**底层逻辑变更**:v0.9.2 真实 TikTok trace audit 暴露了一个 general 模式盲点 ——
-旧版 SKILL 写 "general 模式不强制走 Hypothesis Ledger",导致 agent 在交付物里
-放 7+ 条"高置信推断"档结论但 **零 `[H<n>]` 引用**,绕过了 v0.9.0/v0.9.1
-反幻觉硬 gate。v0.9.3 起 general 模式规则收紧:
+**底层逻辑变更**:v0.9.2 一次真实大规模 trace audit(684 MB / 7.1M 行 ARM64
+trace)暴露了一个 general 模式盲点 —— 旧版 SKILL 写 "general 模式不强制走
+Hypothesis Ledger",导致 agent 在交付物里放 7+ 条"高置信推断"档结论但
+**零 `[H<n>]` 引用**,绕过了 v0.9.0/v0.9.1 反幻觉硬 gate。v0.9.3 起 general
+模式规则收紧:
 
 ### 三档 claim 分类(交付物撰写时必须严格遵守)
 
