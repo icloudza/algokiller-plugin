@@ -357,12 +357,12 @@ def tool_write_artifact(args: dict[str, Any]) -> dict:
                         "cites none of them. Either cite the relevant H<id> in your "
                         "claims, or abandon those hypotheses if they no longer apply."),
                     }
-        # FIX gap 1 (v0.9.3, real-trace audit closure):
+        # FIX gap 1 (v0.9.3, real-world large-trace audit closure):
         # If the deliverable labels any claim as "高置信推断" / "high-confidence
         # inference" tier, [H<n>] backing is mandatory regardless of whether
         # the ledger currently has any concluded hypothesis. Pre-v0.9.3 this
-        # check was a soft skill rule; in production (the trace_1009_main.log
-        # TikTok audit) the agent emitted 7+ such claims with zero ledger
+        # check was a soft skill rule; in production audit (684 MB / 7.1M-line
+        # ARM64 trace) the agent emitted 7+ such claims with zero ledger
         # citations, bypassing the entire v0.9.0/v0.9.1 anti-hallucination
         # scaffold. The hard gate forces the agent to either (a) actually run
         # the hypothesis_add → conclude → [H<n>] loop, or (b) downgrade the

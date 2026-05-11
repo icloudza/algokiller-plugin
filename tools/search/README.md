@@ -82,7 +82,7 @@ ak_search bytes       --file PATH --query 0xVAL [--limit N] [--with-text]
 | `producer`  | Backward scan from `--sink-line` for the most recent `-> regN=0xVAL` matching the requested value. | ~28 ms per 50-line back-scan |
 | `semop`     | Classify each instruction (`zero` / `crypto_candidate` / `hash_loop_candidate` / `stack_save|restore` / `memory_load|store` / `branch` / `addr_calc` / `data_move` / `alu` / `compare` / `unknown`). | linear, < 5 ms per row |
 | `lint`      | Single-pass JSON health-check: line count, module distribution, top mnemonics, `call func:` / `hexdump` / `ret` counts, register/memory observation presence, format warnings. | 0.22 s |
-| `fold`      | Write a derivative trace with repeated W-line blocks collapsed to first-block + sentinel + last-block. `--block 4 --threshold 100` collapses ARM64 4-instruction hash loops. | 0.09 s — 115 MB → 1.1 MB (99 %) on WeChat startup trace |
+| `fold`      | Write a derivative trace with repeated W-line blocks collapsed to first-block + sentinel + last-block. `--block 4 --threshold 100` collapses ARM64 4-instruction hash loops. | 0.09 s — 115 MB → 1.1 MB (99 %) on a production startup trace |
 | `callgraph` | `--top N` Top-K most-called `call func:` symbols; `--to NAME` lists every call site of NAME. | 0.4 s |
 | `modgraph`  | Cross-module transition matrix + per-module line counts + Top-K edges. | 0.45 s |
 | `hexblock`  | Parse a `call func: NAME(args)` block at `--line` into structured JSON: call, args, optional ObjC class, optional hexdumps with concatenated `bytes_hex`, terminating `ret`. | 0.15 s |
@@ -96,7 +96,7 @@ Every subcommand emits one JSON object per line:
 
 ```json
 {"type":"match","line":42,"byte_offset":8192,"text":"..."}
-{"type":"regflow","line":600000,"value":"0x2bab...","instr":"[WeChat] 0x... madd x9, ..."}
+{"type":"regflow","line":600000,"value":"0x2bab...","instr":"[Module] 0x... madd x9, ..."}
 {"type":"producer","line":17,"reg":"x0","value":"0x11fbcded8","instr":"..."}
 {"type":"semop","line":1,"mnem":"stp","class":"stack_save","operands":"x29, x30, [sp,#0x60]","instr":"..."}
 {"type":"lint","size_bytes":...,"line_count":...,"top_modules":[...],"top_mnemonics":[...],"format_ok":true,"warnings":[]}

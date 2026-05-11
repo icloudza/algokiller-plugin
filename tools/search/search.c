@@ -825,7 +825,7 @@ static bool find_output_reg_for_value(LineView line, const char *wanted_value,
 }
 
 /* Parse mnemonic + operand region from a line of form:
- *   [WeChat] 0xABS!0xREL mnem operands; ...
+ *   [Module] 0xABS!0xREL mnem operands; ...
  * Returns false if line doesn't match the expected GumTrace prefix.
  */
 static bool parse_mnem_and_operands(LineView line,

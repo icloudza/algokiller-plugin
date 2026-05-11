@@ -156,7 +156,7 @@ out=$($BIN lint --file "$FIXTURE" --top 5)
 count=$(printf '%s\n' "$out" | grep -c '^{"type":"lint"' || true)
 assert_eq "lint emits 1 JSON object" "1" "$count"
 assert_contains "lint reports 15 lines" '"line_count":15' "$out"
-assert_contains "lint sees WeChat module" '"name":"WeChat"' "$out"
+assert_contains "lint sees app_main module" '"name":"app_main"' "$out"
 assert_contains "lint detects register obs" '"has_register_observations":true' "$out"
 assert_contains "lint detects memory reads" '"has_memory_reads":true' "$out"
 assert_contains "lint detects memory writes" '"has_memory_writes":true' "$out"
@@ -266,11 +266,11 @@ assert_contains "callgraph xref miss → 0 hits" '"total_hits":0' "$out"
 echo "[test] new: modgraph"
 
 out=$($BIN modgraph --file "$S34" --top 10)
-assert_contains "modgraph sees WeChat module" '"name":"WeChat"' "$out"
-assert_contains "modgraph sees mmcronet module" '"name":"mmcronet"' "$out"
-# fixture: WeChat → mmcronet 1, mmcronet → WeChat 1 = 2 transitions
-assert_contains "modgraph WeChat→mmcronet edge" '"from":"WeChat","to":"mmcronet"' "$out"
-assert_contains "modgraph mmcronet→WeChat edge" '"from":"mmcronet","to":"WeChat"' "$out"
+assert_contains "modgraph sees app_main module" '"name":"app_main"' "$out"
+assert_contains "modgraph sees lib_net module" '"name":"lib_net"' "$out"
+# fixture: app_main → lib_net 1, lib_net → app_main 1 = 2 transitions
+assert_contains "modgraph app_main→lib_net edge" '"from":"app_main","to":"lib_net"' "$out"
+assert_contains "modgraph lib_net→app_main edge" '"from":"lib_net","to":"app_main"' "$out"
 assert_contains "modgraph total_transitions=2" '"total_transitions":2' "$out"
 
 # -----------------------------------------------------------------------------

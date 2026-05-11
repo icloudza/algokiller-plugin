@@ -674,8 +674,8 @@ class HypothesisLedger:
                          f"{falsify_tag}{rev_tag}{ratio_tag})")
         return "\n".join(lines)
 
-    # FIX gap 1 (v0.9.3, surfaced by real TikTok trace audit on
-    # trace_1009_main.log):
+    # FIX gap 1 (v0.9.3, surfaced by a real-world large-trace audit —
+    # 684 MB / 7.1M-line production ARM64 trace):
     # When the agent labels a deliverable claim "高置信推断" /
     # "high-confidence inference", the v0.9.0+v0.9.1 anti-hallucination
     # scaffold expects [H<n>] backing. Pre-v0.9.3 general mode was a soft
