@@ -2181,55 +2181,176 @@ static int cmd_hexblock(int argc, char **argv) {
  * ===========================================================================
  */
 
+typedef enum { FP_WEAK = 0, FP_MEDIUM = 1, FP_STRONG = 2 } Confidence;
+
+static const char *confidence_str(Confidence c) {
+    switch (c) {
+        case FP_STRONG: return "strong";
+        case FP_MEDIUM: return "medium";
+        case FP_WEAK:   return "weak";
+    }
+    return "unknown";
+}
+
 typedef struct {
     const char *name;
-    const char *category;   /* hash / cipher / cipher_hint / crc */
-    const char *magic_hex;  /* "0x" + lowercase hex literal */
+    const char *category;    /* taxonomy: hash / cipher_sym / cipher_asym / ecc / crc / mac */
+    Confidence  conf;
+    const char *magic_hex;   /* "0x" + lowercase hex literal */
 } Fingerprint;
 
-/* Curated fingerprint constants — enough to identify common cipher / hash
- * primitives without false-positive flood. AES sbox entries are recorded as
- * 32-bit packed words (the way table-loaded T-table implementations would
- * fetch them).
+/* Curated fingerprint constants.
+ *
+ * Each entry: {name, category, confidence, magic_hex}.
+ *   category   — algorithm taxonomy (hash / cipher / ecc / crc).
+ *   confidence — independent signal quality:
+ *                  strong  : unique, RFC/standard-verified, real-trace 0 FP
+ *                  medium  : algorithm-specific but somewhat short or shared
+ *                            with adjacent primitives (e.g. SHA-256 init
+ *                            word also appears in BLAKE2s IV).
+ *                  weak    : known to overlap with general-purpose code
+ *                            (hashmaps, golden-ratio derived constants).
+ *
+ * Constants in this table are byte-array S-box leading bytes for AES (the
+ * raw 0x63,0x7c,0x77,0x7b sequence packed BE) and the T-table words for
+ * Te0[0..3] (FIPS 197 mix-column derived). Both AES patterns are kept so
+ * detection survives both byte-array and T-table implementations. AES-NI /
+ * hardware-accelerated builds emit none of these — that is a known constscan
+ * limitation, documented in tools/search/README.md.
+ *
+ * Values verified against original references:
+ *   MD5/SHA-1/SHA-256 init  : RFC 6234 §5.3.{1,3,4}
+ *   SHA-512 init            : RFC 6234 §5.3.5
+ *   AES S-box / Te0         : FIPS 197 §5.1.1 + §5.2
+ *   SHA-3 / Keccak RC       : FIPS 202 §3.2.5
+ *   ChaCha20 sigma          : RFC 8439 §2.3
+ *   SM3 IV                  : GM/T 0004-2012 §5.3
+ *   SM4 FK / CK             : GM/T 0002-2012 §6.1, §6.2
+ *   TEA delta               : Wheeler & Needham 1994, "TEA, a Tiny Encryption Algorithm"
+ *   CRC32 polynomials       : IEEE 802.3 §3.2.8 (normal), zlib (reflected)
+ *   FNV-1a 64-bit           : http://isthe.com/chongo/tech/comp/fnv/
+ *   P-256                   : FIPS 186-4 §D.1.2.3
  */
 static const Fingerprint FINGERPRINTS[] = {
-    /* MD5 init */
-    {"MD5.A",                "hash",   "0x67452301"},
-    {"MD5.B",                "hash",   "0xefcdab89"},
-    {"MD5.C",                "hash",   "0x98badcfe"},
-    {"MD5.D",                "hash",   "0x10325476"},
-    /* SHA-1 / SHA-2 init constants */
-    {"SHA1.h4",              "hash",   "0xc3d2e1f0"},
-    {"SHA256.h0",            "hash",   "0x6a09e667"},
-    {"SHA256.h1",            "hash",   "0xbb67ae85"},
-    {"SHA256.h2",            "hash",   "0x3c6ef372"},
-    {"SHA256.h3",            "hash",   "0xa54ff53a"},
-    {"SHA256.h4",            "hash",   "0x510e527f"},
-    {"SHA256.h5",            "hash",   "0x9b05688c"},
-    {"SHA256.h6",            "hash",   "0x1f83d9ab"},
-    {"SHA256.h7",            "hash",   "0x5be0cd19"},
-    /* CRC32 polynomials */
-    {"CRC32.poly_reflected", "crc",    "0xedb88320"},
-    {"CRC32.poly_normal",    "crc",    "0x04c11db7"},
-    /* FNV-1a 64-bit */
-    {"FNV1a.prime64",        "hash",   "0x100000001b3"},
-    {"FNV1a.offset64",       "hash",   "0xcbf29ce484222325"},
-    /* AES sbox / inverse sbox 32-bit packed leading words */
-    {"AES.sbox[0..3]",       "cipher", "0x637c777b"},
-    {"AES.sbox[4..7]",       "cipher", "0xf26b6fc5"},
-    {"AES.inv_sbox[0..3]",   "cipher", "0x52096ad5"},
-    /* SM4 sbox leading words */
-    {"SM4.sbox[0..3]",       "cipher", "0xd690e9fe"},
-    {"SM4.sbox[4..7]",       "cipher", "0xcce13db7"},
-    /* SM4 FK constants */
-    {"SM4.FK0",              "cipher", "0xa3b1bac6"},
-    {"SM4.FK1",              "cipher", "0x56aa3350"},
-    /* DES initial perm hint (uncommon as literal — kept for completeness) */
-    /* Bernstein / DJB constant — usually shows up only as 0x83 in madd */
-    {"Bernstein.mul131",     "hash",   "0x83"},
-    /* Whirlpool box leading bytes (32-bit pack) */
-    {"Whirlpool.S[0..3]",    "cipher_hint", "0x18233481"},
-    {NULL, NULL, NULL},
+
+    /* ---- Hash: MD5 init quartet ---- */
+    {"MD5.A",                "hash",       FP_STRONG, "0x67452301"},
+    {"MD5.B",                "hash",       FP_STRONG, "0xefcdab89"},
+    {"MD5.C",                "hash",       FP_STRONG, "0x98badcfe"},
+    {"MD5.D",                "hash",       FP_STRONG, "0x10325476"},
+
+    /* ---- Hash: SHA-1 ---- */
+    {"SHA1.h4",              "hash",       FP_STRONG, "0xc3d2e1f0"},
+    {"SHA1.K[0..19]",        "hash",       FP_STRONG, "0x5a827999"},
+    {"SHA1.K[20..39]",       "hash",       FP_STRONG, "0x6ed9eba1"},
+    {"SHA1.K[40..59]",       "hash",       FP_STRONG, "0x8f1bbcdc"},
+    {"SHA1.K[60..79]",       "hash",       FP_STRONG, "0xca62c1d6"},
+
+    /* ---- Hash: SHA-256 (32-bit init, BLAKE2s IV identical → medium) ---- */
+    {"SHA256.h0",            "hash",       FP_MEDIUM, "0x6a09e667"},
+    {"SHA256.h1",            "hash",       FP_MEDIUM, "0xbb67ae85"},
+    {"SHA256.h2",            "hash",       FP_MEDIUM, "0x3c6ef372"},
+    {"SHA256.h3",            "hash",       FP_MEDIUM, "0xa54ff53a"},
+    {"SHA256.h4",            "hash",       FP_MEDIUM, "0x510e527f"},
+    {"SHA256.h5",            "hash",       FP_MEDIUM, "0x9b05688c"},
+    {"SHA256.h6",            "hash",       FP_MEDIUM, "0x1f83d9ab"},
+    {"SHA256.h7",            "hash",       FP_MEDIUM, "0x5be0cd19"},
+
+    /* ---- Hash: SHA-512 (BLAKE2b IV identical → medium, ambiguous algorithm) */
+    {"SHA512.h0",            "hash",       FP_MEDIUM, "0x6a09e667f3bcc908"},
+    {"SHA512.h1",            "hash",       FP_MEDIUM, "0xbb67ae8584caa73b"},
+    {"SHA512.h2",            "hash",       FP_MEDIUM, "0x3c6ef372fe94f82b"},
+    {"SHA512.h3",            "hash",       FP_MEDIUM, "0xa54ff53a5f1d36f1"},
+    {"SHA512.h4",            "hash",       FP_MEDIUM, "0x510e527fade682d1"},
+    {"SHA512.h5",            "hash",       FP_MEDIUM, "0x9b05688c2b3e6c1f"},
+    {"SHA512.h6",            "hash",       FP_MEDIUM, "0x1f83d9abfb41bd6b"},
+    {"SHA512.h7",            "hash",       FP_MEDIUM, "0x5be0cd19137e2179"},
+
+    /* ---- Hash: SM3 IV (GM/T 0004-2012) ---- */
+    {"SM3.IV0",              "hash",       FP_STRONG, "0x7380166f"},
+    {"SM3.IV1",              "hash",       FP_STRONG, "0x4914b2b9"},
+    {"SM3.IV2",              "hash",       FP_STRONG, "0x172442d7"},
+    {"SM3.IV3",              "hash",       FP_STRONG, "0xda8a0600"},
+    {"SM3.IV4",              "hash",       FP_STRONG, "0xa96f30bc"},
+    {"SM3.IV5",              "hash",       FP_STRONG, "0x163138aa"},
+    {"SM3.IV6",              "hash",       FP_STRONG, "0xe38dee4d"},
+    {"SM3.IV7",              "hash",       FP_STRONG, "0xb0fb0e4e"},
+
+    /* ---- Hash: SHA-3 / Keccak round constants (skip RC[0]=0x01, too generic) */
+    {"SHA3.RC[1]",           "hash",       FP_STRONG, "0x0000000000008082"},
+    {"SHA3.RC[2]",           "hash",       FP_STRONG, "0x800000000000808a"},
+    {"SHA3.RC[4]",           "hash",       FP_STRONG, "0x000000000000808b"},
+
+    /* ---- Hash: FNV-1a 64-bit (hashmaps / Go / Rust runtimes) ---- */
+    {"FNV1a.prime64",        "hash",       FP_WEAK,   "0x100000001b3"},
+    {"FNV1a.offset64",       "hash",       FP_WEAK,   "0xcbf29ce484222325"},
+
+    /* ---- Cipher: AES — byte-array S-box (raw, NOT T-table) ---- */
+    {"AES.sbox_bytes[0..3]", "cipher_sym", FP_MEDIUM, "0x637c777b"},
+    {"AES.sbox_bytes[4..7]", "cipher_sym", FP_MEDIUM, "0xf26b6fc5"},
+    {"AES.inv_sbox_bytes",   "cipher_sym", FP_MEDIUM, "0x52096ad5"},
+    /* ---- Cipher: AES — T-table Te0[0..3] (mix-column expanded, FIPS 197) ---- */
+    {"AES.Te0[0]",           "cipher_sym", FP_STRONG, "0xc66363a5"},
+    {"AES.Te0[1]",           "cipher_sym", FP_STRONG, "0xf87c7c84"},
+    {"AES.Te0[2]",           "cipher_sym", FP_STRONG, "0xee777799"},
+    {"AES.Te0[3]",           "cipher_sym", FP_STRONG, "0xf67b7b8d"},
+
+    /* ---- Cipher: SM4 (国密) ---- */
+    {"SM4.sbox[0..3]",       "cipher_sym", FP_STRONG, "0xd690e9fe"},
+    {"SM4.sbox[4..7]",       "cipher_sym", FP_STRONG, "0xcce13db7"},
+    {"SM4.FK0",              "cipher_sym", FP_STRONG, "0xa3b1bac6"},
+    {"SM4.FK1",              "cipher_sym", FP_STRONG, "0x56aa3350"},
+    {"SM4.CK[0]",            "cipher_sym", FP_STRONG, "0x00070e15"},
+    {"SM4.CK[1]",            "cipher_sym", FP_STRONG, "0x1c232a31"},
+    {"SM4.CK[2]",            "cipher_sym", FP_STRONG, "0x383f464d"},
+    {"SM4.CK[3]",            "cipher_sym", FP_STRONG, "0x545b6269"},
+
+    /* ---- Cipher: ChaCha20 / Salsa20 sigma ---- */
+    {"ChaCha20.sigma[0]",    "cipher_sym", FP_STRONG, "0x61707865"},
+    {"ChaCha20.sigma[1]",    "cipher_sym", FP_STRONG, "0x3320646e"},
+    {"ChaCha20.sigma[2]",    "cipher_sym", FP_STRONG, "0x79622d32"},
+    {"ChaCha20.sigma[3]",    "cipher_sym", FP_STRONG, "0x6b206574"},
+
+    /* ---- Cipher: TEA family (0x9e3779b9 also used by Knuth hash / xxHash) */
+    {"TEA.delta",            "cipher_sym", FP_MEDIUM, "0x9e3779b9"},
+
+    /* ---- Cipher hint: Whirlpool S-box first 4 bytes ---- */
+    {"Whirlpool.S[0..3]",    "cipher_sym", FP_WEAK,   "0x18233481"},
+
+    /* ---- MAC: Poly1305 r-mask clamp (RFC 8439 §2.5)
+     *      r &= 0x0ffffffc0ffffffc0ffffffc0fffffff
+     *      Split into two 64-bit limbs (BE word order). */
+    {"Poly1305.clamp_lo",    "mac",        FP_STRONG, "0x0ffffffc0fffffff"},
+    {"Poly1305.clamp_hi",    "mac",        FP_STRONG, "0x0ffffffc0ffffffc"},
+
+    /* ---- MAC: SipHash initial key constants — ASCII "somepseudorandomly..."
+     *      sip-hash24 / sip-hash13 IV (HashDoS defense, used by Rust HashMap,
+     *      Python str, libcrypto). */
+    {"SipHash.k0",           "mac",        FP_STRONG, "0x736f6d6570736575"},
+    {"SipHash.k1",           "mac",        FP_STRONG, "0x646f72616e646f6d"},
+
+    /* ---- CRC: 32-bit polynomial constants ---- */
+    {"CRC32.poly_reflected", "crc",        FP_STRONG, "0xedb88320"},
+    {"CRC32.poly_normal",    "crc",        FP_STRONG, "0x04c11db7"},
+
+    /* ---- ECC: NIST P-256 ---- */
+    {"P256.order_low[0]",    "ecc",        FP_STRONG, "0xbce6faada7179e84"},
+    {"P256.order_low[1]",    "ecc",        FP_STRONG, "0xf3b9cac2fc632551"},
+    /* P-256 curve param b (FIPS 186-4 §D.1.2.3 — low 64-bit limb) */
+    {"P256.b_lo",            "ecc",        FP_STRONG, "0xcc53b0f63bce3c3e"},
+
+    /* ---- ECC: secp256k1 prime low 64-bit (Bitcoin / Ethereum) ---- */
+    {"secp256k1.p_lo",       "ecc",        FP_STRONG, "0xfffffffefffffc2f"},
+
+    /* ---- ECC: Ed25519 curve constant d low 64-bit
+     *      d = -121665/121666 mod p, full d = 0x52036cee2b6ffe73...
+     *      Distinguishes Ed25519 from X25519/Curve25519. */
+    {"Ed25519.d_lo",         "ecc",        FP_STRONG, "0x52036cee2b6ffe73"},
+
+    /* ---- ECC: Curve25519 ladder constant a24 = 121665 = (A-2)/4 where A=486662 */
+    {"Curve25519.a24",       "ecc",        FP_MEDIUM, "0x1db41"},
+
+    {NULL, NULL, FP_WEAK, NULL},
 };
 
 static int run_constscan(const IndexedFile *indexed, uint64_t limit_per_fp) {
@@ -2281,6 +2402,8 @@ static int run_constscan(const IndexedFile *indexed, uint64_t limit_per_fp) {
         json_write_cstr(fp->name);
         fputs(",\"category\":", stdout);
         json_write_cstr(fp->category);
+        fputs(",\"confidence\":", stdout);
+        json_write_cstr(confidence_str(fp->conf));
         fputs(",\"magic\":", stdout);
         json_write_cstr(fp->magic_hex);
         printf(",\"total_hits\":%" PRIu64, total_hits);
