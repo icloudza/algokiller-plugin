@@ -69,39 +69,93 @@ description: ARM64 trace 密文还原方法论。当用户给出一段 ARM64 执
 
 ---
 
-## Stage 1: 对抗大厂的 Hardened Binary 路径
+## Stage 1: 对抗 Hardened Binary 的多信号联合判定
 
-constscan + cryptoinstr 都瞎掉时（**两者都报 0 命中或全 alu_only**），目标可能是大厂典型反逆向手段。按以下顺序排查：
+constscan + cryptoinstr 都缺信号时（**两者都 0 命中或全 `alu_only`**），**不要直接下"hardened"结论**。`constscan miss` 只能说明"literal fingerprint missing"，可能性是一个集合，不是单一答案。同样 `cryptoinstr hit` 也只是极强证据，不是绝对实锤——必须 **multi-signal correlation** 才能定论。
 
-| 大厂常见手段 | 识别信号 | 反制 |
+### 1. constscan 0 命中的可能解释（不要单点归因）
+
+| 可能性 | 区分信号 | 反制 |
 |---|---|---|
-| **AES-NI 硬件加速** | constscan 0 sbox + cryptoinstr 命中 `aese/aesmc` | 直接看硬件指令命中行就是算法实锤 |
-| **NEON SIMD bitslicing** | `tbl/tbx`(查表)、`shrn/shll`(位平面)、`ushr/sli` 大量；但 sbox 字面量为 0 | trace_callgraph + 跨函数 hexblock 看密钥/密文边界 |
-| **AES T-table（OpenSSL aes_core 风格）** | constscan 命中 `AES.Te0[0..3]` + `mem_r=Te0表基址 + idx*4` | 已被 constscan 覆盖（verdict=real），直接抓 sample_lines |
-| **白盒密码 (T-box / wide encoding)** | 无任何 constscan 命中 + 大量 `ldr` 顺序读连续表 + 表大小 > 4KB | 用 trace_search "mem_r=" + trace_regflow 看表项读取顺序；用 trace_fold 折叠重复访问 |
-| **OLLVM 控制流平展** | 大量小 basic block + 反复 `cbz/cbnz` + 同一 dispatch state 变量频繁更新 | trace_semop 标 branch + 找 dispatch state var → trace_regflow 还原状态机 |
-| **OLLVM 字符串/常量混淆** | constscan 0 命中但运行时 trace 中能看到字符串 | trace_search 找 trace 中的字符串字面量 ASCII，反推被构造之处 |
-| **VMP / VMProtect / OLLVM `obfu`** | 单函数极长 (1M+ 行), trace_fold --block 4 仍压不下来 | 先 fold --block 2/3/8/16 试各种循环宽度；再看 trace_modgraph 边界 |
-| **国密 (SM2/SM3/SM4)** | constscan 命中 SM3.IV* / SM4.FK*/CK*/sbox | 已识别；trace_callgraph 找 sm3_compress / sm4_crypt 入口 |
-| **签名 (Ed25519 / secp256k1)** | constscan 命中 P256.b_lo / secp256k1.p_lo / Ed25519.d_lo | 已识别；trace_callgraph 找 ed25519_sign / ecdsa_sign 入口 |
-| **HMAC / KDF 串联** | constscan 命中 hash IV 且有 outer pad / inner pad（0x36/0x5c 重复 64 次）| trace_bytes 搜 0x3636363636363636 / 0x5c5c5c5c5c5c5c5c |
+| **硬件加密** (AES-NI/SHA-NI/SM-Crypto-Ext) | cryptoinstr 命中 `aese/sha256h/...` | 看 cryptoinstr 输出即可定算法候选 |
+| **bitsliced / 常时实现** (BearSSL, HACL\*, fiat-crypto) | 大量 `eor`/`bic`/`and`/`orr` 算术堆叠，无表查找，无 sbox | trace_semop 标 `crypto_candidate`/`alu`；trace_modgraph 找 BearSSL/HACL 符号；BN/r2 静态匹配函数 prologue |
+| **runtime-generated tables** (启动期算 Te[]) | trace_search 找 `0x63 0x7c 0x77 0x7b` 等 sbox 字节字面量；找 `xtime` 模式（`x << 1` + 条件 `^0x1b`） | trace_regflow 追 table 基址 → trace_bytes 搜首字节序列 |
+| **compiler constant splitting** (movz/movk 4 段拼) | `movz/movk` 拼装时 trace 行有完整 `-> wN=0xMAGIC`（GumTrace 记寄存器值, 仍能被 constscan 命中）；但 LTO/IPO 后整段消失 | constscan 实际能抓 movz+movk 拼装结果（实测 wechat TEA delta 28 命中）；LTO 抹掉的情况要靠 hash / xref 函数级匹配 |
+| **dynamic-linked crypto** (CCCrypt/CommonCrypto, OpenSSL via libcrypto.dylib) | trace 主 binary 0 命中，但 `call func: CCCrypt`/`call func: EVP_*`/`call func: SecKeyEncrypt` | trace_callgraph --to CCCrypt / EVP_ / Sec ；hexblock 取 call args/hexdump |
+| **委派给 SEP / dyld_shared_cache / TrustZone** | 看到 `mach_msg_send` → SEP；`call func: BoringSSL_*` 在 cache 内 | 这部分超出 trace 范围；只能从 args/return 推 |
+| **白盒密码 (T-box, wide encoding)** | 无 constscan + nested `ldr` 模式（一次 ldr 输出立刻成下一次 ldr 的 index）+ 表项熵高 + 表间有 affine mask XOR | trace_regflow 追 index 寄存器；trace_search "mem_r=" 找 table 基址；BN 静态看 table 大小 + 引用 |
+| **VMP / VMProtect / 自研 VM** | 单函数极长 (>1M 行) + 大量 indirect branch (`br xN` / `blr xN`) + 同一 dispatch handler 反复 + opcode-like immediate 寄存器序列 | trace_fold --block 2/3/4/8/16 试循环宽度；trace_semop 找 branch hub；不要期望 cryptoinstr/constscan 直接命中 |
+| **OLLVM 控制流平展** | 现代 flatten 不仅 `cbz/cbnz`，**也可能用** `csel` / `tbz/tbnz` / `adrp+br xN`；CFG 特征：phi-heavy SSA、unnatural dominator graph、巨型 switch dispatcher、indirect branch hub | trace_semop 标 branch；trace_regflow 追 dispatch state；建议同时 BN 反编译看 dominator |
+| **真的没加密** | callgraph 含纯业务符号、无加密 API 调用、`run_static_tool strings` 见明文协议 | 报告给用户 "未发现密码学信号"，不要瞎猜 |
 
-**通用准则**：硬件加速识别用 cryptoinstr；软件实现识别用 constscan；都瞎用 trace_callgraph + trace_modgraph + 静态 BN/r2 联动从函数语义反推。
+### 2. cryptoinstr 命中的解释（强证据 ≠ 绝对实锤）
 
-### ARM Crypto Extensions 指令 cheatsheet (cryptoinstr 输出对照)
-
-| mnem | primitive | 含义 |
+| 指令 | 几乎实锤的 | 仅候选 / 需 corroboration |
 |---|---|---|
-| `aese`, `aesmc`, `aesd`, `aesimc` | AES | 加/解密 round 各一条 |
-| `sha1c/m/p`, `sha1h`, `sha1su0/su1` | SHA-1 | hash update + schedule |
-| `sha256h`, `sha256h2`, `sha256su0/su1` | SHA-256 | hash update part1/part2 + schedule |
-| `sha512h`, `sha512h2`, `sha512su0/su1` | SHA-512 | ARMv8.2 |
-| `eor3`, `rax1`, `xar`, `bcax` | SHA-3 | Keccak χ/θ/ρ-π (ARMv8.2; eor3 也用于通用 3-way XOR → confidence=medium) |
-| `pmull`, `pmull2` | GHASH/GCM | 多项式乘 (confidence=medium, 也用于通用 GF mul) |
-| `sm3partw1/2`, `sm3ss1`, `sm3tt1a/1b/2a/2b` | SM3 | ARMv8.2 |
-| `sm4e`, `sm4ekey` | SM4 | ARMv8.2 |
+| `aese / aesmc / aesd / aesimc` | ✅ AES (语义专用, 编译器/普通代码不会发) | — |
+| `sha1c/m/p, sha1h, sha1su0/1` | ✅ SHA-1 | — |
+| `sha256h/h2, sha256su0/1` | ✅ SHA-256 | — |
+| `sha512h/h2, sha512su0/1` | ✅ SHA-512 (ARMv8.2) | — |
+| `sm3*` (sm3partw1/2/ss1/tt1a/1b/2a/2b) | ✅ SM3 | — |
+| `sm4e, sm4ekey` | ✅ SM4 | — |
+| `pmull, pmull2` | ⚠️ **不能直接判 GCM** | carryless polynomial multiply — 也用于 CRC folding / Reed-Solomon / BCH / generic GF(2^n) / bitmatrix。需配合 GHASH 标志 (0xe100000000000000 reduction const) / 16-byte block iteration 才能定 GMAC |
+| `eor3` | ⚠️ **不能直接判 SHA-3** | ARMv8.2 通用 3-way XOR, 编译器优化也会用 |
+| `rax1 / xar / bcax` | ⚠️ 是 Keccak 强提示, **不绝对** | 需配合 5×5 lane permutation、24 round constants、theta/rho/pi/chi/iota 五步结构才能定 SHA-3 |
 
-看到这些指令 = 算法实锤，比 constscan 常数还硬——constscan 软件常数可能被 OLLVM/白盒抹掉，但硬件指令必须保留（mnemonic 是编码而非数据）。
+**`cryptoinstr` 命中后必须做的二次验证**：
+- AES: 数 round 数（AES-128 = 10, AES-192 = 12, AES-256 = 14）→ 在 trace_callgraph + trace_regflow 看是否符合迭代结构。
+- SHA-256: 64 round 累加 + 8 个 working var (a-h)。
+- SHA-3: 24 round + 5×5 state lane。
+
+### 3. cryptoinstr 看不到 mnemonic 的几种合法场景
+
+`cryptoinstr` 0 命中**不等于**"没用 ARM Crypto"。可能：
+- **VMP / 自研 VM 把 aese lift 成 VM opcode** —— trace 里看到的是 `vm_dispatch` / `ldr xN, [xVM, opcode]; blr xHandler`，原 mnemonic 已消失
+- **JIT runtime codegen** (JavaScriptCore / V8 / Wasm / JVM intrinsic) —— 静态 binary 无 mnemonic，运行时 emit。看 `memfd:jit-cache` 类模块行（实测 metasec trace 中已见）
+- **dyld_shared_cache / libcorecrypto / SEP bridge** —— iOS/macOS CCCrypt/SecKey 实际跑在 cache 内或 Secure Enclave 中，主 binary 没 mnemonic。看 `call func: CCCrypt` / `mach_msg_send` 边界
+- **fallback to scalar** —— 某些 binary 启动检测 CPU feature，没硬件支持时走软件分支（这种情况 constscan 反而有信号）
+
+### 4. 已识别 → 直接深挖的算法
+
+| 算法 | constscan 真信号 | 下一步 |
+|---|---|---|
+| **AES T-table (OpenSSL aes_core 风格)** | `AES.Te0[0..3] verdict=real` + `mem_r=表基址+idx*4` | 抓 sample_lines, trace_regflow 追 round key 演化 |
+| **国密 SM2/SM3/SM4** | SM3.IV0..7 + SM4.FK*/CK*/sbox verdict=real | trace_callgraph 找 sm3_compress / sm4_crypt 入口 |
+| **Ed25519 / secp256k1 / P-256** | `Ed25519.d_lo` / `secp256k1.p_lo` / `P256.b_lo` verdict=real | trace_callgraph 找 ed25519_sign / ecdsa_sign / point_mul 入口 |
+| **HMAC / KDF 串联** | hash IV 命中 + 看到 0x36/0x5c 字节 pad | **注意**：很多实现 runtime 计算 `ipad[i] = key[i] ^ 0x36`，不会 materialize 0x3636... 整段；`trace_bytes` 搜 0x36 重复字节是**额外信号**，不是必要条件 |
+| **NEON SIMD bitslicing AES** | tbl/tbx/shrn/shll/ushr/sli 大量 + 0 sbox | hexblock 看密钥/密文边界，不要期望常数 |
+
+### 5. ARM Crypto Extensions cheatsheet (cryptoinstr 输出对照)
+
+| mnem | primitive | confidence | 含义 |
+|---|---|---|---|
+| `aese`, `aesmc`, `aesd`, `aesimc` | AES | strong | 加/解密 round 各一条 |
+| `sha1c/m/p`, `sha1h`, `sha1su0/su1` | SHA-1 | strong | hash update + schedule |
+| `sha256h/h2`, `sha256su0/su1` | SHA-256 | strong | hash update + schedule |
+| `sha512h/h2`, `sha512su0/su1` | SHA-512 | strong | ARMv8.2 |
+| `rax1`, `xar`, `bcax` | SHA-3 候选 | strong (但需 corroboration) | Keccak ρ+π / θ / χ (ARMv8.2) |
+| `eor3` | SHA-3 / 通用 | **medium** | 3-way XOR, 编译器也用 |
+| `pmull`, `pmull2` | GHASH 候选 / 通用 GF mul | **medium** | 也用于 CRC / RS / BCH |
+| `sm3partw1/2`, `sm3ss1`, `sm3tt1a/1b/2a/2b` | SM3 | strong | ARMv8.2 |
+| `sm4e`, `sm4ekey` | SM4 | strong | ARMv8.2 |
+
+### 6. 核心准则：multi-signal correlation
+
+**没有任何单一 detector 能给出最终结论**。成熟 RE pipeline 永远是多信号联合判定：
+
+```
+constants          (constscan verdict=real)
++ opcodes          (cryptoinstr + trace_semop)
++ memory shape     (trace_regflow / hexblock / mem_r/mem_w 模式)
++ CFG shape        (trace_callgraph / modgraph / BN dominator)
++ entropy          (table data entropy via run_static_tool)
++ trace behavior   (round count / iteration structure)
++ syscall/API      (CCCrypt / EVP_ / SecKey / KeyStore 调用)
++ SIMD usage       (cryptoinstr + NEON tbl/shrn 等)
++ buffer lifecycle (hexblock + trace_producer)
+```
+
+每个 detector 给一个**证据强度**而非真值。最终结论由**多个证据正交支持**得到——这才是从 "magic-number grep" 进化到 "crypto-aware binary semantic recovery" 的分水岭。
 
 ---
 
