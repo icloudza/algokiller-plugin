@@ -310,9 +310,24 @@ assert_contains "constscan categories include hash" '"category":"hash"' "$out"
 
 # A trace with no fingerprints should yield empty hits
 out=$($BIN constscan --file "$FIXTURE" --samples 3)
-# mini.trace has Bernstein 0x83 in madd operand range — that fingerprint may match.
-# Make sure constscan completes without error.
 assert_contains "constscan on mini.trace returns valid JSON" '"type":"constscan"' "$out"
+
+# Sprint 5+ verdict tests
+S5=tests/fixtures/sprint5-constscan.trace
+out=$($BIN constscan --file "$S5" --samples 1)
+assert_contains "constscan emits confidence field" '"confidence":' "$out"
+assert_contains "constscan emits evidence breakdown" '"evidence":{"load_imm":' "$out"
+assert_contains "constscan emits verdict field" '"verdict":' "$out"
+assert_contains "fixture mov w16 #0x61707865 → load_imm" '"verdict":"real"' "$out"
+assert_contains "ChaCha20 sigma category cipher_sym" '"category":"cipher_sym"' "$out"
+assert_contains "Poly1305 category mac" '"category":"mac"' "$out"
+assert_contains "P256.b_lo category ecc" '"category":"ecc"' "$out"
+assert_contains "secp256k1.p_lo present" '"fingerprint":"secp256k1.p_lo"' "$out"
+assert_contains "Ed25519.d_lo present" '"fingerprint":"Ed25519.d_lo"' "$out"
+assert_contains "SipHash.k0 present" '"fingerprint":"SipHash.k0"' "$out"
+# Verify the deleted BKDR.mul131 fingerprint really gone from output
+count=$(printf '%s\n' "$out" | grep -c '"fingerprint":"BKDR.mul131"' || true)
+assert_eq "BKDR.mul131 fingerprint removed (0 occurrences)" "0" "$count"
 
 # -----------------------------------------------------------------------------
 echo "[test] new: bytes"

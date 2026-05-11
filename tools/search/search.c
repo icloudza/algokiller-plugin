@@ -2353,6 +2353,124 @@ static const Fingerprint FINGERPRINTS[] = {
     {NULL, NULL, FP_WEAK, NULL},
 };
 
+/* Evidence classification for a constscan hit line. The same magic may
+ * appear in a line as: a movz/movk-built immediate (LOAD_IMM = real signal),
+ * an ldr/ldp memory read producing the value (MEM_R = real signal, e.g. a
+ * preloaded constant table), an ldr/ldp memory write address, or merely a
+ * value computed by an ALU op (ALU = coincidental collision risk).
+ *
+ * Distinguishing these turns "37 hits of MD5.A" from a single integer into a
+ * real-signal verdict.
+ */
+typedef enum {
+    EV_LOAD_IMM,    /* mov/movz/movk + value as output */
+    EV_MEM_R,       /* ldr/ldp/ldur with mem_r= + value as output */
+    EV_MEM_R_ADDR,  /* magic appears as a memory address (mem_r=magic, mem_w=magic) */
+    EV_MEM_W,       /* str/stp + mem_w with magic as output value */
+    EV_ALU,         /* arithmetic op + value as output (collision risk) */
+    EV_OTHER        /* magic appears in operands but not as output */
+} EvidenceKind;
+
+typedef struct {
+    uint64_t load_imm;
+    uint64_t mem_r;
+    uint64_t mem_r_addr;
+    uint64_t mem_w;
+    uint64_t alu;
+    uint64_t other;
+} EvidenceCounts;
+
+static bool mnem_is_mov_family(const unsigned char *m, size_t mlen) {
+    if (mlen >= 3 && memcmp(m, "mov", 3) == 0) return true;  /* mov, movk, movz, movn */
+    return false;
+}
+
+static bool mnem_is_load_family(const unsigned char *m, size_t mlen) {
+    if (mlen >= 3 && memcmp(m, "ldr", 3) == 0) return true;
+    if (mlen >= 3 && memcmp(m, "ldp", 3) == 0) return true;
+    if (mlen >= 4 && memcmp(m, "ldur", 4) == 0) return true;
+    return false;
+}
+
+/* Check whether the line ends with "-> [reg]=<magic>" (i.e. magic is the
+ * instruction's output value, not just an operand). Scans the region after
+ * the last "-> " up to end-of-line.
+ */
+static bool magic_is_output(LineView line, const char *magic, size_t mlen) {
+    static const unsigned char arrow[] = " -> ";
+    const unsigned char *a = mem_find(line.start, line.len, arrow, 4);
+    if (a == NULL) return false;
+    const unsigned char *region = a + 4;
+    const unsigned char *end = line.start + line.len;
+    /* Walk tokens "reg=value " */
+    const unsigned char *p = region;
+    while (p < end) {
+        while (p < end && *p == ' ') p++;
+        const unsigned char *eq = NULL;
+        for (const unsigned char *q = p; q < end; q++) {
+            if (*q == '=') { eq = q; break; }
+            if (*q == ' ') break;
+        }
+        if (eq == NULL) { while (p < end && *p != ' ') p++; continue; }
+        const unsigned char *vstart = eq + 1;
+        if (vstart + mlen <= end &&
+            memcmp(vstart, magic, mlen) == 0) {
+            /* require value boundary: next char is space or end or punctuation */
+            if (vstart + mlen == end ||
+                vstart[mlen] == ' ' ||
+                vstart[mlen] == ',' ||
+                vstart[mlen] == ';') {
+                return true;
+            }
+        }
+        while (p < end && *p != ' ') p++;
+    }
+    return false;
+}
+
+static EvidenceKind classify_evidence(LineView line, const char *magic, size_t mlen) {
+    /* mem_r=<magic> / mem_w=<magic> — magic appears as a memory ADDRESS */
+    char mem_r_lit[80], mem_w_lit[80];
+    int mr = snprintf(mem_r_lit, sizeof(mem_r_lit), "mem_r=%s", magic);
+    int mw = snprintf(mem_w_lit, sizeof(mem_w_lit), "mem_w=%s", magic);
+    if (mr > 0 && mem_find(line.start, line.len,
+                          (const unsigned char *)mem_r_lit, (size_t)mr) != NULL) {
+        return EV_MEM_R_ADDR;
+    }
+    if (mw > 0 && mem_find(line.start, line.len,
+                          (const unsigned char *)mem_w_lit, (size_t)mw) != NULL) {
+        return EV_MEM_W;
+    }
+
+    /* Determine instruction mnemonic */
+    const unsigned char *mn = NULL, *op = NULL;
+    size_t mn_len = 0, op_len = 0;
+    bool has_mnem = parse_mnem_and_operands(line, &mn, &mn_len, &op, &op_len);
+    (void)op; (void)op_len;
+
+    bool is_output = magic_is_output(line, magic, mlen);
+
+    if (has_mnem && is_output) {
+        if (mnem_is_mov_family(mn, mn_len)) return EV_LOAD_IMM;
+        if (mnem_is_load_family(mn, mn_len)) {
+            /* If line also has mem_r= without matching the magic, it's table load */
+            if (mem_find(line.start, line.len, (const unsigned char *)"mem_r=", 6) != NULL) {
+                return EV_MEM_R;
+            }
+            return EV_MEM_R;  /* register-to-register style ldr without explicit mem_r still treated as load */
+        }
+        return EV_ALU;
+    }
+    return EV_OTHER;
+}
+
+static const char *evidence_verdict(const EvidenceCounts *e) {
+    if (e->load_imm > 0 || e->mem_r > 0) return "real";
+    if (e->mem_w > 0 || e->mem_r_addr > 0) return "weak";
+    if (e->alu > 0) return "alu_only";
+    return "other";
+}
+
 static int run_constscan(const IndexedFile *indexed, uint64_t limit_per_fp) {
     size_t fp_count = 0;
     while (FINGERPRINTS[fp_count].name != NULL) fp_count++;
@@ -2367,6 +2485,7 @@ static int run_constscan(const IndexedFile *indexed, uint64_t limit_per_fp) {
         size_t mlen = strlen(fp->magic_hex);
 
         uint64_t total_hits = 0;
+        EvidenceCounts ev = {0};
         uint64_t sample_lines[16];
         size_t sample_n = 0;
 
@@ -2375,19 +2494,25 @@ static int run_constscan(const IndexedFile *indexed, uint64_t limit_per_fp) {
             LineView line = line_at_offset(indexed->mapped.data, indexed->mapped.size, off);
             const unsigned char *hit = bmh_find(&s, line.start, line.len);
             if (hit == NULL) continue;
-            /* Require boundary chars (not a longer hex run). The folded ASCII
-             * lower means we can compare unfolded — but we want "the literal
-             * matches as a complete 0xVAL run, not a prefix of a longer one".
-             */
+            /* boundary check — not a prefix of a longer hex run */
             const unsigned char *after = hit + mlen;
             if (after < line.start + line.len) {
                 unsigned char c = *after;
                 if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
                     (c >= 'A' && c <= 'F')) {
-                    continue;  /* longer hex run — false match */
+                    continue;
                 }
             }
             total_hits++;
+            EvidenceKind k = classify_evidence(line, fp->magic_hex, mlen);
+            switch (k) {
+                case EV_LOAD_IMM:    ev.load_imm++;    break;
+                case EV_MEM_R:       ev.mem_r++;       break;
+                case EV_MEM_R_ADDR:  ev.mem_r_addr++;  break;
+                case EV_MEM_W:       ev.mem_w++;       break;
+                case EV_ALU:         ev.alu++;         break;
+                case EV_OTHER:       ev.other++;       break;
+            }
             if (sample_n < limit_per_fp && sample_n < (sizeof(sample_lines)/sizeof(sample_lines[0]))) {
                 sample_lines[sample_n++] = line_no;
             }
@@ -2407,6 +2532,15 @@ static int run_constscan(const IndexedFile *indexed, uint64_t limit_per_fp) {
         fputs(",\"magic\":", stdout);
         json_write_cstr(fp->magic_hex);
         printf(",\"total_hits\":%" PRIu64, total_hits);
+        printf(",\"evidence\":{\"load_imm\":%" PRIu64
+               ",\"mem_r\":%" PRIu64
+               ",\"mem_r_addr\":%" PRIu64
+               ",\"mem_w\":%" PRIu64
+               ",\"alu\":%" PRIu64
+               ",\"other\":%" PRIu64 "}",
+               ev.load_imm, ev.mem_r, ev.mem_r_addr, ev.mem_w, ev.alu, ev.other);
+        fputs(",\"verdict\":", stdout);
+        json_write_cstr(evidence_verdict(&ev));
         fputs(",\"sample_lines\":[", stdout);
         for (size_t i = 0; i < sample_n; i++) {
             if (i > 0) putchar(',');
