@@ -59,7 +59,7 @@ description: ARM64 trace 密文还原方法论。当用户给出一段 ARM64 执
    - **明确忽略 `verdict: "alu_only"`**——这些是 ALU 运算碰撞的假阳。例如 0x9e3779b9（TEA delta）加自己等于 0x3c6ef372（SHA-256.h2）——agent 必须看 verdict 不被 total_hits 误导。
    - `verdict: "weak"` 仅作为辅助提示。
 3. `trace_cryptoinstr` —— 扫 ARM Crypto Extensions 硬件加密指令清单。**必须跟 constscan 一起读**：
-   - constscan 命中 + cryptoinstr 0 命中 → **纯软件实现**（如字节 metasec_ov.so 跑 MD5/SHA-1/AES Te0/SM3）。
+   - constscan 命中 + cryptoinstr 0 命中 → **纯软件实现**(常见于自研签名 SO 跑 MD5/SHA-1/AES Te0/SM3 等软件 T-table 路径)。
    - constscan 0 命中 + cryptoinstr 命中 → **纯硬件加密**（如 iOS CryptoKit 跑 AES-NI）。
    - 两者都命中 → **混合**（某些热路径走硬件，慢路径走软件兜底）。
    - 两者都 0 → 这个 trace 段不涉及加密；OR 走了白盒密码 / OLLVM 化整、constscan 和 cryptoinstr 都瞎了——这种情况下转 Stage 1 "Hardened 大厂样本" 路径。
