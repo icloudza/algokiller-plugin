@@ -13,13 +13,53 @@ description: ARM64 trace 密文还原方法论。当用户给出一段 ARM64 执
 
 你必须基于 trace 证据回答用户任务。不要编造指令、寄存器值、内存字节、函数边界、密钥、常量、字段语义、分支结果或调用关系。
 
-可用工具（均由 `algokiller` MCP server 提供）：
-- `algokiller.trace_search`：在当前 trace 中做大小写不敏感的精确子串搜索。
-- `algokiller.trace_context`：按文件行号读取上下文。
-- `algokiller.write_artifact`：写出最终交付物（`.py` 源码或 `.md` 分析报告）到本次会话 artifacts 目录。
+可用工具（均由 `algokiller` MCP server 提供, v0.6.0 共 17 个，按使用顺序分组）：
+
+**🔍 体检与总览（bind_trace 之后第一波必做）**
+- `algokiller.trace_lint`：单遍扫 trace 得 JSON 体检——行数/模块分布/Top-K mnemonic/call_func 块数/有无寄存器观察/format_ok + warnings。先调一次，确认 trace 格式可用、结构画像清晰。
+- `algokiller.trace_constscan`：扫 71 个密码学常数指纹（MD5/SHA-1/SHA-256/SHA-512/SM3/SHA-3/CRC32/FNV1a/AES sbox/AES Te0/SM4/ChaCha20/TEA/Whirlpool/Poly1305/SipHash + P-256/secp256k1/Ed25519/Curve25519）。**必看 `verdict` 字段而不是 `total_hits`**：`real` = load_imm 或 mem_r 真信号；`alu_only` = ALU 运算碰撞假阳，必须忽略；`weak` = 仅 mem_w/mem_r_addr 间接信号。每个命中带 `evidence` 分项（load_imm / mem_r / alu / ...）和 `sample_lines` 锚点。`category` 分类：hash / cipher_sym / ecc / crc / mac；`confidence` 分级：strong / medium / weak。
+- `algokiller.trace_callgraph --top N`：Top-K 最常被调的 `call func: NAME(args)` 符号 + 计数。一眼看见热路径（malloc/memcpy/objc_msgSend/CCCrypt/...）。
+- `algokiller.trace_modgraph --top N`：跨模块跳转矩阵。看 caller_mod → callee_mod 邻接 + 边权重，定位密码学边界（如 WeChat → openssl / metasec → libc++）。
+
+**🔬 精准搜索与上下文**
+- `algokiller.trace_search`：大小写不敏感精确子串搜索（BMH 引擎）。`limit ≤ 100`，须二选一 `from_line` / `before_line`。
+- `algokiller.trace_context`：按行号取前后上下文。须显式 `before` + `after`（各 ≤ 100）。
+- `algokiller.trace_bytes --query 0xVAL`：hex 字面量全量命中（自动 byte-reverse + leading-zero-strip 变体），limit 高达 10000，输出每个变体 + 行号。比 trace_search 更适合"找一个值在全 trace 出现多少次"。
+
+**📈 数据流追踪（找寄存器演化 / 值来源 / 指令语义）**
+- `algokiller.trace_regflow --reg xN`：寄存器 N 在 [from_line, to_line] 区间的所有 `-> xN=0xVAL` 演化序列，一行一记录。追密钥派生 / hash 累加器 / buffer 指针神器，比反复 trace_search 节约 5-10× token。
+- `algokiller.trace_producer --value 0xVAL --sink-line N`：从 sink 行反向最近 max_back 行内找首次写出该值的指令（任意寄存器）。替代"before_line 反向 grep 多轮"循环。
+- `algokiller.trace_semop --line N | --from-line A --to-line B`：分类每条指令为 11 类语义（`zero` xor x,x,x / `crypto_candidate` eor 不同寄存器 / `hash_loop_candidate` madd/msub / `stack_save|restore` stp/ldp x29,x30 / `memory_load|store` / `branch` b/bl/cbz/ret / `addr_calc` adrp/adr / `data_move` mov / `alu` add/sub/orr/and/eor/mul / `compare` cmp/tst/subs / `unknown`）。用来剪掉非密码学候选行。
+
+**🧱 数据块结构化提取**
+- `algokiller.trace_hexblock --line N`：解析 `call func: NAME(args)` 块——返回 call、args、可选 `class:` 标签、可选 `hexdumps[]`（每段 `{address, length, bytes_hex}`，bytes_hex 已拼接所有 hexdump 行）、`ret`。替代手动凑 `trace_context` + 拼字节。memcpy/sprintf/CCCrypt 后取数据流首选。
+
+**📉 体量管理**
+- `algokiller.trace_fold --out_path PATH --block 4 --threshold 100`：写一份新 trace，连续 W 行相同 signature 的重复块折叠为 first-block + sentinel + last-block。WeChat 启动 trace 实测 115MB → 1.1MB（99% 压缩），保留首末块数据流证据。Hash loop（madd / ldrsb / subs / b.ne 4 条交替）用 `--block 4`，单指令重复用 `--block 1`。
+
+**📦 交付物**
+- `algokiller.write_artifact`：写最终交付物（`.py` 源码 / `.md` 分析报告）到本次会话 artifacts 目录。
 - `algokiller.list_artifacts` / `algokiller.read_artifact`：回看已写入的交付物。
 
+**🔧 静态分析协同**
+- `algokiller.run_static_tool`：白名单调用系统 CLI（radare2 / binutils / LLVM / jtool2 / class-dump / ripgrep / jq）。BN MCP 不在线时的兜底。
+
 每次工具返回都会附带一个 `discipline_reminder` 字段，每 20 次还会附带一个 `discipline_full_reinjection` 全量规则段。读它，遵守它——它就是为对抗长任务里的思维漂移而设计的。
+
+---
+
+## Stage 0: 必做的开场三件套
+
+**bind_trace 后第一波动作（务必按序）**：
+
+1. `trace_lint` —— 确认 trace 是合法 GumTrace 格式（`format_ok: true`）、模块分布、有无 `call_func_blocks` / 寄存器观察。如果 `warnings` 非空、`format_ok: false`，立即向用户报告并停止——别在残废 trace 上烧 token。
+2. `trace_constscan` —— 拿密码学算法清单。**必须按 `verdict` 字段过滤**：
+   - 只信 `verdict: "real"`（load_imm > 0 或 mem_r > 0）的指纹。
+   - **明确忽略 `verdict: "alu_only"`**——这些是 ALU 运算碰撞的假阳。例如 0x9e3779b9（TEA delta）加自己等于 0x3c6ef372（SHA-256.h2）——agent 必须看 verdict 不被 total_hits 误导。
+   - `verdict: "weak"` 仅作为辅助提示。
+3. `trace_callgraph --top 10` + `trace_modgraph --top 10` —— 热点函数 + 跨模块边界。结合 constscan 真信号，初步定位密码学发生在哪段代码 / 哪个模块。
+
+完成 Stage 0 后再进入具体证据链构建。这一步约束保护你在大 trace 上避免盲搜耗 token。
 
 ---
 
@@ -42,15 +82,31 @@ description: ARM64 trace 密文还原方法论。当用户给出一段 ARM64 执
 
 ## 工具使用规则
 
+**核心工具使用规则**
+
 - 每次调用 `trace_search` 必须显式携带 `limit`，并且只能在 `from_line` 与 `before_line` 中选择一个：`from_line` 向后搜索，`before_line` 只搜索该行之前的内容并按最近命中优先返回；每次调用 `trace_context` 必须显式携带 `before` 和 `after`。所有条数参数最大值都是 100。
 - 先用 `trace_search` 定位证据，再用 `trace_context` 展开上下文。
-- 如果搜索命中的是 call/hexdump/ret 行，必须用 `trace_context` 查看附近设置参数、消费返回值、读写相关内存或影响控制流的指令行。
+- 如果搜索命中的是 call/hexdump/ret 行，**优先用 `trace_hexblock --line N`** 一次拿到结构化 call/args/hexdumps/ret，不要手动 `trace_context` 拼 hexdump 行。仅当 hexblock 失败（非 call 行）时退回 `trace_context`。
 - 通过多轮 `trace_search` 追踪寄存器值、内存地址、返回值、函数名、字段名、hexdump ASCII 和常量，逐步建立证据链；是否继续追踪取决于当前模式和用户任务。
 - 每轮 `trace_search` 前先明确本轮搜索目的：定位目标实例、寻找最近写入/生成点、追踪输入来源、验证字段/分支/算法假设、确认调用边界或确认后续消费者。不要把同一次搜索结果同时解释成多个角色。
 - hex/字节按字节处理（`0x11223344` 反序 = `44 33 22 11`），不按字符或 nibble 反转。
 - `0x` 前缀查询由 server 自动尝试 fallback（reversed / leading-zero-trim 组合）；命中变体时返回里 `fallback_query` 字段标明。非 `0x` 前缀的 hex（如 `08 d2 11`、`08d211`）需自己尝试原序 + 反序。
 - >4 字节查询：完整失败后用 2-4 个高辨识度 4 字节滑动窗口 × (原序 + 反序)；命中冲突 / 低熵窗口才换 offset 或扩 5-8 字节。
 - 小步搜索、小范围上下文。询问用户的限制见下面"输入假设与询问限制"。
+
+**扩展工具替代手工循环（v0.6.0 强烈推荐）**
+
+| 你想做 | ❌ 老姿势（多轮 token 烧光） | ✅ 新姿势（一次拿结果） |
+|---|---|---|
+| 看寄存器 x9 在某段的值演化 | `trace_search "x9="` × N + 手动串联 | `trace_regflow --reg x9 --from-line A --to-line B` 一次返序列 |
+| 找值 0xVAL 的来源 | `trace_search 0xVAL --before-line N` × 多轮 bisect | `trace_producer --value 0xVAL --sink-line N` 一次返写入指令 |
+| 判断这行是不是密码学候选 | LLM 凭印象判 | `trace_semop --line N` 返回 `crypto_candidate` / `zero` / 等 |
+| 取 memcpy 后那段字节流 | `trace_context` × N + 手拼 hex 行 | `trace_hexblock --line <memcpy行>` 返结构化 + bytes_hex |
+| 看 metasec 在调谁 | `trace_search "call func:"` 翻 | `trace_callgraph --top 20` 直接 Top-K |
+| 谁调过 `objc_retain` | `trace_search "call func: objc_retain"` × limit | `trace_callgraph --to objc_retain` 全部命中 |
+| 看 WeChat 调没调 mmcronet | LLM 数 `[mmcronet]` 行 | `trace_modgraph --top 30` 返跨模块矩阵 |
+| 找全 trace 0x67452301 出现 | `trace_search` 受 limit 100 制约 | `trace_bytes --query 0x67452301 --limit 10000` 全量 + 反序变体 |
+| 110MB hash loop trace 看不动 | 苦撑 | `trace_fold --out_path /tmp/fold.trace --block 4 --threshold 100` 压 99%，再 bind_trace 折叠版 |
 
 ---
 

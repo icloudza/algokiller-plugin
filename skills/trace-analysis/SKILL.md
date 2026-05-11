@@ -13,13 +13,46 @@ description: ARM64 trace 通用证据分析方法论。当用户给出一段 ARM
 
 你必须基于 trace 证据回答用户任务。不要编造指令、寄存器值、内存字节、函数边界、密钥、常量、字段语义、分支结果或调用关系。
 
-可用工具（均由 `algokiller` MCP server 提供）：
-- `algokiller.trace_search`：在当前 trace 中做大小写不敏感的精确子串搜索。
-- `algokiller.trace_context`：按文件行号读取上下文。
-- `algokiller.write_artifact`：写出最终交付物（`.md` 分析报告或 `.py` 源码）到本次会话 artifacts 目录。
-- `algokiller.list_artifacts` / `algokiller.read_artifact`：回看已写入的交付物。
+可用工具（均由 `algokiller` MCP server 提供, v0.6.0 共 17 个，按使用顺序分组）：
+
+**🔍 体检与总览（bind_trace 之后第一波必做）**
+- `algokiller.trace_lint`：单遍扫 trace 得 JSON 体检——行数 / 模块分布 / Top-K mnemonic / call_func 块数 / 寄存器观察率 / `format_ok` / `warnings`。先调一次确认 trace 格式可用 + 结构画像清晰；非 GumTrace 格式立即停止。
+- `algokiller.trace_callgraph --top N`：Top-K 最常被调的 `call func: NAME(args)` 符号 + 计数，一眼看见执行流热点（malloc / objc_msgSend / __memcpy / pthread_mutex_unlock / ...）。
+- `algokiller.trace_callgraph --to NAME`：查询哪些行调用了指定函数（substring 匹配）。比手动 `trace_search "call func: NAME"` 干净。
+- `algokiller.trace_modgraph --top N`：跨模块跳转矩阵——caller_mod → callee_mod 边权重 + 每模块行数。看模块边界跳转密度（如 WeChat ↔ mmcronet、libmetasec ↔ libc++）。
+- `algokiller.trace_constscan`：扫 71 个密码学常数指纹。**必看 `verdict` 字段而不是 `total_hits`**：`real` = 真信号；`alu_only` = ALU 碰撞假阳必须忽略；`weak` = 间接信号。即使 general 模式，constscan 也能快速回答"代码里有没有 hash / 加密"。
+
+**🔬 精准搜索与上下文**
+- `algokiller.trace_search`：大小写不敏感精确子串搜索。`limit ≤ 100`，二选一 `from_line` / `before_line`。
+- `algokiller.trace_context`：按行号取前后上下文。须显式 `before` + `after`（各 ≤ 100）。
+- `algokiller.trace_bytes --query 0xVAL`：hex 字面量全量命中（自动反序 + 剥前导零），limit 高达 10000。比 trace_search 更适合"找一个值在全 trace 出现多少次"。
+
+**📈 数据流与指令语义**
+- `algokiller.trace_regflow --reg xN`：寄存器 N 的值演化序列。追指针 / 状态机 / 计数器。
+- `algokiller.trace_producer --value 0xVAL --sink-line N`：反向找首次写出该值的指令。替代多轮 `before_line` bisect。
+- `algokiller.trace_semop --line N | --range A..B`：指令语义分类（11 类）——快速判某行是 `branch` / `memory_load|store` / `stack_save|restore` / `addr_calc` / `data_move` / `alu` / `compare` 等，过滤不相干指令。
+
+**🧱 数据块结构化**
+- `algokiller.trace_hexblock --line N`：解析 `call func:` 块为 JSON——返回 call、args、可选 ObjC class、`hexdumps[]`（已拼接 bytes_hex）、`ret`。看 memcpy / sprintf / parse 函数后的数据流首选。
+
+**📉 体量管理**
+- `algokiller.trace_fold --out_path PATH --block W --threshold N`：写折叠版 trace。`--block 4 --threshold 100` 把 hash loop 类 trace 压 99%。general 模式如果遇到大 trace 跑不动，先 fold 一份再 bind。
+
+**📦 交付物 + 静态分析**
+- `algokiller.write_artifact` / `algokiller.list_artifacts` / `algokiller.read_artifact`：交付物存取。
+- `algokiller.run_static_tool`：白名单系统 CLI（radare2 / binutils / class-dump / ripgrep / jq）。
 
 每次工具返回都会附带一个 `discipline_reminder` 字段，每 20 次还会附带一个 `discipline_full_reinjection` 全量规则段。读它，遵守它。
+
+---
+
+## Stage 0: 开场三件套（general 模式同样必做）
+
+1. `trace_lint` —— 确认 trace 格式合法 + 拿模块/mnemonic 分布画像。
+2. `trace_callgraph --top 10` + `trace_modgraph --top 10` —— 拿热点函数 + 跨模块跳转矩阵。这两步告诉你"这个 trace 在干什么"的轮廓。
+3. （可选）`trace_constscan` —— 即使是 general 任务，也用它确认有没有密码学常数。如果任务跟加密/hash 完全无关可以跳过。
+
+完成 Stage 0 后再针对用户具体问题做证据链构建。
 
 ---
 
@@ -42,10 +75,25 @@ description: ARM64 trace 通用证据分析方法论。当用户给出一段 ARM
 
 ## 工具使用规则
 
+**核心规则**
+
 - 每次调用 `trace_search` 必须显式携带 `limit`，并且只能在 `from_line` 与 `before_line` 中选择一个：`from_line` 向后搜索，`before_line` 只搜索该行之前的内容并按最近命中优先返回；每次调用 `trace_context` 必须显式携带 `before` 和 `after`。所有条数参数最大值都是 100。
 - 先用 `trace_search` 定位证据，再用 `trace_context` 展开上下文。
-- 如果搜索命中的是 call/hexdump/ret 行，必须用 `trace_context` 查看附近设置参数、消费返回值、读写相关内存或影响控制流的指令行。
+- 如果搜索命中的是 call/hexdump/ret 行，**优先用 `trace_hexblock --line N`** 一次拿结构化 call/args/hexdumps/ret，不要手拼 hexdump 行。仅当 hexblock 失败（非 call 行）时退回 `trace_context`。
 - 每轮 `trace_search` 前先明确本轮搜索目的：定位实例、找最近来源、找后续消费者、验证字段边界、确认分支条件、寻找调用边界、验证算法/解析假设或排除冲突命中。不要把同一次搜索结果同时解释成多个角色。
+
+**用扩展工具替代手工 trace_search 循环（v0.6.0）**
+
+| 你想做 | 老姿势 | ✅ 新姿势 |
+|---|---|---|
+| 看寄存器 xN 演化 | `trace_search "xN="` × 多轮 | `trace_regflow --reg xN --from-line A --to-line B` |
+| 找值 0xVAL 来源 | `trace_search 0xVAL --before-line N` 多轮 bisect | `trace_producer --value 0xVAL --sink-line N` |
+| 判某行干啥 | LLM 凭印象 | `trace_semop --line N` 返 11 类语义 |
+| 取 call 块字节流 | `trace_context` + 手拼 | `trace_hexblock --line N` |
+| 看热点 callees | `trace_search "call func:"` 翻 | `trace_callgraph --top N` |
+| 看跨模块调用 | LLM 数 `[mod]` 行 | `trace_modgraph --top N` |
+| 找 hex 全命中 | trace_search 100 cap | `trace_bytes --query 0xVAL --limit 10000` |
+| 大 trace 跑不动 | 苦撑 | `trace_fold --out_path /tmp/fold.trace --block 4 --threshold 100` |
 - hex/字节按字节处理。`0x` 前缀查询由 server 自动 fallback（reversed / leading-zero-trim），命中变体时返回里 `fallback_query` 字段标明；其他 hex 形式（`08 d2 11` / `08d211`）需自己尝试原序 + 反序。
 - >4 字节查询：完整失败后用 2-4 个高辨识度 4 字节滑动窗口；命中冲突 / 低熵窗口才换 offset 或扩 5-8 字节。
 - 小步搜索、小范围上下文。询问用户的限制见下面"输入假设与询问限制"。
