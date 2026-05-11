@@ -31,7 +31,7 @@ from tools.handlers import LEDGER_INTERNAL_TOOLS  # noqa: E402
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "algokiller"
-SERVER_VERSION = "0.8.1"
+SERVER_VERSION = "0.9.1"
 
 
 # ---------------------------------------------------------------------------
@@ -55,17 +55,37 @@ def _attach_discipline(name: str, payload: dict, args: dict | None = None) -> di
     # Skip discipline injection on protocol-level errors (no bound trace).
     if payload.get("status") == "error" and STATE.daemon is None and name != "bind_trace":
         return payload
+    # FIX A-6: a handler can opt-out of discipline counter bumping by
+    # marking the payload with _skip_discipline=True. Used for pure
+    # argument-validation failures (bad integer / missing field / etc.)
+    # so the reinjection interval reflects *real* analysis work, not the
+    # agent typo-correcting its way through schema constraints. Without
+    # this, a session with 6 typos triggers full-rule reinjection at call
+    # 14 instead of 20 — diluting the anti-drift signal.
+    if payload.pop("_skip_discipline", False):
+        return payload
     call_count = STATE.bump_tool_call()
     payload.update(build_reminder(mode=STATE.mode, call_count=call_count))
     payload["_tool_call_id"] = call_count
-    # FIX #1 anchor: persist tool result for evidence-excerpt verification.
-    # The ledger checks "did this excerpt actually appear in tool_call_id N's
-    # output?" — we have to actually store the output for that to work.
+    # FIX F-10 anchor: persist the FULL tool result (before agent-side
+    # truncation) so FIX#1 verbatim verification works on real evidence
+    # even when daemon output exceeds max_output_chars. The `_stdout_full`
+    # field is daemon-side; here we replace stdout with the full text for
+    # the persistence step, then strip the helper field before returning.
     if STATE.tool_log is not None and name not in LEDGER_INTERNAL_TOOLS:
+        ledger_payload = payload
+        full_stdout = payload.get("_stdout_full")
+        if full_stdout is not None:
+            ledger_payload = dict(payload)
+            ledger_payload["stdout"] = full_stdout
+            ledger_payload.pop("_stdout_full", None)
         try:
-            STATE.tool_log.record(call_count, name, args or {}, payload)
+            STATE.tool_log.record(call_count, name, args or {}, ledger_payload)
         except Exception as exc:
             _log(f"tool_log.record failed for #{call_count} {name}: {exc}")
+    # Strip the helper field from the agent-facing payload; it exists only
+    # for the ledger and is never meant to flow into LLM context.
+    payload.pop("_stdout_full", None)
     if STATE.ledger is not None and call_count > 0 and call_count % 5 == 0:
         summary = STATE.ledger.summary_for_inject()
         if summary:

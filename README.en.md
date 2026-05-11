@@ -36,7 +36,7 @@ claude plugin update algokiller@algokiller-suite
 2. **Slash commands** (strong activation)
    - `/algokiller:ciphertext <trace> <task>`
    - `/algokiller:general <trace> <task>`
-3. **17 MCP tools**
+3. **25 MCP tools** (18 trace/artifact/static + 7 hypothesis-ledger)
    - Binding / artifacts: `bind_trace` / `write_artifact` / `list_artifacts` / `read_artifact`
    - Core search: `trace_search` / `trace_context`
    - Data flow: `trace_regflow` (register-value evolution) / `trace_producer` (nearest writer of a value) / `trace_semop` (11-class instruction classifier)
@@ -185,7 +185,7 @@ printf '%s\n' \
   | python3 server/algokiller_mcp.py
 ```
 
-Expect: `initialize` response + `tools/list` advertising 23 tools (18 trace/artifact/static tools + 5 hypothesis-ledger tools).
+Expect: `initialize` response + `tools/list` advertising 25 tools (18 trace/artifact/static tools + 7 hypothesis-ledger tools — v0.9.1 added `mark_hypothesis_reviewed` and `hypothesis_archive`).
 
 ---
 

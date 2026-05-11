@@ -102,9 +102,16 @@ class AkSearchDaemon:
                 return self.request(command, max_output_chars=max_output_chars, _retry=False)
             raise RuntimeError("ak_search daemon stdin closed unexpectedly (after retry)")
 
+        # FIX F-10: collect the FULL daemon output unconditionally; the
+        # post-truncation for the agent-facing payload happens at the end.
+        # Previously truncation was applied during the read loop so the
+        # FIX#1 anti-hallucination check (excerpt must appear in stored
+        # result) could spuriously fail when real evidence fell past the
+        # max_output_chars boundary — which then nudged agents toward
+        # picking only excerpts visible in the truncated window. The
+        # ToolCallLog now records `_stdout_full` so verbatim verification
+        # always sees the complete output.
         parts: list[str] = []
-        char_count = 0
-        truncated = False
         while True:
             line = self.process.stdout.readline()
             if not line:
@@ -122,18 +129,23 @@ class AkSearchDaemon:
                 # returning to the MCP layer. ak_search JSON-escapes its lines
                 # but raw trace bytes inside `text` fields can still be lone
                 # surrogates that crash json serialization upstream.
-                clean_stdout = _scrub_text("".join(parts))
-                return {
+                full_stdout = _scrub_text("".join(parts))
+                truncated = len(full_stdout) > max_output_chars
+                visible_stdout = full_stdout[:max_output_chars] if truncated else full_stdout
+                result = {
                     "status": "ok" if data.get("status") == "ok" else "error",
-                    "stdout": clean_stdout,
+                    "stdout": visible_stdout,
                     "stderr": _scrub_text(str(data.get("error") or "")),
                     "truncated": truncated,
                 }
-            if char_count + len(line) <= max_output_chars:
-                parts.append(line)
-                char_count += len(line)
-            else:
-                truncated = True
+                if truncated:
+                    # Ledger-only field. _attach_discipline records this into
+                    # ToolCallLog then strips it before the payload reaches
+                    # the agent — keeps agent context tight while preserving
+                    # full-text verifiability for evidence excerpts.
+                    result["_stdout_full"] = full_stdout
+                return result
+            parts.append(line)
 
     def _drain_stderr_tail(self, tail_chars: int = 4000) -> str:
         if self.process is None or self.process.stderr is None:
@@ -173,18 +185,23 @@ class AkSearchDaemon:
         except OSError as exc:
             return {"status": "error", "error": f"{subcommand} exec failed: {exc}"}
 
-        stdout = _scrub_text(result.stdout or "")
-        truncated = False
-        if len(stdout) > max_output_chars:
-            stdout = stdout[:max_output_chars]
-            truncated = True
-        return {
+        full_stdout = _scrub_text(result.stdout or "")
+        truncated = len(full_stdout) > max_output_chars
+        visible_stdout = full_stdout[:max_output_chars] if truncated else full_stdout
+        payload = {
             "status": "ok" if result.returncode == 0 else "error",
-            "stdout": stdout,
+            "stdout": visible_stdout,
             "stderr": _scrub_text(result.stderr or ""),
             "returncode": result.returncode,
             "truncated": truncated,
         }
+        # FIX F-10: keep the full pre-truncation text available to the
+        # MCP layer so ToolCallLog can record it for FIX#1 verbatim
+        # verification. _attach_discipline strips this before the payload
+        # is forwarded to the agent (it never appears in the agent context).
+        if truncated:
+            payload["_stdout_full"] = full_stdout
+        return payload
 
     def close(self) -> None:
         process = self.process

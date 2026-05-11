@@ -153,15 +153,17 @@ class TestL1Plumbing(unittest.TestCase):
         if hasattr(cls, "client"):
             cls.client.close()
 
-    def test_01_tools_list_returns_23(self):
+    def test_01_tools_list_returns_25(self):
         resp = self.client.request("tools/list")
         tools = resp["result"]["tools"]
-        self.assertEqual(len(tools), 23)
+        # v0.9.1: added mark_hypothesis_reviewed (FIX #6) and hypothesis_archive (FIX #7)
+        self.assertEqual(len(tools), 25)
         names = {t["name"] for t in tools}
         # Sanity-check a few across categories.
         for required in ("bind_trace", "trace_lint", "trace_constscan",
                          "trace_callgraph", "trace_hexblock",
-                         "hypothesis_add", "write_artifact"):
+                         "hypothesis_add", "write_artifact",
+                         "mark_hypothesis_reviewed", "hypothesis_archive"):
             self.assertIn(required, names)
 
     def test_02_bind_and_lint(self):
@@ -269,12 +271,9 @@ class TestL3LedgerEndToEnd(unittest.TestCase):
             "final_confidence": "high",
         })
         self.assertEqual(r["status"], "error", r)
-        # Either falsification or supporting-count gate triggers first.
+        # supporting-count gate triggers first (only 2 supporting)
         err = r["error"]
-        self.assertTrue(
-            ("falsification_attempted" in err) or
-            (">=3 supporting" in err),
-            f"unexpected reject reason: {err}")
+        self.assertIn(">=3 supporting", err)
 
         # ---- Step 3: add a 3rd supporting from yet another tool ----
         lint = self.client.call_tool("trace_lint", {})
@@ -288,21 +287,63 @@ class TestL3LedgerEndToEnd(unittest.TestCase):
         })
         self.assertEqual(r["status"], "ok", r)
 
-        # ---- Step 4: still no falsification_attempted → reject high ----
+        # ---- Step 4: count passes but FIX #5 falsification_evidence missing ----
         r = self.client.call_tool("hypothesis_conclude", {
             "id": hid,
             "final_statement": "SHA-256 family computation present",
             "final_confidence": "high",
         })
         self.assertEqual(r["status"], "error", r)
-        self.assertIn("falsification_attempted", r["error"])
+        self.assertIn("falsification_evidence", r["error"])
 
-        # ---- Step 5: flip falsification_attempted, conclude(high) ok ----
+        # ---- Step 5a: FIX #5 boolean-only NOT sufficient anymore ----
         r = self.client.call_tool("hypothesis_update", {
             "id": hid,
             "falsification_attempted": True,
         })
         self.assertEqual(r["status"], "ok", r)
+        # FIX #5 warning should surface
+        self.assertIn("warning", r)
+        r = self.client.call_tool("hypothesis_conclude", {
+            "id": hid,
+            "final_statement": "SHA-256 family computation present",
+            "final_confidence": "high",
+        })
+        self.assertEqual(r["status"], "error", r)
+        self.assertIn("falsification_evidence", r["error"])
+
+        # ---- Step 5b: run a real falsification experiment + cite it ----
+        falsify_lint = self.client.call_tool("trace_lint", {})
+        self.assertEqual(falsify_lint["status"], "ok", falsify_lint)
+        falsify_excerpt = falsify_lint["stdout"][:80]
+        r = self.client.call_tool("hypothesis_update", {
+            "id": hid,
+            "falsification_evidence": {
+                "tool_call_id": falsify_lint["_tool_call_id"],
+                "excerpt": falsify_excerpt,
+            },
+        })
+        self.assertEqual(r["status"], "ok", r)
+
+        # ---- Step 5c: FIX #6 reviewer gate ----
+        r = self.client.call_tool("hypothesis_conclude", {
+            "id": hid,
+            "final_statement": "SHA-256 family computation present",
+            "final_confidence": "high",
+        })
+        self.assertEqual(r["status"], "error", r)
+        self.assertIn("reviewer", r["error"].lower())
+
+        # Now spawn the reviewer verdict (in real usage this is the
+        # hypothesis-reviewer sub-agent; in the test we call directly).
+        r = self.client.call_tool("mark_hypothesis_reviewed", {
+            "id": hid,
+            "verdict": "confirm",
+            "reason": "all gates audited; evidence excerpts verified",
+        })
+        self.assertEqual(r["status"], "ok", r)
+
+        # ---- Step 6: conclude(high) finally succeeds ----
         r = self.client.call_tool("hypothesis_conclude", {
             "id": hid,
             "final_statement": "SHA-256 family computation present in trace",
@@ -311,9 +352,9 @@ class TestL3LedgerEndToEnd(unittest.TestCase):
         self.assertEqual(r["status"], "ok", r)
         self.assertEqual(r["hypothesis"]["confidence"], "high")
 
-        # ---- Step 6: write_artifact citing H<id> → ok ----
+        # ---- Step 7: write_artifact citing [H<id>] (FIX A-8 bracket form) → ok ----
         artifact_body = (
-            f"# Findings\n\nSHA-256 family computation found in trace; see {hid}.\n"
+            f"# Findings\n\nSHA-256 family computation found in trace; see [{hid}].\n"
         )
         r = self.client.call_tool("write_artifact", {
             "path": "findings.md", "content": artifact_body,
@@ -321,7 +362,7 @@ class TestL3LedgerEndToEnd(unittest.TestCase):
         self.assertEqual(r["status"], "ok", r)
         self.assertTrue(Path(r["path"]).exists())
 
-        # ---- Step 7: write_artifact bypassing ledger → reject ----
+        # ---- Step 8: write_artifact bypassing ledger → reject ----
         bypass_body = (
             "# Long report\n\n"
             + ("Lorem ipsum dolor sit amet, consectetur adipiscing elit. " * 20)
@@ -331,6 +372,20 @@ class TestL3LedgerEndToEnd(unittest.TestCase):
         })
         self.assertEqual(r["status"], "error", r)
         self.assertIn("bypasses hypothesis ledger", r["error"])
+
+        # ---- Step 9 (FIX #7): hypothesis_archive lets the agent exempt
+        # non-load-bearing concluded hypotheses from the bypass gate. ----
+        r = self.client.call_tool("hypothesis_archive", {
+            "id": hid,
+            "reason": "exclusion analysis; not load-bearing for final report",
+        })
+        self.assertEqual(r["status"], "ok", r)
+        self.assertEqual(r["hypothesis"]["state"], "archived")
+        # Now the bypass body should NOT be rejected (no remaining concluded).
+        r = self.client.call_tool("write_artifact", {
+            "path": "no-citation.md", "content": bypass_body,
+        })
+        self.assertEqual(r["status"], "ok", r)
 
     def test_invalid_excerpt_rejected_in_e2e_path(self):
         """FIX #1 must reject fabricated evidence over JSON-RPC, not just

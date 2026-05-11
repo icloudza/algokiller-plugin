@@ -38,6 +38,15 @@ class SessionState:
         self.trace_file = trace_path
         self.trace_basename = trace_path.stem
         self.mode = mode
+        # FIX A-2: reset tool_call_count on (re-)bind. Previously the counter
+        # was monotonic across rebinds, so the new session's first tool call
+        # would be #47 (carrying over from the prior session) and its
+        # tool_call_log file would be 000047.json — leaving 1..46 missing on
+        # disk. Ledger evidence-id range check (1..current) still passed but
+        # tool_log.get() returned None and excerpt verification spuriously
+        # failed. CHANGELOG v0.8.x promised "fresh per-session"; this now
+        # actually delivers it.
+        self.tool_call_count = 0
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.artifacts_dir = ARTIFACTS_ROOT / self.trace_basename / timestamp
         self.artifacts_dir.mkdir(parents=True, exist_ok=True)
