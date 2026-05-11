@@ -100,7 +100,17 @@ class ToolCallLog:
         rec = self.get(call_id)
         if rec is None:
             return False
-        return excerpt in rec["result_text"]
+        if excerpt in rec["result_text"]:
+            return True
+        # The agent sees tool stdout in its un-escaped form (Claude unwraps
+        # the JSON-RPC content[0].text once); result_text is the JSON-dumped
+        # payload where `"` became `\"`, `\n` became `\\n`, etc. If the
+        # agent copies a verbatim substring containing those characters,
+        # `excerpt in result_text` will fail spuriously. Re-encode the
+        # excerpt the same way the result was serialised and try again —
+        # fabricated strings still fail both checks, real ones now pass.
+        escaped = json.dumps(excerpt, ensure_ascii=False)[1:-1]
+        return escaped in rec["result_text"]
 
     def tool_name(self, call_id: int) -> Optional[str]:
         rec = self.get(call_id)
