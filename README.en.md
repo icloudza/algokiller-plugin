@@ -34,9 +34,11 @@ Claude Desktop plugin for ARM64 trace evidence analysis and cipher/algorithm rec
 Rebuild the binary when the arch doesn't match:
 
 ```bash
-cd <AlgoKiller>/tools/search && make
-cp ak_search <plugin>/server/bin/ak_search
+cd tools/search && make
+cp ak_search ../../server/bin/ak_search
 ```
+
+Source is vendored in [`tools/search/`](tools/search/) (mirrored from upstream [AlgoKiller/tools/search](https://github.com/lidongyooo/AlgoKiller/tree/main/tools/search)). The repo ships an arm64-macOS prebuilt binary; rebuild with the command above for other platforms.
 
 ---
 
@@ -238,7 +240,7 @@ xattr -d com.apple.quarantine server/bin/ak_search
 file server/bin/ak_search    # expect: Mach-O 64-bit executable arm64
 ```
 
-Wrong arch? Rebuild: `cd <AlgoKiller>/tools/search && make && cp ak_search <plugin>/bin/`.
+Wrong arch? Rebuild: `cd tools/search && make && cp ak_search ../../server/bin/`.
 
 ### `bind_trace` appears to hang on a GB-scale trace
 

@@ -34,9 +34,11 @@
 二进制架构不匹配时重编：
 
 ```bash
-cd <AlgoKiller>/tools/search && make
-cp ak_search <plugin>/server/bin/ak_search
+cd tools/search && make
+cp ak_search ../../server/bin/ak_search
 ```
+
+源码已内置在 [`tools/search/`](tools/search/)（上游 [AlgoKiller/tools/search](https://github.com/lidongyooo/AlgoKiller/tree/main/tools/search) 镜像）。仓库默认带 arm64-macOS 预编译产物，其他平台用上面命令重编即可。
 
 ---
 
@@ -238,7 +240,7 @@ xattr -d com.apple.quarantine server/bin/ak_search
 file server/bin/ak_search   # 应为 Mach-O 64-bit executable arm64
 ```
 
-架构不匹配时重编：`cd <AlgoKiller>/tools/search && make && cp ak_search <plugin>/bin/`。
+架构不匹配时重编：`cd tools/search && make && cp ak_search ../../server/bin/`。
 
 ### `bind_trace` 在 GB trace 上看似卡住
 
