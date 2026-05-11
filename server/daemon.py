@@ -146,9 +146,18 @@ class AkSearchDaemon:
 
     def run_cli(self, subcommand: str, args: list[str],
                 timeout: int = 30, max_output_chars: int = 200_000) -> dict:
-        """Run ak_search in one-shot CLI mode (no daemon protocol) for the
-        Sprint-1 subcommands (regflow / producer / semop). Daemon-mode wiring
-        for these is deferred to Sprint 2.
+        """Run ak_search in one-shot CLI mode (no daemon protocol).
+
+        All extension subcommands (regflow / producer / semop / lint / fold /
+        callgraph / modgraph / hexblock / constscan / cryptoinstr / bytes)
+        go through this path: they re-mmap the trace each call and exit. The
+        upstream daemon protocol is currently `match` / `context` only.
+
+        Expanding the daemon protocol to cover extension subcommands would
+        save the mmap+line-index rebuild per call. On a 684 MB / 7.14 M-line
+        trace that rebuild is sub-300 ms thanks to mmap + the line-index in
+        an anonymous shared mapping — the overhead is real but not currently
+        a blocker. Tracked for a future release; not on the critical path.
         """
         if not self.binary.exists():
             return {"status": "error", "error": f"ak_search binary not found: {self.binary}"}

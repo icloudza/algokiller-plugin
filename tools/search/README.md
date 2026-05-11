@@ -6,7 +6,7 @@ High-throughput trace-evidence engine for very large ARM64 trace files.
 >
 > **Upstream contributes**: the original `match` / `context` / `daemon` engine —— mmap + 1-based line index + ASCII case-insensitive BMH + tab-protocol daemon. Copyright on those code paths and the original `search.c` skeleton belongs to the upstream author.
 >
-> **This plugin extends with 10 new subcommands** for register-flow tracing, semantic classification, call-graph aggregation, hex-dump block parsing, cryptographic-constant fingerprinting, byte-sequence search, lint, and trace folding. The plugin's contributions are MIT-licensed alongside the rest of `algokiller-plugin`.
+> **This plugin extends with 11 new subcommands** for register-flow tracing, semantic classification, call-graph aggregation, hex-dump block parsing, cryptographic-constant fingerprinting (`constscan`), ARM Crypto Extensions hardware-instruction detection (`cryptoinstr`), byte-sequence search, lint, and trace folding. The plugin's contributions are MIT-licensed alongside the rest of `algokiller-plugin`.
 
 ---
 
@@ -17,7 +17,7 @@ Source of the native engine, vendored into the plugin repo so non-arm64-macOS us
 - `./search.c`   — full source (single C11 translation unit, ~3 K lines after extension)
 - `./Makefile`   — minimal builder
 - `./build.sh`   — thin wrapper around `make`
-- `./tests/`     — POSIX-sh harness, 108 assertions across all subcommands, hand-crafted fixtures
+- `./tests/`     — POSIX-sh harness, 132 assertions across all subcommands, hand-crafted fixtures
 
 The prebuilt runtime binary lives at [`../../server/bin/ak_search`](../../server/bin/ak_search) (arm64-macOS). The `tools/search/ak_search` produced by `make` here is a local build artifact and is git-ignored.
 
@@ -28,7 +28,7 @@ cd tools/search
 make                              # produces ./ak_search
 cp ak_search ../../server/bin/    # replace the prebuilt arm64 binary
 chmod +x ../../server/bin/ak_search
-./tests/run_tests.sh              # 97 PASS expected
+./tests/run_tests.sh              # 132 PASS expected
 ```
 
 The plugin auto-runs `chmod +x` + Gatekeeper xattr cleanup on `daemon.start()`. If you cross-compile or grab from CI, drop the binary at `server/bin/ak_search` and the plugin picks it up.
@@ -48,7 +48,7 @@ make CC=clang CFLAGS='-O3 -march=native -std=c11'
 make CC=aarch64-linux-gnu-gcc          # cross-compile for Linux arm64
 ```
 
-## CLI surface (13 subcommands)
+## CLI surface (14 subcommands)
 
 ### Upstream engine
 
@@ -71,8 +71,9 @@ ak_search fold      --in PATH --out PATH [--threshold N] [--block N]
 ak_search callgraph --file PATH (--to NAME | --top N) [--limit N]
 ak_search modgraph  --file PATH [--top N]
 ak_search hexblock  --file PATH --line N [--max-lines N]
-ak_search constscan --file PATH [--samples N]
-ak_search bytes     --file PATH --query 0xVAL [--limit N] [--with-text]
+ak_search constscan   --file PATH [--samples N]
+ak_search cryptoinstr --file PATH [--samples N]
+ak_search bytes       --file PATH --query 0xVAL [--limit N] [--with-text]
 ```
 
 | Subcommand | What it does | Sample real-trace cost (684 MB / 7.14 M lines) |
@@ -85,7 +86,8 @@ ak_search bytes     --file PATH --query 0xVAL [--limit N] [--with-text]
 | `callgraph` | `--top N` Top-K most-called `call func:` symbols; `--to NAME` lists every call site of NAME. | 0.4 s |
 | `modgraph`  | Cross-module transition matrix + per-module line counts + Top-K edges. | 0.45 s |
 | `hexblock`  | Parse a `call func: NAME(args)` block at `--line` into structured JSON: call, args, optional ObjC class, optional hexdumps with concatenated `bytes_hex`, terminating `ret`. | 0.15 s |
-| `constscan` | Scan for 26 curated cryptographic constants (MD5 / SHA1 / SHA256 init values, CRC32 polynomials, FNV-1a, AES sbox words, SM4 sbox + FK, Bernstein, Whirlpool). | 11 s |
+| `constscan` | Scan for 71 curated cryptographic constants across hash / cipher_sym / ecc / crc / mac (MD5 / SHA-1 / SHA-256 / SHA-512 / SM3 / SHA-3 / CRC32 / FNV-1a / AES sbox + Te0 / SM4 sbox + FK / ChaCha20 / TEA / Whirlpool / Poly1305 / SipHash / P-256 / secp256k1 / Ed25519 / Curve25519). Each hit carries a `verdict` (real / weak / alu_only) so ALU collisions are not mistaken for real load_imm/mem_r signals. | 11 s |
+| `cryptoinstr` | Scan for ARM Crypto Extensions hardware instructions: AES (aese/aesmc/aesd/aesimc), SHA-1 (sha1c/m/p/h/su0/su1), SHA-256 (sha256h/h2/su0/su1), SHA-512 (sha512h/h2/su0/su1), SHA-3 (eor3/rax1/xar/bcax), GHASH (pmull/pmull2), SM3 (sm3*), SM4 (sm4e/sm4ekey). Companion to `constscan` for hardware-accelerated crypto. | 0.3 s |
 | `bytes`     | Hex-literal search with automatic byte-reversed and leading-zero-stripped variants; default output is line + variant only (token-frugal). | 0.2 s |
 
 ## Output format

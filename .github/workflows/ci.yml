@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }} · Python ${{ matrix.python }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            python: "3.12"
+          - os: ubuntu-latest
+            python: "3.12"
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Show toolchain
+        run: |
+          uname -a
+          cc --version || true
+          python3 --version
+
+      - name: Build ak_search (native engine)
+        working-directory: tools/search
+        run: |
+          make
+          cp ak_search ../../server/bin/ak_search
+          chmod +x ../../server/bin/ak_search
+          file ../../server/bin/ak_search
+
+      - name: Run native C test harness (132 assertions)
+        run: |
+          ./tools/search/tests/run_tests.sh | tee /tmp/ak_search_tests.log
+          grep -E '^=+$|PASS=' /tmp/ak_search_tests.log | tail -3
+          # Fail the job if any assertion failed.
+          if grep -q '  FAIL  ' /tmp/ak_search_tests.log; then
+            echo "::error::ak_search test harness reported FAILs"
+            exit 1
+          fi
+
+      - name: Run Python unit tests (standard library, no deps)
+        run: |
+          python3 -m unittest discover -s tests/python -v
+
+      - name: MCP server smoke test (initialize + tools/list)
+        run: |
+          printf '%s\n' \
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{}}}' \
+            '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+            '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+            | python3 server/algokiller_mcp.py > /tmp/mcp_smoke.json
+          # Must respond to both initialize and tools/list.
+          test "$(grep -c '"id":1' /tmp/mcp_smoke.json)" -ge 1
+          test "$(grep -c '"id":2' /tmp/mcp_smoke.json)" -ge 1
+          echo "MCP smoke test ok"

@@ -2,7 +2,7 @@
 
 **Language**: [中文](README.md) | **English**
 
-Claude Desktop plugin for ARM64 trace evidence analysis and cipher/algorithm recovery. Bundles the AlgoKiller methodology as skills, with a local MCP server driving the native `ak_search` engine (13 subcommands) over GB-scale traces.
+Claude Desktop plugin for ARM64 trace evidence analysis and cipher/algorithm recovery. Bundles the AlgoKiller methodology as skills, with a local MCP server driving the native `ak_search` engine (14 subcommands) over GB-scale traces.
 
 > **Methodology + ak_search engine origin**: [AlgoKiller](https://github.com/lidongyooo/AlgoKiller) by [@lidongyooo](https://github.com/lidongyooo)
 > Upstream contributes the three core subcommands (`match` / `context` / `daemon` — mmap + BMH + line index + tab-protocol daemon) and the original methodology harness.
@@ -42,7 +42,7 @@ claude plugin update algokiller@algokiller-suite
    - Data flow: `trace_regflow` (register-value evolution) / `trace_producer` (nearest writer of a value) / `trace_semop` (11-class instruction classifier)
    - Health & volume: `trace_lint` (one-pass JSON summary) / `trace_fold` (block-aware folding, 115 MB → 1.1 MB)
    - Call graph: `trace_callgraph` (Top-K / xref) / `trace_modgraph` (cross-module matrix) / `trace_hexblock` (structured call+args+hexdump+ret)
-   - Crypto fingerprints: `trace_constscan` (26 MD5 / SHA1 / SHA256 / CRC / FNV / AES / SM4 constants) / `trace_bytes` (hex literal + auto byte-reverse)
+   - Crypto fingerprints: `trace_constscan` (71 hash / cipher / ecc / crc / mac constants with real/weak/alu_only verdict classification) / `trace_cryptoinstr` (ARM Crypto Extensions hardware instructions: AES / SHA-1 / SHA-256 / SHA-512 / SHA-3 / SM3 / SM4 / GHASH) / `trace_bytes` (hex literal + auto byte-reverse)
    - Static analysis: `run_static_tool` — allow-listed system CLIs (radare2 / binutils / LLVM / jtool2 / class-dump / ripgrep / jq)
 4. **Anti-drift reinjection**
    - Every tool return carries `discipline_reminder`; every 20 calls also includes `discipline_full_reinjection`
@@ -183,7 +183,7 @@ printf '%s\n' \
   | python3 server/algokiller_mcp.py
 ```
 
-Expect: `initialize` response + `tools/list` advertising 7 tools.
+Expect: `initialize` response + `tools/list` advertising 23 tools (18 trace/artifact/static tools + 5 hypothesis-ledger tools).
 
 ---
 
