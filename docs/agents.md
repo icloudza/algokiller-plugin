@@ -52,8 +52,8 @@ Agent(
   prompt=(
     "Review H3. Main agent is preparing "
     "hypothesis_conclude(id='H3', final_confidence='high'). "
-    "H3 statement: 'WeChat metasec_ov.so computes SM4-CBC for X-Sign'. "
-    "Bound trace: /captures/wechat_login.trace.log (mode=ciphertext)"
+    "H3 statement: 'target_sign.so computes SM4-CBC for the API signing header'. "
+    "Bound trace: /captures/targetapp_login.trace.log (mode=ciphertext)"
   ),
 )
 ```
