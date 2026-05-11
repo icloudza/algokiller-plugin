@@ -514,6 +514,149 @@ open thread: <一句话描述发现>
 
 大型应用厂商自研 VM(各家社交/支付/电商客户端历史上都有过)指纹比 VMP 弱:handler 数量更少(10-50 个 vs VMP 100+)、opcode 多为 1-2 字节、VM context 通常 < 256 字节、常和 OLLVM fla 混合使用。处置规则相同。
 
+### 完整 VM 还原 4 阶段流程(仅当 IO-buffer bypass 不可行时启动)
+
+> **重要前提**:绝大多数 VMP 任务**不应该**走这条全量还原路径。先尝试上面的"语义算子序列"绕过策略 —— 7-8 成场景这就够了。仅当:**(a)** 用户明确要求完整字节码 → 可执行 Python decoder,或 **(b)** bypass 路径死锁(IO buffer 中间态完全藏在 VM context 内,trace 不可见),才进入下面 4 阶段。
+>
+> **脆性警告**:VMP 反编译是脆性活,任一阶段判错会导致后续 100+ 条 listing 看起来合理但实际全错。每个阶段都有**强制验证 gate**,不通过不进下一阶。**严禁**为求进度跳过验证 —— v0.9.3 anti-hallucination layer 4(高置信推断必须 `[H<n>]` + 蓝军 reviewer)在这条路径上**全程激活**。
+
+#### Stage A · VMP 识别(三特征同时命中才算确认)
+
+**必要条件**(三条 AND,缺一不可。任意一条不过 → **不是** VMP,不要进 Stage B):
+
+1. **真 dispatcher 高频复现**:同一相对地址 ≥1000 次被调用。
+   - 工具:`trace_callgraph --top 20 --match exact` → 候选 dispatcher 是 top-1/2 非系统符号
+   - 排除:`objc_msgSend` / `__memcpy_aarch64_simd` / `malloc` / `pthread_*` 这种 system runtime 高频调用,**不是** VMP dispatcher
+
+2. **computed-goto 模式存在**:dispatcher 内部出现 `ldr xN, [xCTX, xOPCODE, lsl #3]; br xN` 或等价形态(handler table 间接跳转)。
+   - 工具:`trace_hexblock --line <候选 dispatcher 行>` 拉块内 prologue + `trace_regflow --reg <疑似 PC reg>` 看寄存器是不是有"读值 → 加偏移 → 跳"模式
+   - 关键鉴别:**OLLVM control-flow flattening 也有大 dispatch state**,但走 `cbz/cbnz/csel` 直接 br,**不是** indirect call → 那是 fla,**不是** VMP,转 §OLLVM 处置
+
+3. **VM context 结构存在**:某固定寄存器(常见 x19/x20/x22)始终指向同一 ≥64 字节的堆/TLS 区域,handler 反复对它做 mem_r/mem_w。
+   - 工具:`trace_regflow --reg x19`(或 x20/x22)→ 看是不是 init 后地址一直恒定;`trace_search --query <推测 base 地址>` → 看其他 handler 是不是也读这地址
+   - 排除:寄存器内容跨 handler 频繁变化 → 那是普通函数参数,**不是** VM context
+
+**Stage A gate**:三条全 ✓ → 进 Stage B。任一不过 → 不是 VMP,回 ciphertext 主流程。
+
+**典型失败模式**(就是被这道 gate 拦住的):
+- 看到长函数 + 多 branch 就喊 VMP → 误判 OLLVM fla → 浪费 50+ tool calls 试反 opcode
+- 把 `objc_msgSend` 高频调用当成 handler dispatch → 整个分析跑偏
+- VM context 候选寄存器没真正恒定就 commit → Stage B 字宽推导直接失败,但 agent 已经写了 30 行幻觉 listing
+
+---
+
+#### Stage B · opcode schema 推导(**最脆**,字宽错一位后续全错)
+
+进入条件:Stage A gate ✓ + 已发 `hypothesis_add(statement="binary 含 VMP,dispatcher 在 0xXXX",confidence='low')`。
+
+本阶段确定 5 个关键参数,**每个都必须有可验证证据,严禁凭直觉拍**:
+
+| # | 参数 | 怎么确定 | 验证 |
+|---|---|---|---|
+| 1 | opcode 字宽(8/16/32/可变) | 看 dispatcher 入口的 opcode load:`ldrb`=8 / `ldrh`=16 / `ldr w/x`=32 | 跑 10 个不同 handler entry 都使用相同 load 指令 |
+| 2 | endianness(LE/BE/swapped) | ARM64 默认 LE。VMP 内部偶尔 byte-swap → 看 load 后是否立即 `rev`/`rev16` | dispatcher 内 byte-reversal 指令的存在 / 缺失 |
+| 3 | bit field 布局(primary / secondary / register 位段) | dispatcher 解码段的 `ubfm` / `and #MASK` / `lsr #N` | 至少 2 个独立 dispatch path 提取相同 mask/shift |
+| 4 | encoding 状态(明文 / XOR rolling / 加密 stream) | opcode load 到 dispatch 之间是否有 XOR/lookup? | ≥2 个 handler 反复用同一 key/state |
+| 5 | PC 步进规则(定长 +N / 当前 handler 决定) | dispatcher 末尾对 PC reg 的运算 | ≥5 条 trace 行验证步进量一致 |
+
+**Stage B 脆性 gate**(必须全过,不允许部分通过):
+
+- ✓ 字宽假设下,从 dispatcher 入口拉取 ≥100 个 opcode value,**频率分布合理**:top opcode 占比 <30%,不能有 50%+ 的某固定值 —— 那种情况说明字宽错了,在数据流里采到了 align padding 或 stride 错位
+- ✓ 用推导出的 bit field 解码 50 个 opcode,**落到 ≥5 个不同 handler entry**(全落同一个 handler = 字宽/mask 错)
+- ✓ 无 "鬼 opcode"(opcode 值对应的 handler 地址不在 handler table 已知范围内)→ 出现就是 encoding state 没识别(rolling/加密)
+
+**强制规约**:
+
+- Stage B gate 通过之前,**严禁** `hypothesis_add` 任何**具体 handler** 的 mnemonic 推断。整个 Stage B 只对应**一个** root hypothesis:`"opcode schema = 字宽 X + bit field A/B/C + encoding Y"`
+- 升 schema 假设为 `conclude(medium)` 之前,必须有 `falsification_evidence`(FIX#5):跑 round-trip —— 把 100 条 trace opcode 的 raw bytes 喂进 Python decode → 推 handler index → **必须 100% 落在已知 handler table 内**
+- **99% 不算过**:1% 异常往往就是 rolling/加密没识别,后续 handler reverse 会全错但表面合理。
+
+**典型失败模式**:
+
+- 看 dispatcher 第一条 `ldrh w8, [x19]` 就 commit 16-bit opcode → 实际是 `ldrh` 后跟 `bfi` 拼成 32-bit → listing 全错
+- 没识别 rolling opcode → 推出的 handler index 看起来落在合法范围(mask 对了),但 mnemonic 全乱
+- 加密 opcode 把 dispatcher 入口的 XOR 当成"正常运算" → schema 表面 OK,decode 全是反密的明文
+
+---
+
+#### Stage C · 单 handler 迭代反编译(每个 handler 走完整 ledger 闭环)
+
+进入条件:Stage B opcode schema concluded(>=medium)。
+
+每个 handler 的还原走 4 步:
+
+1. **handler body 拉取**:从 handler table 拿地址 → `decompile_function`(BN MCP)或 `trace_hexblock --line <handler entry>` 拉前 50 行 trace
+2. **mnemonic 推断 + 寄存器映射**:从 handler body 推 VM opcode → 真 mnemonic(`ADD` / `EOR` / `LDR` 等)+ 推 vReg N ↔ ARM64 reg 映射 + 识别 implicit clobber(handler 内是否动了 condition flag / accumulator / 其他 vReg)
+3. **`hypothesis_add(low)` 记录**:`statement="VM opcode 0x33 = EOR (vRd=vR4, vRn=vR1, vRm=vR2)"`,`supporting` 含 ≥1 条 verbatim excerpt(handler body 内特征指令行)+ ≥1 条 trace 内 round-trip 候选输入输出对
+4. **round-trip 验证**:Python 实现这条 handler 的 emulator → 喂 trace 中实际出现的 vReg 输入 → 跑一遍 → **比对 trace 中下一条 handler 入口时 VM context 的 mem_w 内容**
+   - **完全一致** → `falsification_evidence` 喂 "emulator output 字节序列 = trace output 字节序列" 的 tool_call → `hypothesis_conclude(medium)`
+   - **任何不一致** → 回 Stage B 校验 schema,或 Stage C 重 mnemonic 推断,**不要硬 conclude**
+
+**Stage C 强制约束**:
+
+- **每个 handler 单独走一遍 ledger 闭环**。50 个 handler = 50 次 `hypothesis_add → conclude`,每个都有独立 [H<n>]
+- 这是 algokiller 反幻觉骨架的本职场景:**严禁** "看起来像 ADD 就当 ADD"。`ADD` vs `ADC`(带进位)/ `MOV` vs `CSEL`(条件)/ `LDR` vs `LDP`(成对)在 trace 上表现极接近,语义完全不同 —— 不做 round-trip 验证就 conclude 是 v0.9.3 anti-hallucination layer 4 想拦的事
+- handler 数 >30 时,**蓝军 reviewer 必经**(FIX#6):每 10 个 handler concluded 后 spawn 一次 `hypothesis-reviewer` 抽审 3-5 个;抽审挑被高频引用的(top dispatch path)
+- handler 之间存在 `depends_on` 关系(handler A 的语义结论依赖 handler B 的寄存器映射)→ 必须用 `depends_on` 字段连成 DAG,FIX#4 abandon-cascade 才能正确传播
+
+**典型失败模式**:
+
+- 推 `mov vRd, vRn` 实际是 `csel` → 良性输入时表现一致,carry/edge case 全错
+- 漏掉 implicit clobber(handler 内还动了 vReg 之外的 condition flag / accumulator)→ 后续 handler 取该寄存器时上下文错位
+- 60 个 handler reverse 完只 round-trip 验证了 5 个 → 剩下 55 个其实都错,但 listing 表面圆满
+- handler 之间没建 `depends_on` 链 → 某个底层 handler 后来发现错(abandon)→ 上层依赖该映射的 handler 没自动失效 → 错误一直留在交付物里
+
+---
+
+#### Stage D · 业务级闭环验证(没有这步 = 没干完)
+
+进入条件:Stage C 所有 **load-bearing handler** concluded(关键的 high,辅助的 medium)。
+
+3 级验证(逐级递进,**每级都必须过**,不允许只过 1-2 级就声称完成):
+
+| 层级 | 内容 | 阈值 |
+|---|---|---|
+| 指令级 | Python emulator 单步,**每条 VM 指令的 vReg/vMem 更新与 trace 行 `-> reg=val` 一对一比对** | **100% 一致**,1% 偏差即错 |
+| 块级 | 从 trace 选一段 basic block(连续 ~50-100 条 VM 指令,无外部 syscall 干扰),emulator 跑这块的 vReg 输入 → 比对 trace 末尾 VM context 完整快照 | block 内每个 vMem byte 一致 |
+| 业务级 | 跑用户级输入(已知一段明文 → 应产生已知密文),emulator 输出与真 binary 输出 | **bit-for-bit** 一致 |
+
+**任一级不一致 → 还没干完**,回 Stage B/C 排查具体出错点(从指令级开始排,定位到第一条偏差的 VM 指令,反推哪个 handler 推断错了)。
+
+**与 anti-hallucination scaffold 绑定**:
+
+- 业务级 (3) 通过 → `write_artifact` 时 `falsification_evidence` 必须含 emulator-vs-binary **一致输出对的 verbatim 比对**(两段 hex bytes,emulator output / binary output,字节级一致)
+- `[H<n>]` 引用层级:
+  - Stage A 假设 = [H1] schema dispatcher 在 0xXXX
+  - Stage B = [H2] depends_on [H1],opcode schema = (字宽,bit field,encoding)
+  - Stage C 每 handler = [H3..H53] depends_on [H2]
+  - Stage D 业务级断言 = [H54] depends_on [H3..H53] 全部 concluded
+- FIX#4 abandon-cascade:Stage A abandon → 整链(B/C/D)自动失效;Stage B abandon → C/D 失效;Stage C 单 handler abandon → 仅依赖该 handler 的下游失效
+
+**降级交付条件(必须遵守)**:
+
+- 累计 >100 tool 调用未通过 Stage D 业务级验证 → **强制**降级:交付 "已 round-trip 通过的 handler 子集 + 待 reverse handler 列表 + 已确认 schema 参数"
+- **严禁**写出"完整 decoder"措辞(那是 v0.9.3 高置信推断 gate 在这场景的具体落地);只能写"覆盖 X/Y handler,余下 (Y-X) 个待补"
+
+---
+
+#### 不可自动化的部分(明确边界,防过度承诺)
+
+下列情况**纯 trace + algokiller 工具链做不完**,必须配合 BN/IDA 静态分析或 dump 后手工介入,**严禁** agent 假装能搞定:
+
+| 场景 | 障碍 | 必需工作 |
+|---|---|---|
+| opcode 加密 + key runtime 解密注入 | trace 见到的是加密 opcode,decode 出来是密文 | dump key 或 hook 解密点(Frida 动态 capture) |
+| 自修改 opcode stream | 执行期 opcode 被改写,静态 trace 反映不出动态语义 | runtime 多次 dump + diff |
+| 状态完整性校验 | VM 内部 hash context,RE 篡改 abort | patch 校验点(改 binary)或在受控环境跑 |
+| JIT-style 即时编译 opcode | opcode 解码后 emit native code,trace 无"VM 指令"层 | 那是 JIT,不是 VMP,转 JIT 分析路径 |
+
+**碰上以上场景的处置**:
+
+- 必须在 `hypothesis_add` 里把这条作为 **contradicting** 证据(`contradicting` 数组),或者直接 `hypothesis_abandon` 整条 VMP 还原假设
+- **严禁**"我先把能看到的部分写出来" —— 半截 decoder 误导性比"承认看不到"高 10×。FIX#2 contradiction pressure(`contradicting > supporting` 时 confidence 硬封顶 low)在这里自动生效
+
+---
+
 ### OLLVM 三大 pass 指纹与归约
 
 OLLVM（Obfuscator-LLVM）有 3 个常见 pass，每个都有指纹，识别后归约规则不同。

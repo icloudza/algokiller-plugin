@@ -6,6 +6,81 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.9.5] — Full VM reversal methodology in ciphertext-recovery SKILL
+
+`skills/ciphertext-recovery/SKILL.md` previously had a one-paragraph
+treatment of VMP / 自研 VM with a "bypass via IO-buffer semantic ops"
+strategy. The bypass strategy is correct as the **default** path for
+most VMP tasks. But the SKILL had no guidance for the cases where:
+
+- The user explicitly asks for a complete byte-code → executable
+  Python decoder, OR
+- The bypass path deadlocks because the IO buffer's intermediate state
+  lives entirely inside the VM context (invisible to trace).
+
+Without a structured methodology for these escalation cases, the agent
+would either give up or, worse, ship a half-reversed "decoder" with
+fabricated handler semantics. VMP reversal is a brittle workflow —
+one wrong bit in the opcode bit-field decode produces 100+ lines of
+plausible-looking but semantically false listing.
+
+### Added — `完整 VM 还原 4 阶段流程` section (+140 lines)
+
+Four explicit stages with **strict brittleness gates** at every transition:
+
+| Stage | Purpose | Gate |
+|---|---|---|
+| **A. VMP 识别** | confirm it's actually a VM(P), not OLLVM-fla / heavy obfuscation | 3 necessary conditions (high-frequency dispatcher + computed-goto + persistent VM context register), all must ✓ |
+| **B. opcode schema 推导** | determine word size / endianness / bit field / encoding state / PC stride | 100-opcode frequency distribution check + multi-handler hit check + no "ghost opcode" — **99% pass does NOT pass; needs 100%** |
+| **C. 单 handler 迭代反编译** | reverse each VM handler with round-trip emulation | per-handler hypothesis_add → conclude with `falsification_evidence` proving Python emulator output = trace mem_w output |
+| **D. 业务级闭环验证** | bit-for-bit business-level output match | 3 levels (instruction / block / business) all must pass with 100% / 100% / bit-for-bit |
+
+### Anti-hallucination scaffold wiring
+
+Every stage explicitly invokes the v0.9.0–v0.9.3 scaffold:
+
+- Stage B schema hypothesis MUST conclude with `falsification_evidence`
+  (FIX #5) — schema verified against 100-opcode round-trip.
+- Stage C every handler hypothesis MUST round-trip vs trace mem_w output.
+  Handler count > 30 → **mandatory `hypothesis-reviewer` audit** every
+  10 handlers (FIX #6 hard gate).
+- Stages chain via `depends_on` — Stage A abandon cascades to B/C/D
+  (FIX #4 abandon-cascade); Stage B abandon cascades to C/D; etc.
+- Stage D business-level pass → `write_artifact` `[H<n>]` citations link
+  the whole chain (FIX #7 — non-load-bearing handlers can be
+  `hypothesis_archive`d).
+- v0.9.3 high-confidence tier marker gate enforces "complete decoder"
+  language can ONLY appear when Stage D bit-for-bit passes.
+
+### Explicit "不可自动化" boundary
+
+Four scenarios are now documented as out-of-scope for pure-trace +
+algokiller workflow:
+
+- Encrypted opcode with runtime-decrypted key
+- Self-modifying opcode stream
+- VM-internal state-integrity checks
+- JIT-style runtime native code emission (this is JIT, NOT VMP)
+
+In these cases the SKILL mandates that the agent either record the
+blocker as `contradicting` evidence (FIX #2 contradiction pressure
+auto-caps confidence at low) or call `hypothesis_abandon` on the full
+VM-reversal track. "Half-decoder is 10× more misleading than 'I can't
+see it' is" — written into the SKILL verbatim.
+
+### Why this is its own release, not a v0.9.4 amendment
+
+- Adds a new behavioural path the agent didn't have before (full
+  reversal vs bypass) — large enough to deserve a version of its own.
+- Server / handlers / schemas / gates unchanged. Plugin will function
+  identically v0.9.4 vs v0.9.5 at the API level; the difference is
+  agent-visible methodology only.
+
+### Tests
+
+- No engine changes → native 146/146 PASS unchanged.
+- No handler changes → Python 83/83 PASS unchanged.
+
 ## [0.9.4] — Brand hygiene: strip app-specific names from skill / code / fixtures
 
 algokiller's mission is **algorithm-domain-agnostic** trace analysis ——
