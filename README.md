@@ -46,6 +46,8 @@ claude plugin update algokiller@algokiller-suite
    - 静态分析：`run_static_tool` —— 白名单调用系统 CLI（radare2 / binutils / LLVM / jtool2 / class-dump / ripgrep / jq）
 4. **反漂移注入**
    - 每次工具返回带 `discipline_reminder`；每 20 次附 `discipline_full_reinjection` 完整规则段
+5. **Sub-agents**（v0.9.0+ 新增）
+   - `hypothesis-reviewer` —— 独立 context 蓝军，`hypothesis_conclude(high)` 之前主 agent 通过 `Agent` 工具 spawn 它做独立证据审查。详见 [docs/agents.md](docs/agents.md)。
 
 ---
 

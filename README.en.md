@@ -46,6 +46,8 @@ claude plugin update algokiller@algokiller-suite
    - Static analysis: `run_static_tool` — allow-listed system CLIs (radare2 / binutils / LLVM / jtool2 / class-dump / ripgrep / jq)
 4. **Anti-drift reinjection**
    - Every tool return carries `discipline_reminder`; every 20 calls also includes `discipline_full_reinjection`
+5. **Sub-agents** (v0.9.0+)
+   - `hypothesis-reviewer` — Independent blue-team reviewer spawned via the `Agent` tool before any `hypothesis_conclude(final_confidence="high")` on a load-bearing hypothesis. Read-only access to the ledger and trace; recommends `confirm` / `refute` / `abandon`. See [docs/agents.md](docs/agents.md).
 
 ---
 

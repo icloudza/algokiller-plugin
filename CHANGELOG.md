@@ -6,6 +6,32 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.9.0] — Sub-Agents: Hypothesis Reviewer (anti-hallucination defence layer 3)
+
+### Added
+- **`agents/hypothesis-reviewer.md`** — Plugin-level sub-agent invoked
+  via the `Agent` tool. Independent blue-team reviewer for any
+  `hypothesis_conclude(final_confidence="high")` call on a load-bearing
+  hypothesis. Tools restricted to read-only trace queries + `hypothesis_list`
+  (no `conclude`/`add`/`update`/`abandon` power) — it can only recommend,
+  not execute. Closes the one anti-hallucination gap the server-side
+  FIX#1–#4 gates cannot: an agent that has invested 20+ tool calls in a
+  hypothesis becomes biased toward concluding it; an independent reviewer
+  with no sunk cost stays objective.
+- **`docs/agents.md`** — sub-agent inventory, invocation patterns,
+  design boundaries, future-agent rationale (why
+  `trace-evidence-scout` / `crypto-recovery-specialist` were considered
+  and withdrawn).
+- **`skills/ciphertext-recovery/SKILL.md`** — new `conclude(high) 必经
+  蓝军审查` section spelling out when and how to spawn the reviewer.
+- **`skills/trace-analysis/SKILL.md`** — pointer to the reviewer for
+  the optional ledger usage in general mode.
+
+### Changed
+- Plugin version: `0.8.1` → `0.9.0`.
+
+## [0.8.x] — pre-sub-agent baseline (preserved for changelog continuity)
+
 ### Added
 - `CHANGELOG.md`, `SECURITY.md`, `CONTRIBUTING.md` (project hygiene baseline).
 - GitHub Actions CI: macOS + Linux matrix, runs `tools/search/tests/run_tests.sh`

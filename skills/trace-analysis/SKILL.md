@@ -47,6 +47,22 @@ description: ARM64 trace 通用证据分析方法论。当用户给出一段 ARM
 
 ---
 
+## Sub-agent: hypothesis-reviewer (v0.9.0+, 可选)
+
+general 模式不强制走 Hypothesis Ledger,但当任务**会驱动一个具体技术决策**（例如"这个 buffer 是被算法 X 加密的"会决定后续如何还原数据流）时, 推荐:
+
+1. 用 `hypothesis_add` 记录关键判断
+2. 想把它升为 `conclude(high)` 之前, spawn `hypothesis-reviewer` agent 做独立蓝军审查:
+   ```
+   Agent(subagent_type="hypothesis-reviewer",
+         prompt="Review H<N>. Statement: '<…>'. Bound trace: <path> (mode=general)")
+   ```
+3. reviewer 返回 `confirm` / `refute` / `abandon` + reason, 主 agent 按推荐执行 conclude / 补证据 / abandon
+
+详见 `algokiller:ciphertext-recovery` skill 的 "conclude(high) 必经蓝军审查" 章节。
+
+---
+
 ## Stage 0: 开场三件套（general 模式同样必做）
 
 1. `trace_lint` —— 确认 trace 格式合法 + 拿模块/mnemonic 分布画像。

@@ -120,6 +120,28 @@ E. 交付
 
 每 5 次 tool call, server 自动把当前 active ledger summary 附在工具返回里. 你不需要主动 `hypothesis_list`——但**看到 inject summary 后必须更新状态**: 没进展的 active 假设要么补 evidence 要么 abandon. 长期挂着 falsification_attempted=false 是 3.25 行为.
 
+### conclude(high) 必经蓝军审查 (v0.9.0+)
+
+**任何 load-bearing 假设升 high 之前必须 spawn `hypothesis-reviewer` agent 做独立审查**。规则:
+
+- 这个 reviewer 是**独立 context 的蓝军**, 看不到你的推理过程, 只看 ledger state + 用 trace_search 抽查 evidence excerpt 是否真支持 statement。
+- 调用方式:
+  ```
+  Agent(subagent_type="hypothesis-reviewer",
+        prompt="Review H<N>. Main agent is preparing hypothesis_conclude(id='H<N>', final_confidence='high'). \
+                H<N> statement: '<full statement>'. Bound trace: <trace path> (mode=ciphertext)")
+  ```
+- reviewer 返回 JSON: `{"recommendation": "confirm" | "refute" | "abandon", "reason": "...", "next_steps_for_main_agent": "..."}`
+- recommendation = `confirm` → 你可以 `hypothesis_conclude(id, ..., final_confidence="high")`
+- recommendation = `refute` → 按 next_steps 补 evidence 或换思路, 不要硬 conclude
+- recommendation = `abandon` → 调 `hypothesis_abandon(id, reason)`, 重新规划
+
+**什么算 load-bearing**: 这个假设的结论会被 `write_artifact` 的最终交付物以 H<N> 引用。简单说"决定 recovered.py 里哪段代码长什么样"的, 都是 load-bearing。
+
+**为什么强制走 reviewer**: server 端 FIX#1-#4 拦得住"凭空捏造证据 / 数量不够 / 没反证"——但拦不住"你为这个假设花了 20 轮调用, 沉没成本让你倾向 confirm"。reviewer 没沉没成本, 客观性更高。**这是 algokiller v0.9.0 反幻觉护城河的第三层。**
+
+**medium 可选走 reviewer**: 不强制, 但对会驱动主要分支的关键假设建议过一遍——花 1 次 spawn 换"早期纠偏", 比走到 write_artifact 才被拒收 cost 低得多。
+
 ### 这套约束防什么
 
 | 幻觉模式 | 被哪一道防线挡住 |
@@ -130,6 +152,7 @@ E. 交付
 | 跳过反驳直接 conclude high | falsification_attempted 校验 |
 | 下游错误传播 | abandon 时自动 surface 依赖者 |
 | 隐式断言 (写报告不引用 H<id>) | write_artifact 检测到 ledger 有 concluded 但 0 引用 → 拒收 |
+| **沉没成本驱动的 conclude(high)** (v0.9.0+) | **必经独立蓝军 hypothesis-reviewer 审查** |
 
 **底层逻辑**: ledger 让 AI 不能瞎说. 它把推理从"AI 自说自话"变成"AI 必须显式构建可证伪 + 可审计的论证链".
 
