@@ -370,38 +370,48 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "hypothesis_add",
         "description": (
-            "Create a new active hypothesis in the session's reasoning ledger. Every "
-            "claim you intend to put in a final deliverable MUST be backed by a "
-            "concluded hypothesis. Each hypothesis MUST declare a falsification_plan "
-            "(which experiment would refute it). Supporting/contradicting evidence "
-            "must cite real tool_call_ids from this session (look at the _tool_call_id "
-            "field returned by every other tool). The ledger is the anti-hallucination "
-            "scaffold: it stops the agent from giving structured-looking but "
-            "unsupported conclusions."
+            "Create a new active hypothesis. Every claim in your final deliverable MUST be "
+            "backed by a concluded hypothesis. Anti-hallucination scaffold v2 enforces:\n"
+            "  FIX#1 Each evidence item MUST contain `excerpt` — a >=12-char verbatim substring "
+            "        of the cited tool_call_id's output. Server checks the substring exists.\n"
+            "  FIX#2 Contradiction pressure: contradicting > supporting → confidence hard-capped "
+            "        at 'low'; conclude(high) needs supporting >= 2× contradicting.\n"
+            "  FIX#3 Source diversity: conclude(high) requires supporting from >=2 distinct "
+            "        tool names (3 hits from one tool = correlated, not independent).\n"
+            "  FIX#4 Conflict graph: declare conflicts_with for mutually exclusive hypotheses. "
+            "        Cannot conclude(>=medium) while a conflicting hypothesis is concluded."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "statement": {"type": "string", "description": "One-sentence hypothesis. >=6 chars."},
                 "confidence": {"type": "string", "enum": ["unknown", "low", "medium", "high"],
-                               "description": "Initial confidence; start at unknown/low unless evidence already gathered."},
+                               "description": "Initial confidence; start at unknown/low."},
                 "falsification_plan": {"type": "string",
-                                       "description": "Required. Which tool + which result would refute this hypothesis? >=10 chars."},
+                                       "description": "Required >=10 chars. Which tool + result would refute this?"},
                 "supporting": {"type": "array", "items": {"type": "object",
                                "properties": {"tool_call_id": {"type": "integer"},
-                                              "summary": {"type": "string"},
+                                              "excerpt": {"type": "string",
+                                                          "description": "REQUIRED. >=12-char verbatim substring of the tool's output. Not your paraphrase."},
+                                              "summary": {"type": "string",
+                                                          "description": "Optional human commentary on what the excerpt means."},
                                               "line_range": {"type": "array"},
                                               "note": {"type": "string"}},
-                               "required": ["tool_call_id", "summary"]}},
+                               "required": ["tool_call_id", "excerpt"]}},
                 "contradicting": {"type": "array", "items": {"type": "object",
                                   "properties": {"tool_call_id": {"type": "integer"},
+                                                 "excerpt": {"type": "string"},
                                                  "summary": {"type": "string"},
                                                  "line_range": {"type": "array"},
                                                  "note": {"type": "string"}},
-                                  "required": ["tool_call_id", "summary"]}},
+                                  "required": ["tool_call_id", "excerpt"]}},
                 "depends_on": {"type": "array", "items": {"type": "string"},
-                               "description": "Hypothesis ids this depends on, e.g. ['H1']."},
-                "next_experiment": {"type": "string", "description": "Optional. What tool you plan to run next to advance this."},
+                               "description": "Hypothesis ids this depends on. abandon-cascade ready."},
+                "conflicts_with": {"type": "array", "items": {"type": "string"},
+                                   "description": "Hypothesis ids this is mutually exclusive with. Both cannot be concluded >=medium."},
+                "next_experiment": {"type": "string"},
+                "reason_for_experiment": {"type": "string",
+                                          "description": "Why this experiment next, given current ledger state."},
             },
             "required": ["statement", "confidence", "falsification_plan"],
         },
@@ -712,7 +722,9 @@ def tool_hypothesis_add(args: dict[str, Any]) -> dict:
         supporting=args.get("supporting"),
         contradicting=args.get("contradicting"),
         depends_on=args.get("depends_on"),
+        conflicts_with=args.get("conflicts_with"),
         next_experiment=args.get("next_experiment"),
+        reason_for_experiment=args.get("reason_for_experiment"),
     )
 
 
@@ -726,6 +738,7 @@ def tool_hypothesis_update(args: dict[str, Any]) -> dict:
         add_supporting=args.get("add_supporting"),
         add_contradicting=args.get("add_contradicting"),
         next_experiment=args.get("next_experiment"),
+        reason_for_experiment=args.get("reason_for_experiment"),
         falsification_attempted=args.get("falsification_attempted"),
     )
 
@@ -1109,20 +1122,24 @@ def _log(msg: str) -> None:
     sys.stderr.flush()
 
 
-def _attach_discipline(name: str, payload: dict) -> dict:
+def _attach_discipline(name: str, payload: dict, args: dict | None = None) -> dict:
     # Skip discipline injection on protocol-level errors (no bound trace).
     if payload.get("status") == "error" and STATE.daemon is None and name != "bind_trace":
         return payload
     call_count = STATE.bump_tool_call()
     payload.update(build_reminder(mode=STATE.mode, call_count=call_count))
-    # Anchor tool_call_id into the result so the agent can cite it as evidence
-    # in hypothesis_track. Without a real id the ledger's anti-hallucination
-    # check (which verifies cited ids fall inside 1..tool_call_count) would
-    # have nothing to verify against.
     payload["_tool_call_id"] = call_count
-    # Periodic hypothesis-ledger summary inject (cheap, terse). Mirrors the
-    # discipline_reminder cadence — every N calls, surface the active ledger
-    # state so the agent doesn't drift away from its own working memory.
+    # FIX #1 anchor: persist tool result for evidence-excerpt verification.
+    # The ledger checks "did this excerpt actually appear in tool_call_id N's
+    # output?" — we have to actually store the output for that to work.
+    if STATE.tool_log is not None and name not in ("hypothesis_add", "hypothesis_update",
+                                                    "hypothesis_conclude",
+                                                    "hypothesis_abandon",
+                                                    "hypothesis_list"):
+        try:
+            STATE.tool_log.record(call_count, name, args or {}, payload)
+        except Exception as exc:
+            _log(f"tool_log.record failed for #{call_count} {name}: {exc}")
     if STATE.ledger is not None and call_count > 0 and call_count % 5 == 0:
         summary = STATE.ledger.summary_for_inject()
         if summary:
@@ -1169,7 +1186,7 @@ def handle_request(req: dict) -> dict | None:
                 ),
                 "available_tools": list(HANDLERS.keys()),
             }
-            payload = _attach_discipline(name, payload)
+            payload = _attach_discipline(name, payload, arguments)
             return {
                 "jsonrpc": "2.0",
                 "id": req_id,
@@ -1188,7 +1205,7 @@ def handle_request(req: dict) -> dict | None:
                 ),
             }
 
-        payload = _attach_discipline(name, payload)
+        payload = _attach_discipline(name, payload, arguments)
         text = json.dumps(payload, ensure_ascii=False)
         return {
             "jsonrpc": "2.0",
