@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "algokiller",
+  "version": "0.1.0",
+  "description": "ARM64 trace evidence analysis & cipher algorithm recovery. Bundles the AlgoKiller methodology as skills + a local MCP server that drives the native ak_search engine over GB-scale trace files.",
+  "author": {
+    "name": "cloudza"
+  },
+  "homepage": "https://github.com/icloudza/algokiller-plugin",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/icloudza/algokiller-plugin.git"
+  },
+  "bugs": {
+    "url": "https://github.com/icloudza/algokiller-plugin/issues"
+  },
+  "license": "MIT",
+  "keywords": [
+    "reverse-engineering",
+    "arm64",
+    "trace-analysis",
+    "cipher-recovery",
+    "algorithm-recovery",
+    "cryptanalysis",
+    "binary-analysis",
+    "mcp",
+    "claude-desktop"
+  ]
+}

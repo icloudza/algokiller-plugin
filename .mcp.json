@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "algokiller": {
+      "command": "python3",
+      "args": [
+        "-u",
+        "${CLAUDE_PLUGIN_ROOT}/server/algokiller_mcp.py"
+      ],
+      "cwd": "${CLAUDE_PLUGIN_ROOT}",
+      "env": {
+        "ALGOKILLER_PLUGIN_ROOT": "${CLAUDE_PLUGIN_ROOT}",
+        "PYTHONUNBUFFERED": "1"
+      }
+    }
+  }
+}

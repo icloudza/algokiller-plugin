@@ -1,0 +1,554 @@
+#!/usr/bin/env python3
+"""algokiller MCP server — JSON-RPC 2.0 over stdio, zero external deps.
+
+Speaks MCP 2024-11-05 directly (initialize / tools/list / tools/call / ping).
+Designed to be launched by Claude Desktop's plugin runtime via .mcp.json.
+"""
+
+from __future__ import annotations
+
+import atexit
+import json
+import re
+import signal
+import sys
+import traceback
+from pathlib import Path
+from typing import Any
+
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+
+from state import STATE, AK_SEARCH_BIN, PLUGIN_ROOT  # noqa: E402
+from daemon import AkSearchDaemon  # noqa: E402
+from discipline import build_reminder  # noqa: E402
+from artifacts import ArtifactStore  # noqa: E402
+from static_tools import ALLOWED_TOOLS as STATIC_TOOLS_ALLOW, run_static_tool  # noqa: E402
+
+
+PROTOCOL_VERSION = "2024-11-05"
+SERVER_NAME = "algokiller"
+SERVER_VERSION = "0.1.0"
+
+
+# ---------------------------------------------------------------------------
+# Tool schemas (advertised via tools/list)
+# ---------------------------------------------------------------------------
+
+TOOLS: list[dict[str, Any]] = [
+    {
+        "name": "bind_trace",
+        "description": (
+            "Bind the current session to an ARM64 trace log file and analysis mode. "
+            "Must be called once before any trace_search or trace_context. "
+            "Subsequent calls re-bind (the previous ak_search daemon is closed and a new one is started)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Absolute path to the trace log file."},
+                "mode": {
+                    "type": "string",
+                    "enum": ["ciphertext", "general"],
+                    "description": "Analysis mode: 'ciphertext' for cipher / algorithm recovery, 'general' for open trace analysis.",
+                },
+            },
+            "required": ["path", "mode"],
+        },
+    },
+    {
+        "name": "trace_search",
+        "description": (
+            "Case-insensitive exact substring search over the bound trace. "
+            "Provide exactly one of from_line / before_line plus limit (<=100). "
+            "from_line searches forward; before_line searches backward and returns nearest earlier matches first. "
+            "For 0x-hex queries with no matches, the server automatically retries with byte-reversed and "
+            "leading-zero-trimmed variants."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Exact substring to find. ASCII case-insensitive."},
+                "from_line": {"type": "integer", "minimum": 1, "description": "1-based file line to start searching from (forward)."},
+                "before_line": {"type": "integer", "minimum": 1, "description": "1-based file line; search only lines strictly before this (backward)."},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Maximum number of matching lines to return."},
+            },
+            "required": ["query", "limit"],
+        },
+    },
+    {
+        "name": "trace_context",
+        "description": (
+            "Return neighboring trace lines around a 1-based file line in the bound trace. "
+            "Both before and after must be provided, each <= 100."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "line": {"type": "integer", "minimum": 1},
+                "before": {"type": "integer", "minimum": 0, "maximum": 100},
+                "after": {"type": "integer", "minimum": 0, "maximum": 100},
+            },
+            "required": ["line", "before", "after"],
+        },
+    },
+    {
+        "name": "write_artifact",
+        "description": (
+            "Write a final deliverable (recovered Python source, or markdown analysis report) "
+            "into the session artifacts directory. Path is relative; the server appends mode + timestamp."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Relative filename, e.g. 'recovered.py' or 'report.md'."},
+                "content": {"type": "string", "description": "Full file content."},
+                "notes": {"type": "string", "description": "Optional short evidence / confidence note saved alongside."},
+            },
+            "required": ["path", "content"],
+        },
+    },
+    {
+        "name": "list_artifacts",
+        "description": "List all artifacts written in the current session directory.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "read_artifact",
+        "description": "Read back an artifact previously written by write_artifact (path must be inside the current session directory).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "run_static_tool",
+        "description": (
+            "Execute an allow-listed READ-ONLY static-analysis CLI on the user's machine. "
+            "Use this to complement trace analysis with binary metadata, local disassembly, string extraction, "
+            "byte-order conversion, and JSON / cross-file search — especially when Binary Ninja MCP is NOT connected. "
+            "Tools are launched via argv (no shell), have per-tool timeouts, and r2 is bounded to single-command "
+            "mode with mandatory -q -2 -n flags (no full-binary analysis allowed — r2 -A / aaa are rejected). "
+            "If a tool is not installed, the response includes a 'hint' with the install command. "
+            "Priority: prefer Binary Ninja MCP if connected; use this only when BN is offline or for capabilities "
+            "BN does not have (rax2 byte-order conversion, ripgrep cross-file search, jq JSON, etc)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tool": {
+                    "type": "string",
+                    "enum": sorted(STATIC_TOOLS_ALLOW.keys()),
+                    "description": "Tool name from the allow-list. Use 'file' to detect binary type / arch first.",
+                },
+                "args": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Command-line arguments as a list of strings (NOT a shell string). "
+                        "Example: ['-I', '/path/to/binary'] for rabin2 info. "
+                        "For r2: MUST include ['-q', '-2', '-n', '-c', '<single bounded command>', '<binary path>']. "
+                        "Forbidden for r2: -A / -AA / -AAA flags, and -c commands containing aaa/aac/aae/aab/aav/aar/aap."
+                    ),
+                },
+                "input_stdin": {
+                    "type": "string",
+                    "description": "Optional stdin content. Use for jq (pipe JSON in) or c++filt (pipe symbols in).",
+                },
+            },
+            "required": ["tool", "args"],
+        },
+    },
+]
+
+
+# ---------------------------------------------------------------------------
+# Tool implementations
+# ---------------------------------------------------------------------------
+
+def _require_bound() -> dict | None:
+    if STATE.trace_file is None or STATE.daemon is None:
+        return {
+            "status": "error",
+            "error": "no trace bound",
+            "instruction": "Call bind_trace(path, mode) first.",
+        }
+    return None
+
+
+def _byte_reverse_hex(hex_digits: str) -> str:
+    padded = hex_digits if len(hex_digits) % 2 == 0 else "0" + hex_digits
+    return "0x" + "".join(reversed([padded[i:i + 2] for i in range(0, len(padded), 2)]))
+
+
+def _hex_fallback_queries(query: str) -> list[str]:
+    if not query.lower().startswith("0x"):
+        return []
+    hex_digits = query[2:]
+    if not re.fullmatch(r"[0-9a-fA-F]+", hex_digits):
+        return []
+    fallbacks = [_byte_reverse_hex(hex_digits)]
+    trimmed = hex_digits.lstrip("0")
+    if trimmed and trimmed != hex_digits:
+        fallbacks.append("0x" + trimmed)
+        fallbacks.append(_byte_reverse_hex(trimmed))
+    seen = {query.lower()}
+    out: list[str] = []
+    for fq in fallbacks:
+        if fq.lower() not in seen:
+            seen.add(fq.lower())
+            out.append(fq)
+    return out
+
+
+def _search_once(query: str, *, from_line: int = 0, before_line: int = 0, limit: int) -> dict:
+    hex_query = query.encode("utf-8").hex()
+    return STATE.daemon.request(f"match\t{from_line}\t{before_line}\t{limit}\t{hex_query}")
+
+
+def _empty_ok(result: dict) -> bool:
+    return result.get("status") == "ok" and not str(result.get("stdout") or "").strip()
+
+
+def _has_matches(result: dict) -> bool:
+    return result.get("status") == "ok" and bool(str(result.get("stdout") or "").strip())
+
+
+def tool_bind_trace(args: dict[str, Any]) -> dict:
+    path_arg = args.get("path")
+    mode_arg = args.get("mode")
+    if not path_arg or not isinstance(path_arg, str):
+        return {"status": "error", "error": "path is required"}
+    if mode_arg not in ("ciphertext", "general"):
+        return {"status": "error", "error": "mode must be 'ciphertext' or 'general'"}
+
+    trace_path = Path(path_arg).expanduser()
+    if not trace_path.is_absolute():
+        trace_path = trace_path.resolve()
+    else:
+        trace_path = trace_path.resolve()
+    if not trace_path.exists():
+        return {"status": "error", "error": f"trace file not found: {trace_path}"}
+    if not trace_path.is_file():
+        return {"status": "error", "error": f"trace path is not a file: {trace_path}"}
+
+    if STATE.daemon is not None:
+        STATE.daemon.close()
+        STATE.daemon = None
+
+    daemon = AkSearchDaemon(binary=AK_SEARCH_BIN, trace_file=trace_path)
+    try:
+        daemon.start()
+    except Exception as exc:
+        return {"status": "error", "error": f"failed to start ak_search daemon: {exc}"}
+
+    STATE.daemon = daemon
+    STATE.bind(trace_path, mode_arg)
+
+    return {
+        "status": "ok",
+        "trace_file": str(trace_path),
+        "mode": mode_arg,
+        "artifacts_dir": str(STATE.artifacts_dir),
+        "instruction": (
+            "Trace bound. Use trace_search / trace_context to gather evidence; "
+            "use write_artifact to deliver final source or analysis. "
+            "Tool returns include a 'discipline_reminder' field — read it before deciding the next call."
+        ),
+    }
+
+
+def tool_trace_search(args: dict[str, Any]) -> dict:
+    err = _require_bound()
+    if err is not None:
+        return err
+
+    query = str(args.get("query", ""))
+    if not query:
+        return {"status": "error", "error": "query must not be empty"}
+    has_from = "from_line" in args
+    has_before = "before_line" in args
+    if has_from == has_before:
+        return {"status": "error", "error": "exactly one of from_line / before_line is required"}
+    try:
+        limit = int(args.get("limit", 0))
+    except (TypeError, ValueError):
+        return {"status": "error", "error": "limit must be an integer"}
+    if not (1 <= limit <= 100):
+        return {"status": "error", "error": "limit must be in [1, 100]"}
+
+    if has_before:
+        try:
+            before_line = int(args["before_line"])
+        except (TypeError, ValueError):
+            return {"status": "error", "error": "before_line must be an integer"}
+        if before_line < 1:
+            return {"status": "error", "error": "before_line must be >= 1"}
+        result = _search_once(query, before_line=before_line, limit=limit)
+        if _empty_ok(result):
+            for fq in _hex_fallback_queries(query):
+                fallback = _search_once(fq, before_line=before_line, limit=limit)
+                if _has_matches(fallback):
+                    fallback["fallback_query"] = fq
+                    return fallback
+        return result
+
+    try:
+        from_line = int(args["from_line"])
+    except (TypeError, ValueError):
+        return {"status": "error", "error": "from_line must be an integer"}
+    if from_line < 1:
+        return {"status": "error", "error": "from_line must be >= 1"}
+    result = _search_once(query, from_line=from_line, limit=limit)
+    if _empty_ok(result):
+        for fq in _hex_fallback_queries(query):
+            fallback = _search_once(fq, from_line=from_line, limit=limit)
+            if _has_matches(fallback):
+                fallback["fallback_query"] = fq
+                return fallback
+    return result
+
+
+def tool_trace_context(args: dict[str, Any]) -> dict:
+    err = _require_bound()
+    if err is not None:
+        return err
+    try:
+        line = int(args.get("line", 0))
+    except (TypeError, ValueError):
+        return {"status": "error", "error": "line must be an integer"}
+    if line < 1:
+        return {"status": "error", "error": "line must be >= 1"}
+    if "before" not in args or "after" not in args:
+        return {"status": "error", "error": "before and after are both required"}
+    try:
+        before = int(args["before"])
+        after = int(args["after"])
+    except (TypeError, ValueError):
+        return {"status": "error", "error": "before / after must be integers"}
+    if not (0 <= before <= 100 and 0 <= after <= 100):
+        return {"status": "error", "error": "before and after must be in [0, 100]"}
+    return STATE.daemon.request(f"context\t{line}\t{before}\t{after}")
+
+
+def tool_write_artifact(args: dict[str, Any]) -> dict:
+    if STATE.artifacts_dir is None:
+        return {"status": "error", "error": "artifacts dir not initialized; call bind_trace first"}
+    store = ArtifactStore(STATE.artifacts_dir, mode=STATE.mode)
+    return store.write(
+        rel_path=str(args.get("path", "")),
+        content=str(args.get("content", "")),
+        notes=args.get("notes"),
+    )
+
+
+def tool_list_artifacts(_args: dict[str, Any]) -> dict:
+    if STATE.artifacts_dir is None:
+        return {"status": "error", "error": "artifacts dir not initialized; call bind_trace first"}
+    store = ArtifactStore(STATE.artifacts_dir, mode=STATE.mode)
+    return {
+        "status": "ok",
+        "artifacts_dir": str(STATE.artifacts_dir),
+        "items": store.list_all(),
+    }
+
+
+def tool_read_artifact(args: dict[str, Any]) -> dict:
+    if STATE.artifacts_dir is None:
+        return {"status": "error", "error": "artifacts dir not initialized; call bind_trace first"}
+    store = ArtifactStore(STATE.artifacts_dir, mode=STATE.mode)
+    try:
+        text = store.read(str(args.get("path", "")))
+    except (FileNotFoundError, ValueError) as exc:
+        return {"status": "error", "error": str(exc)}
+    return {"status": "ok", "content": text}
+
+
+def tool_run_static_tool(args: dict[str, Any]) -> dict:
+    tool_name = args.get("tool")
+    tool_args = args.get("args")
+    stdin = args.get("input_stdin")
+    if not isinstance(tool_name, str) or not tool_name:
+        return {"status": "error", "error": "tool must be a non-empty string"}
+    if not isinstance(tool_args, list) or any(not isinstance(a, str) for a in tool_args):
+        return {"status": "error", "error": "args must be a list of strings"}
+    if stdin is not None and not isinstance(stdin, str):
+        return {"status": "error", "error": "input_stdin, if provided, must be a string"}
+    return run_static_tool(tool=tool_name, args=tool_args, input_stdin=stdin)
+
+
+HANDLERS = {
+    "bind_trace": tool_bind_trace,
+    "trace_search": tool_trace_search,
+    "trace_context": tool_trace_context,
+    "write_artifact": tool_write_artifact,
+    "list_artifacts": tool_list_artifacts,
+    "read_artifact": tool_read_artifact,
+    "run_static_tool": tool_run_static_tool,
+}
+
+
+# ---------------------------------------------------------------------------
+# JSON-RPC plumbing
+# ---------------------------------------------------------------------------
+
+def _send(msg: dict) -> None:
+    sys.stdout.write(json.dumps(msg, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+def _log(msg: str) -> None:
+    sys.stderr.write(f"[algokiller-mcp] {msg}\n")
+    sys.stderr.flush()
+
+
+def _attach_discipline(name: str, payload: dict) -> dict:
+    # Skip discipline injection on protocol-level errors (no bound trace).
+    if payload.get("status") == "error" and STATE.daemon is None and name != "bind_trace":
+        return payload
+    call_count = STATE.bump_tool_call()
+    payload.update(build_reminder(mode=STATE.mode, call_count=call_count))
+    return payload
+
+
+def handle_request(req: dict) -> dict | None:
+    method = req.get("method")
+    req_id = req.get("id")
+
+    if method == "initialize":
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+            },
+        }
+    if method == "notifications/initialized":
+        return None  # notification, no response expected
+    if method == "tools/list":
+        return {"jsonrpc": "2.0", "id": req_id, "result": {"tools": TOOLS}}
+    if method == "tools/call":
+        params = req.get("params") or {}
+        name = params.get("name")
+        arguments = params.get("arguments") or {}
+        handler = HANDLERS.get(name)
+        if handler is None:
+            # M3: don't return a JSON-RPC protocol error — return a normal tool
+            # result with a strong self-correction instruction so the agent
+            # doesn't stall on an unknown-tool reply.
+            known = ", ".join(HANDLERS.keys())
+            payload = {
+                "status": "error",
+                "error": f"Unknown tool: {name}",
+                "instruction": (
+                    "This tool does not exist and has been skipped. Do NOT stop, do NOT ask the user; "
+                    f"retry using one of the available tools: {known}. "
+                    "If you intended to search trace evidence, use trace_search / trace_context. "
+                    "If you intended to deliver a final artifact, use write_artifact."
+                ),
+                "available_tools": list(HANDLERS.keys()),
+            }
+            payload = _attach_discipline(name, payload)
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {"content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}]},
+            }
+        try:
+            payload = handler(arguments)
+        except Exception as exc:
+            _log(f"tool '{name}' raised: {exc}\n{traceback.format_exc()}")
+            payload = {
+                "status": "error",
+                "error": str(exc),
+                "instruction": (
+                    "Tool call failed and has been skipped. Do NOT stop, do NOT ask the user; "
+                    "fix the arguments or switch to another tool and continue the previous task."
+                ),
+            }
+
+        payload = _attach_discipline(name, payload)
+        text = json.dumps(payload, ensure_ascii=False)
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {"content": [{"type": "text", "text": text}]},
+        }
+    if method == "ping":
+        return {"jsonrpc": "2.0", "id": req_id, "result": {}}
+    if method and method.startswith("notifications/"):
+        return None  # ignore other notifications silently
+
+    return {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "error": {"code": -32601, "message": f"Unknown method: {method}"},
+    }
+
+
+def _shutdown(_signum: int | None = None, _frame: Any = None) -> None:
+    # P11: ensure the ak_search daemon is reaped on normal exit, SIGTERM, or
+    # SIGINT. Without this the daemon can survive plugin reload and pile up.
+    if STATE.daemon is not None:
+        try:
+            STATE.daemon.close()
+        except Exception:
+            pass
+        STATE.daemon = None
+    if _signum is not None:
+        raise SystemExit(0)
+
+
+def main() -> int:
+    # P9: force line buffering so every JSON-RPC response leaves the process
+    # immediately. Belt + suspenders with the `-u` flag and PYTHONUNBUFFERED=1
+    # set in .mcp.json — if any of the three is honored we are safe.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
+        sys.stderr.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+    # P11: register cleanup hooks before serving any request.
+    atexit.register(_shutdown)
+    try:
+        signal.signal(signal.SIGTERM, _shutdown)
+        signal.signal(signal.SIGINT, _shutdown)
+    except (ValueError, OSError):
+        # Not in main thread, or running on a platform that disallows the
+        # handler. Plugin still works, just without graceful signal cleanup.
+        pass
+
+    _log(f"starting (plugin_root={PLUGIN_ROOT}, binary={AK_SEARCH_BIN})")
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+        except json.JSONDecodeError as exc:
+            _log(f"invalid JSON-RPC line: {exc}")
+            continue
+        try:
+            resp = handle_request(req)
+        except Exception as exc:
+            _log(f"handle_request crashed: {exc}\n{traceback.format_exc()}")
+            resp = {
+                "jsonrpc": "2.0",
+                "id": req.get("id"),
+                "error": {"code": -32000, "message": str(exc)},
+            }
+        if resp is not None:
+            _send(resp)
+
+    if STATE.daemon is not None:
+        STATE.daemon.close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

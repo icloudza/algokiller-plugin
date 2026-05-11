@@ -1,0 +1,50 @@
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Virtualenvs and Python caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# IDE/editor local state
+.idea/
+.vscode/
+
+# Build and packaging output
+dist/
+build/
+*.egg-info/
+
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+.AppleDouble
+.LSOverride
+
+# Editor swap / backup
+*.swp
+*.swo
+*~
+.*.sw?
+*.bak
+*.orig
+
+# AlgoKiller runtime test fixtures (if you drop traces into the repo for testing)
+captures/
+traces/
+artifacts/
+*.trace.log
+
+# Local Python tooling state
+.python-version
+*.egg
+.eggs/
