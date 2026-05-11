@@ -7,13 +7,7 @@
     "name": "cloudza"
   },
   "homepage": "https://github.com/icloudza/algokiller-plugin",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/icloudza/algokiller-plugin.git"
-  },
-  "bugs": {
-    "url": "https://github.com/icloudza/algokiller-plugin/issues"
-  },
+  "repository": "https://github.com/icloudza/algokiller-plugin",
   "license": "MIT",
   "keywords": [
     "reverse-engineering",

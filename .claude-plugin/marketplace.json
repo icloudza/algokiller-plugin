@@ -1,5 +1,4 @@
 {
-    "$schema": "https://json.schemastore.org/claude-code-plugin-marketplace.json",
     "name": "algokiller-suite",
     "description": "ARM64 trace evidence analysis & cipher algorithm recovery. Claude Desktop plugin packaging the AlgoKiller methodology as skills + a local MCP server driving the native ak_search engine (13 subcommands) over GB-scale trace files.",
     "owner": {
