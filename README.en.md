@@ -2,10 +2,11 @@
 
 **Language**: [中文](README.md) | **English**
 
-Claude Desktop plugin for ARM64 trace evidence analysis and cipher/algorithm recovery. Bundles the AlgoKiller methodology as skills, with a local MCP server driving the native `ak_search` engine over GB-scale traces.
+Claude Desktop plugin for ARM64 trace evidence analysis and cipher/algorithm recovery. Bundles the AlgoKiller methodology as skills, with a local MCP server driving the native `ak_search` engine (13 subcommands) over GB-scale traces.
 
-> **Upstream methodology & `ak_search` engine**: [AlgoKiller](https://github.com/lidongyooo/AlgoKiller) by [@lidongyooo](https://github.com/lidongyooo)
-> This repo is the Claude Desktop plugin wrapper; all methodology, the native engine, and the original harness belong to the upstream author.
+> **Methodology + ak_search engine origin**: [AlgoKiller](https://github.com/lidongyooo/AlgoKiller) by [@lidongyooo](https://github.com/lidongyooo)
+> Upstream contributes the three core subcommands (`match` / `context` / `daemon` — mmap + BMH + line index + tab-protocol daemon) and the original methodology harness.
+> This repo extends the native engine with 10 additional subcommands (`regflow` / `producer` / `semop` / `lint` / `fold` / `callgraph` / `modgraph` / `hexblock` / `constscan` / `bytes` — see [tools/search/README.md](tools/search/README.md)) and packages everything as a Claude Desktop plugin. Original code copyright belongs to upstream; plugin extensions are MIT.
 
 ---
 
@@ -17,9 +18,14 @@ Claude Desktop plugin for ARM64 trace evidence analysis and cipher/algorithm rec
 2. **Slash commands** (strong activation)
    - `/algokiller:ciphertext <trace> <task>`
    - `/algokiller:general <trace> <task>`
-3. **7 MCP tools**
-   - `bind_trace` / `trace_search` / `trace_context` / `write_artifact` / `list_artifacts` / `read_artifact`
-   - `run_static_tool` — allow-listed system CLIs (radare2 / binutils / LLVM / jtool2 / class-dump / ripgrep / jq)
+3. **17 MCP tools**
+   - Binding / artifacts: `bind_trace` / `write_artifact` / `list_artifacts` / `read_artifact`
+   - Core search: `trace_search` / `trace_context`
+   - Data flow: `trace_regflow` (register-value evolution) / `trace_producer` (nearest writer of a value) / `trace_semop` (11-class instruction classifier)
+   - Health & volume: `trace_lint` (one-pass JSON summary) / `trace_fold` (block-aware folding, 115 MB → 1.1 MB)
+   - Call graph: `trace_callgraph` (Top-K / xref) / `trace_modgraph` (cross-module matrix) / `trace_hexblock` (structured call+args+hexdump+ret)
+   - Crypto fingerprints: `trace_constscan` (26 MD5 / SHA1 / SHA256 / CRC / FNV / AES / SM4 constants) / `trace_bytes` (hex literal + auto byte-reverse)
+   - Static analysis: `run_static_tool` — allow-listed system CLIs (radare2 / binutils / LLVM / jtool2 / class-dump / ripgrep / jq)
 4. **Anti-drift reinjection**
    - Every tool return carries `discipline_reminder`; every 20 calls also includes `discipline_full_reinjection`
 

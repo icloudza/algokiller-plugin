@@ -2,10 +2,11 @@
 
 **语言**：**中文** | [English](README.en.md)
 
-面向 ARM64 trace 证据分析与算法/密文还原的 **Claude Desktop plugin**。把 AlgoKiller 方法论打包为 skill，配本地 MCP server 驱动 native `ak_search` 引擎，专攻 GB 级 trace。
+面向 ARM64 trace 证据分析与算法/密文还原的 **Claude Desktop plugin**。把 AlgoKiller 方法论打包为 skill，配本地 MCP server 驱动 native `ak_search` 引擎（13 个 subcommand，专攻 GB 级 trace）。
 
-> **方法论与 `ak_search` 引擎原作**：[AlgoKiller](https://github.com/lidongyooo/AlgoKiller) by [@lidongyooo](https://github.com/lidongyooo)
-> 本仓库是其 Claude Desktop plugin 封装，所有方法论、native 引擎、原始 harness 归原作者所有。
+> **方法论 + ak_search 引擎原作**：[AlgoKiller](https://github.com/lidongyooo/AlgoKiller) by [@lidongyooo](https://github.com/lidongyooo)
+> 上游贡献 `match` / `context` / `daemon` 三个核心子命令（mmap + BMH + 行号索引 + tab 协议 daemon）以及原始方法论 harness。
+> 本仓库在此之上额外扩展了 10 个 native 子命令（`regflow` / `producer` / `semop` / `lint` / `fold` / `callgraph` / `modgraph` / `hexblock` / `constscan` / `bytes`，详见 [tools/search/README.md](tools/search/README.md)）并把整套打包为 Claude Desktop plugin。原始代码版权归上游作者；plugin 自身的扩展代码 MIT。
 
 ---
 
@@ -17,9 +18,14 @@
 2. **Slash commands**（强激活）
    - `/algokiller:ciphertext <trace> <task>`
    - `/algokiller:general <trace> <task>`
-3. **7 个 MCP 工具**
-   - `bind_trace` / `trace_search` / `trace_context` / `write_artifact` / `list_artifacts` / `read_artifact`
-   - `run_static_tool` —— 白名单调用系统 CLI（radare2 / binutils / LLVM / jtool2 / class-dump / ripgrep / jq）
+3. **17 个 MCP 工具**
+   - 绑定 / 制品：`bind_trace` / `write_artifact` / `list_artifacts` / `read_artifact`
+   - 基础检索：`trace_search` / `trace_context`
+   - 数据流：`trace_regflow`（寄存器演化）/ `trace_producer`（找值的最近写入者）/ `trace_semop`（指令语义分类，11 类）
+   - 体检与降噪：`trace_lint`（一遍 JSON 体检）/ `trace_fold`（block-aware 折叠，115 MB → 1.1 MB）
+   - 调用图：`trace_callgraph`（Top-K / xref）/ `trace_modgraph`（跨模块矩阵）/ `trace_hexblock`（call+args+hexdump+ret 结构化）
+   - 密码学指纹：`trace_constscan`（26 个 MD5/SHA1/SHA256/CRC/FNV/AES/SM4 常数）/ `trace_bytes`（hex 字面量含自动反序）
+   - 静态分析：`run_static_tool` —— 白名单调用系统 CLI（radare2 / binutils / LLVM / jtool2 / class-dump / ripgrep / jq）
 4. **反漂移注入**
    - 每次工具返回带 `discipline_reminder`；每 20 次附 `discipline_full_reinjection` 完整规则段
 
