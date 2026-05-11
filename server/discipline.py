@@ -59,6 +59,21 @@ GENERAL_FULL_BLOCK = """[Full-rule reinjection — general mode]
 
 REINJECTION_INTERVAL = 20
 
+# FIX F-16 (v0.9.1): the first 3 tool calls of a session are usually
+# bind_trace + lint/constscan/cryptoinstr triage — these are NOT yet
+# producing hits, so the modular-wrap reminders ("Classify hit: origin /
+# generation / copy ...") arrived before the agent had any hits to
+# classify, becoming pure noise. Fix: phase-pin the early calls to a
+# fixed Detection-phase reminder, then resume the modular wrap from
+# call 4 onward when the agent is actually in evidence-gathering territory.
+DETECTION_PHASE_HINT = (
+    "Phase: Detection — run trace_lint → trace_constscan → trace_cryptoinstr → "
+    "trace_callgraph(top=N) to triage the trace before drilling. If trace_lint "
+    "warns about format/missing-call-blocks/missing-register-observations, fix "
+    "the input before sinking analysis tokens."
+)
+EARLY_PHASE_HINT_CALLS = 3
+
 
 def build_reminder(*, mode: str, call_count: int) -> dict:
     """Return a discipline payload to merge into a tool result dict.
@@ -77,7 +92,12 @@ def build_reminder(*, mode: str, call_count: int) -> dict:
     else:
         return {}
 
-    payload = {"discipline_reminder": short_pool[call_count % len(short_pool)]}
+    # FIX F-16: the first EARLY_PHASE_HINT_CALLS get a fixed Detection-phase
+    # reminder; modular wrap resumes after.
+    if 1 <= call_count <= EARLY_PHASE_HINT_CALLS:
+        payload = {"discipline_reminder": DETECTION_PHASE_HINT}
+    else:
+        payload = {"discipline_reminder": short_pool[call_count % len(short_pool)]}
     if call_count > 0 and call_count % REINJECTION_INTERVAL == 0:
         payload["discipline_full_reinjection"] = full_block
     return payload

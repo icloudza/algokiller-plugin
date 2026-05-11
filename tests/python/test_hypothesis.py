@@ -232,7 +232,14 @@ class TestSourceDiversity(unittest.TestCase):
             )
             self.assertEqual(out["status"], "ok", out)
             hid = out["hypothesis"]["id"]
-            ledger.update(hid, falsification_attempted=True)
+            # Satisfy FIX#5 + FIX#6 so the diversity gate is what trips
+            cid_falsify = _record_tool_call(ledger.tool_log, counter,
+                                            "trace_callgraph", "callgraph found no md5_*")
+            ledger.update(hid, falsification_evidence={
+                "tool_call_id": cid_falsify,
+                "excerpt": "callgraph found no md5_*"})
+            ledger.mark_reviewed(hid, "confirm",
+                                 "reviewer audited even though diversity is 1")
             res = ledger.conclude(hid, "MD5 confirmed from constscan",
                                   final_confidence="high")
             self.assertEqual(res["status"], "error")
@@ -259,7 +266,15 @@ class TestSourceDiversity(unittest.TestCase):
             )
             self.assertEqual(out["status"], "ok", out)
             hid = out["hypothesis"]["id"]
-            ledger.update(hid, falsification_attempted=True)
+            # FIX #5: real falsification experiment after hypothesis creation
+            cid_falsify = _record_tool_call(ledger.tool_log, counter,
+                                            "trace_lint", "lint says no inconsistency")
+            ledger.update(hid, falsification_evidence={
+                "tool_call_id": cid_falsify,
+                "excerpt": "lint says no inconsistency"})
+            # FIX #6: reviewer hard gate
+            ledger.mark_reviewed(hid, "confirm",
+                                 "reviewer audited 3-tool diversity and falsification")
             res = ledger.conclude(hid, "MD5 confirmed via 3 tools",
                                   final_confidence="high")
             self.assertEqual(res["status"], "ok", res)
@@ -330,8 +345,9 @@ class TestArtifactReferenceValidation(unittest.TestCase):
                              "excerpt": "MD5.A magic hit"}],
             )
             hid = r["hypothesis"]["id"]
+            # FIX A-8: bracketed citation form is the only one matched
             check = ledger.validate_artifact_references(
-                f"Algorithm is MD5, see {hid}.")
+                f"Algorithm is MD5, see [{hid}].")
             self.assertFalse(check["ok"])
             self.assertTrue(any("not 'concluded'" in e
                                 for e in check["errors"]))
@@ -354,10 +370,241 @@ class TestArtifactReferenceValidation(unittest.TestCase):
             )
             hid = r["hypothesis"]["id"]
             ledger.conclude(hid, "MD5 confirmed", final_confidence="medium")
+            # FIX A-8: bracketed citation form is the only one matched
             check = ledger.validate_artifact_references(
-                f"Algorithm is MD5, see {hid}.")
+                f"Algorithm is MD5, see [{hid}].")
             self.assertTrue(check["ok"], check)
             self.assertIn(hid, check["referenced_ids"])
+
+
+class TestFalsificationEvidence(unittest.TestCase):
+    """FIX #5 (v0.9.1) — conclude(high) requires verifiable
+    falsification_evidence; boolean self-report no longer suffices.
+    """
+
+    def _build_for_high(self, td, n_supporting_distinct=3):
+        ledger, counter = _make_ledger(Path(td))
+        sup = []
+        # Distinct tool names → satisfies FIX #3 diversity
+        for i in range(n_supporting_distinct):
+            cid = _record_tool_call(ledger.tool_log, counter,
+                                    f"distinct_tool_{i}", f"piece evidence {i} content")
+            sup.append({"tool_call_id": cid, "excerpt": f"piece evidence {i} content"})
+        r = ledger.add(
+            statement="Binary computes XX algorithm",
+            confidence="low",
+            falsification_plan="run a counter-experiment via trace_callgraph",
+            supporting=sup,
+        )
+        return ledger, counter, r["hypothesis"]["id"]
+
+    def test_boolean_only_rejected_at_high(self):
+        with tempfile.TemporaryDirectory() as td:
+            ledger, counter, hid = self._build_for_high(td)
+            ledger.update(hid, falsification_attempted=True)
+            # FIX #6 needs reviewer too; satisfy that to isolate FIX #5
+            ledger.mark_reviewed(hid, "confirm", "reviewer audit passed for test")
+            out = ledger.conclude(hid, "concluded", final_confidence="high")
+            self.assertEqual(out["status"], "error")
+            self.assertIn("falsification_evidence", out["error"])
+
+    def test_evidence_before_hypothesis_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            ledger, counter, hid = self._build_for_high(td)
+            # Falsification "evidence" pointing at an OLD tool_call_id
+            # (one we already used for supporting). tool_call_id must be
+            # strictly greater than created_at_tool_call.
+            old_cid = 1
+            out = ledger.update(hid, falsification_evidence={
+                "tool_call_id": old_cid, "excerpt": "piece evidence 0 content"})
+            self.assertEqual(out["status"], "error")
+            self.assertIn("must be GREATER", out["error"])
+
+    def test_valid_evidence_promotes_to_high(self):
+        with tempfile.TemporaryDirectory() as td:
+            ledger, counter, hid = self._build_for_high(td)
+            # Run the falsification experiment AFTER hypothesis was created
+            cid_falsify = _record_tool_call(
+                ledger.tool_log, counter, "trace_callgraph",
+                "call func: md5_compress 0 hits — falsification result")
+            out = ledger.update(hid, falsification_evidence={
+                "tool_call_id": cid_falsify,
+                "excerpt": "call func: md5_compress 0 hits"})
+            self.assertEqual(out["status"], "ok", out)
+            ledger.mark_reviewed(hid, "confirm",
+                                 "reviewer audited evidence and falsification result")
+            res = ledger.conclude(hid, "validated", final_confidence="high")
+            self.assertEqual(res["status"], "ok", res)
+
+
+class TestReviewerHardGate(unittest.TestCase):
+    """FIX #6 (v0.9.1) — conclude(high) requires hypothesis-reviewer
+    verdict='confirm' within REVIEWER_STALENESS_LIMIT calls."""
+
+    def _make_high_ready(self, td):
+        ledger, counter = _make_ledger(Path(td))
+        sup = []
+        for i, tool in enumerate(("trace_constscan", "trace_callgraph",
+                                  "trace_hexblock")):
+            cid = _record_tool_call(ledger.tool_log, counter,
+                                    tool, f"evidence body {i} verbatim")
+            sup.append({"tool_call_id": cid, "excerpt": f"evidence body {i} verbatim"})
+        r = ledger.add(
+            statement="Algorithm is XYZ",
+            confidence="low",
+            falsification_plan="cross-check with other indicators",
+            supporting=sup,
+        )
+        hid = r["hypothesis"]["id"]
+        cid_falsify = _record_tool_call(ledger.tool_log, counter,
+                                        "trace_lint", "lint says no XYZ pattern present")
+        ledger.update(hid, falsification_evidence={
+            "tool_call_id": cid_falsify,
+            "excerpt": "lint says no XYZ pattern"})
+        return ledger, counter, hid
+
+    def test_high_without_reviewer_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            ledger, counter, hid = self._make_high_ready(td)
+            out = ledger.conclude(hid, "trying to conclude",
+                                  final_confidence="high")
+            self.assertEqual(out["status"], "error")
+            self.assertIn("reviewer", out["error"].lower())
+
+    def test_high_with_refute_verdict_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            ledger, counter, hid = self._make_high_ready(td)
+            ledger.mark_reviewed(hid, "refute",
+                                 "evidence #2 was weak by reviewer audit")
+            out = ledger.conclude(hid, "trying anyway",
+                                  final_confidence="high")
+            self.assertEqual(out["status"], "error")
+            self.assertIn("confirm", out["error"])
+
+    def test_high_with_confirm_verdict_accepted(self):
+        with tempfile.TemporaryDirectory() as td:
+            ledger, counter, hid = self._make_high_ready(td)
+            ledger.mark_reviewed(hid, "confirm",
+                                 "evidence checks out; all gates satisfied")
+            out = ledger.conclude(hid, "validated", final_confidence="high")
+            self.assertEqual(out["status"], "ok", out)
+            self.assertEqual(out["hypothesis"]["confidence"], "high")
+
+    def test_stale_review_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            ledger, counter, hid = self._make_high_ready(td)
+            ledger.mark_reviewed(hid, "confirm", "early review will go stale")
+            # Burn 31 more tool calls — REVIEWER_STALENESS_LIMIT is 30
+            for _ in range(31):
+                _record_tool_call(ledger.tool_log, counter,
+                                  "trace_search", "later activity")
+            out = ledger.conclude(hid, "trying late",
+                                  final_confidence="high")
+            self.assertEqual(out["status"], "error")
+            self.assertIn("stale", out["error"].lower())
+
+
+class TestArchiveState(unittest.TestCase):
+    """FIX #7 (v0.9.1) — concluded hypotheses can be archived so they
+    no longer count as 'must be referenced' in the deliverable."""
+
+    def _build_concluded(self, td):
+        ledger, counter = _make_ledger(Path(td))
+        sup = []
+        for i, tool in enumerate(("t_a", "t_b")):
+            cid = _record_tool_call(ledger.tool_log, counter,
+                                    tool, f"evidence chunk {i}")
+            sup.append({"tool_call_id": cid, "excerpt": f"evidence chunk {i}"})
+        r = ledger.add(statement="Sub-hypothesis", confidence="low",
+                       falsification_plan="some experiment",
+                       supporting=sup)
+        hid = r["hypothesis"]["id"]
+        ledger.conclude(hid, "confirmed at medium", final_confidence="medium")
+        return ledger, counter, hid
+
+    def test_archive_succeeds_for_concluded(self):
+        with tempfile.TemporaryDirectory() as td:
+            ledger, counter, hid = self._build_concluded(td)
+            out = ledger.archive(hid, "not load-bearing for final report")
+            self.assertEqual(out["status"], "ok", out)
+            self.assertEqual(out["hypothesis"]["state"], "archived")
+
+    def test_archive_blocks_abandoned(self):
+        with tempfile.TemporaryDirectory() as td:
+            ledger, counter = _make_ledger(Path(td))
+            cid = _record_tool_call(ledger.tool_log, counter,
+                                    "t", "evidence verbatim block")
+            r = ledger.add(statement="To abandon", confidence="low",
+                           falsification_plan="any falsifier",
+                           supporting=[{"tool_call_id": cid,
+                                        "excerpt": "evidence verbatim block"}])
+            hid = r["hypothesis"]["id"]
+            ledger.abandon(hid, "no longer applies")
+            out = ledger.archive(hid, "trying to archive abandoned")
+            self.assertEqual(out["status"], "error")
+
+    def test_archive_short_reason_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            ledger, counter, hid = self._build_concluded(td)
+            out = ledger.archive(hid, "x")
+            self.assertEqual(out["status"], "error")
+            self.assertIn(">=6", out["error"])
+
+    def test_archived_not_required_in_artifact(self):
+        with tempfile.TemporaryDirectory() as td:
+            ledger, counter, hid = self._build_concluded(td)
+            ledger.archive(hid, "exclusion analysis; not in final report")
+            # Artifact with NO references but ledger has only an archived
+            # hypothesis (no concluded ones) — should not trigger the
+            # "bypass" bypass-error.
+            concluded = [h for h in ledger.list(state="concluded")["hypotheses"]
+                         if h["state"] == "concluded"]
+            self.assertEqual(concluded, [])  # archived no longer counts
+
+
+class TestArtifactBracketCitation(unittest.TestCase):
+    """FIX A-8 (v0.9.1) — citation regex is bracket-only; bare H1/H2 in
+    Python source no longer false-match."""
+
+    def _make_concluded(self, td):
+        ledger, counter = _make_ledger(Path(td))
+        sup = []
+        for i, tool in enumerate(("trace_constscan", "trace_callgraph")):
+            cid = _record_tool_call(ledger.tool_log, counter,
+                                    tool, f"evidence content {i}")
+            sup.append({"tool_call_id": cid, "excerpt": f"evidence content {i}"})
+        r = ledger.add(statement="X is true", confidence="low",
+                       falsification_plan="some falsification approach",
+                       supporting=sup)
+        hid = r["hypothesis"]["id"]
+        ledger.conclude(hid, "validated", final_confidence="medium")
+        return ledger, hid
+
+    def test_bare_H_not_matched_as_citation(self):
+        with tempfile.TemporaryDirectory() as td:
+            ledger, hid = self._make_concluded(td)
+            # Bare H<n> in narrative — no brackets. Should NOT be picked up.
+            check = ledger.validate_artifact_references(
+                f"As we discussed, {hid} shows the pattern.")
+            self.assertEqual(check["referenced_ids"], [])
+
+    def test_bracketed_H_matched_as_citation(self):
+        with tempfile.TemporaryDirectory() as td:
+            ledger, hid = self._make_concluded(td)
+            check = ledger.validate_artifact_references(
+                f"Algorithm is X (see [{hid}]).")
+            self.assertTrue(check["ok"], check)
+            self.assertIn(hid, check["referenced_ids"])
+
+    def test_python_variable_name_not_false_matched(self):
+        with tempfile.TemporaryDirectory() as td:
+            ledger, hid = self._make_concluded(td)
+            # Python source with H1 as a magnetic-field variable name — must
+            # NOT trip the validator since the SOURCE doesn't bracket-cite hid.
+            artifact = "def field(t):\n    H1 = 5.0\n    return H1 * t\n"
+            check = ledger.validate_artifact_references(artifact)
+            self.assertEqual(check["referenced_ids"], [])
+            self.assertTrue(check["ok"])
 
 
 class TestAbandonCascade(unittest.TestCase):

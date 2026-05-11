@@ -6,6 +6,178 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.9.1] — Anti-hallucination layer 4 + tool-semantics correction batch
+
+External 29-point code-review surfaced two damaging gaps that the
+v0.8.x / v0.9.0 anti-hallucination scaffold could not close on its own:
+
+1. The `falsification_attempted=true` boolean self-report could be set
+   without ever running the experiment, vacating FIX #1's verbatim
+   grounding on the high-confidence path.
+2. The `hypothesis-reviewer` sub-agent (v0.9.0) was a documentation-only
+   constraint — main agents could skip spawning it and still reach
+   `conclude(high)`.
+
+And 12+ tool-semantics issues where the engine returned data the agent
+systematically misread (silent fallback / observation emits / first+last
+fold / substring vs exact callgraph match / etc).
+
+### Added — Hypothesis Ledger v3 (server-side hard gates)
+
+- **FIX #5 — `falsification_evidence`**. `hypothesis_update` accepts a
+  new `falsification_evidence={tool_call_id, excerpt}` object. The
+  excerpt is verbatim-checked through the same FIX #1 anchor, and the
+  `tool_call_id` must be *greater than* the hypothesis's
+  `created_at_tool_call` (experiment must run *after* the hypothesis was
+  formed). `conclude(high)` now requires this evidence; boolean
+  `falsification_attempted=true` alone is rejected.
+- **FIX #6 — `mark_hypothesis_reviewed` hard gate**. New MCP tool the
+  `hypothesis-reviewer` sub-agent calls after auditing a hypothesis.
+  `conclude(high)` rejects hypotheses without a recent (within 30 tool
+  calls) `verdict="confirm"` record. Closes the documentation-soft hole
+  from v0.9.0.
+- **FIX #7 — `hypothesis_archive`**. New state `archived` for concluded
+  hypotheses that turn out not to be load-bearing for the deliverable.
+  Removes the reverse-prompt-injection failure where agents were forced
+  to either cite irrelevant `[H<id>]`s or have `conclude(high)` rejected.
+
+### Added — Per-tool semantic correctness (Python-side wrappers)
+
+- **F-1 `trace_search`**: removed silent byte-reversed / leading-zero-
+  stripped fallback that was attributing reversed-endian hits to the
+  original query. Zero-hit 0x-queries now return a `hint` pointing at
+  `trace_bytes` (which exposes per-variant counts explicitly).
+- **F-2 `trace_producer`**: added `target_reg` parameter (surfaces
+  register mismatches instead of silently returning a misleading row)
+  and `min_hex_length` (default 4 — protects against `0x0`/`0x1`/`0xff`
+  collisions with thousands of unrelated writes).
+- **F-3 `trace_regflow`**: rows now classified as `write` / `observation`
+  / `unclassified` via mnemonic taxonomy. `cmp`/`tst`/`cbz`/`bl`/`ret`
+  emits (where GumTrace records the register's current value but the
+  instruction does NOT write it) are filtered by default. `regflow_summary`
+  carries the filter counts. Pass `include_observations=true` for the
+  raw view.
+- **F-5 `trace_cryptoinstr`**: per-primitive `verdict`
+  (confirmed / suspected / ambiguous) in `primitive_corroboration`.
+  SHA-3 needs `eor3 + (rax1|xar|bcax)` co-occurrence (eor3 alone is
+  generic 3-way XOR); GHASH needs `pmull + aese` (pmull alone is more
+  often CRC / Reed-Solomon erasure code).
+- **F-6 partial `trace_hexblock`**: Python-side defensive check —
+  status flips to `ok_truncated` with a `warning` when the engine
+  reaches `max_lines` without finding a matching `ret`. Hexdumps from
+  such blocks may belong to a nested inner call (張冠李戴 corruption);
+  the warning explicitly tells the agent not to cite them. Full
+  C-engine nested-depth counter ships in 0.9.2.
+- **F-7 `trace_callgraph`**: explicit `match` parameter
+  (`exact` | `prefix` | `substring`, default `exact`). The engine's
+  default substring match was over-counting (`memcpy` silently matched
+  `_memcpy`, `__memcpy_aarch64_simd`, `safe_memcpy_helper`, etc).
+- **F-11 `trace_search`**: clarified `before_line` direction semantics
+  in the schema description — engine returns hits nearest-to-cutoff
+  first, but the schema wording was easy to misread.
+- **F-13 `trace_bytes`**: limit now allocated evenly per variant.
+  Previously a canonical-heavy result could exhaust the limit before
+  reversed/stripped variants were reported, making agents conclude
+  "no reversed hit" when there were plenty. Response carries
+  `per_variant_emitted`.
+- **F-14 `trace_semop`**: `crypto_candidate` hits sub-classified by ±3
+  ARX-neighbour co-occurrence. `subclass="crypto_arx"` for hits near
+  rotate/add/multiply (genuinely cipher-round territory);
+  `subclass="xor_three_reg"` for bare 3-way XOR with no ARX neighbour
+  (common in constant-time conditionals, byteswap, base64 lookup,
+  software CRC — lead, not evidence).
+- **F-15 schema-only `trace_hexblock`**: each hexdump tagged
+  `direction="unknown"` to make the missing in/out distinction
+  explicit. Full C-engine mem_r vs mem_w discrimination ships in 0.9.2.
+- **F-16 discipline reminder**: first `EARLY_PHASE_HINT_CALLS=3` tool
+  calls now get a fixed Detection-phase reminder instead of the
+  modular wrap. Previously the call_count % 11 rotation could land
+  "Classify hit: origin / generation / copy ..." on the first call
+  (bind_trace), with zero hits to classify.
+
+### Added — Server-side security + correctness
+
+- **F-12 r2 prefix blacklist**: `R2_FORBIDDEN_TOKEN_PREFIXES` rejects r2
+  command tokens starting with `!` (shell escape), `.` (script eval),
+  `@@` (iterate), `=` (network/RAP), `#!` (macro), `$` (alias),
+  `|` (pipe). Previously `r2 -q -2 -n -c "!rm -rf ~"` passed the v0.8.x
+  blacklist because only the first whitespace token (`!rm`) was checked
+  against `aaa/aac/...`.
+- **A-4 `trace_fold` path containment**: `out_filename` is the new
+  preferred parameter (single filename, no directory components). Legacy
+  `out_path` accepted but forced under `STATE.artifacts_dir` via
+  `Path.relative_to`. Removes the path-traversal hole where any
+  absolute output path was accepted.
+- **A-2 `bind_trace`** now resets `tool_call_count = 0` on (re-)bind.
+  CHANGELOG v0.8.x promised "fresh per-session"; the code was not
+  resetting, so the new session's first tool call inherited the prior
+  session's counter (file numbering started at e.g. `000047.json`).
+- **A-6 `_skip_discipline`**: handlers can opt out of the discipline
+  counter for pure argument-validation failures (`_skip_discipline=true`
+  on the payload). Used across handlers so a session with typos doesn't
+  trigger full-rule reinjection at call 14 instead of 20.
+- **A-8 `[H<n>]` bracket-only citation**: the `validate_artifact_
+  references` regex tightened to `\[H(\d+)\]|<H(\d+)>` — bare `H1`/`H2`
+  no longer matched, avoiding false matches on Python variable names,
+  SHA-3 state vector identifiers, etc. SKILL docs teach the bracket
+  form.
+
+### Changed — Daemon / MCP
+
+- **F-10 ToolCallLog stores full pre-truncation result**. Previously
+  `daemon.request` / `daemon.run_cli` truncated stdout *during* read
+  and the `ToolCallLog.record` step stored the already-truncated
+  payload. FIX #1 verbatim verification could then spuriously fail
+  when real evidence fell past the truncation boundary — pushing
+  agents toward picking only excerpts visible in the truncated window.
+  Now the daemon returns `_stdout_full` for ledger-side recording;
+  `_attach_discipline` swaps it into the persisted payload then strips
+  it from the agent-facing one.
+
+### Deferred to 0.9.2 — Requires C-engine work (`tools/search/search.c`)
+
+Documented as KNOWN GAPS in the affected tools' schema descriptions so
+agents see them at the call site, not just in CHANGELOG.
+
+- **F-4 `trace_constscan` adrp+ldr literal-pool blind spot**. iOS
+  Apple-clang -O default emits `adrp x9, page; ldr w0, [x9, #off]` for
+  any 32-bit constant; the magic lives in `.rodata` not on the
+  instruction line, so the current `classify_evidence` reports zero
+  hits when the binary IS doing MD5/SHA-256. New `EV_POOL_LOAD` type
+  + `mem_r=<addr>` dump scanner ships next.
+- **F-6 full `trace_hexblock` nested depth**. Python defensive check
+  (above) catches the truncated case; the C engine still doesn't
+  count `bl`/`ret` nesting so a long-span call block with internal
+  `bl objc_retain; ret` returns the inner ret as the outer boundary.
+- **F-9 `trace_fold` samples_per_fold**. The current first+last
+  collapse drops middle-round state, breaking hash algorithm
+  identification (you can't see SHA-1's a/b/c/d/e rotation across 80
+  rounds when only round 1 + round 80 are kept). New
+  `samples_per_fold` (3-5 evenly spaced) + block-signature in
+  sentinel comment.
+- **F-15 full `trace_hexblock` direction**. Per-hexdump
+  `direction="in"|"out"` based on `mem_r=` vs `mem_w=` source line.
+- **A-3 daemon `extcall` protocol**. Extend the persistent daemon
+  protocol from `match`/`context` to cover the 11 extension
+  subcommands (regflow / producer / semop / lint / fold / callgraph /
+  modgraph / hexblock / constscan / cryptoinstr / bytes). Saves
+  20-150s of cumulative mmap+line-index rebuild on a typical 30-50
+  tool-call session over a GB-scale trace.
+
+### Deferred to 0.9.5+ — Original "Evidence Weighting" roadmap
+
+The pre-review v0.9.1 plan was Evidence Weighting / Confidence Decay /
+Independence anchor model. Postponed: building those on top of tools
+with structural biases amplifies error rather than reducing it. Tool
+correctness (this release) ships first.
+
+### Notes — Hygiene items still pending
+
+- **A-1** docs lint CI for tool count drift, **A-5** SessionState.cleanup
+  unification, **A-9** ToolCallLog chunked truncation, **A-10** startup
+  binary-existence logging, **A-11** daemon retry / SIGTERM / path
+  escape edge tests. Tracked separately.
+
 ## [0.9.0] — Sub-Agents: Hypothesis Reviewer (anti-hallucination defence layer 3)
 
 ### Added

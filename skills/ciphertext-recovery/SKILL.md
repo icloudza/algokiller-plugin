@@ -13,7 +13,7 @@ description: ARM64 trace 密文还原方法论。当用户给出一段 ARM64 执
 
 你必须基于 trace 证据回答用户任务。不要编造指令、寄存器值、内存字节、函数边界、密钥、常量、字段语义、分支结果或调用关系。
 
-可用工具（均由 `algokiller` MCP server 提供, v0.6.0 共 17 个，按使用顺序分组）：
+可用工具（均由 `algokiller` MCP server 提供, v0.9.1 共 25 个 = 18 trace/artifact + 7 ledger，按使用顺序分组）：
 
 **🔍 体检与总览（bind_trace 之后第一波必做）**
 - `algokiller.trace_lint`：单遍扫 trace 得 JSON 体检——行数/模块分布/Top-K mnemonic/call_func 块数/有无寄存器观察/format_ok + warnings。先调一次，确认 trace 格式可用、结构画像清晰。
@@ -99,46 +99,68 @@ B. 实验
    - hypothesis_update 把该 tool_call_id 作为 supporting/contradicting 引用
    - server 校验 id 必须在 [1, 当前 tool_call_count] 区间 (反"凭空捏造证据")
 
-C. 反驳尝试 (conclude=high 必经)
+C. 反驳尝试 (conclude=high 必经, v0.9.1 升级为 FIX #5)
    - 主动跑 falsification_plan 描述的实验, 即使预期会失败
-   - 跑完后调 hypothesis_update(falsification_attempted=true)
-   - 没跑 → server 拒绝 conclude(high)
+   - 跑完后调 hypothesis_update(id, falsification_evidence={tool_call_id, excerpt})
+   - **v0.9.1 起 boolean falsification_attempted=true 不再够用** —— 必须 cite 真实 tool_call_id + 该工具输出里的 verbatim excerpt
+   - server 端再校验 tool_call_id 必须**大于** 该假设的 created_at_tool_call (实验必须在假设之后跑)
+   - 没满足 → server 拒绝 conclude(high), 报错指明哪一条没过
 
-D. 收敛 / 弃用
-   - 满足 gate → hypothesis_conclude(id, final_statement, final_confidence)
+D. 收敛 / 弃用 / 归档 (v0.9.1)
+   - 满足 gate → 先 spawn hypothesis-reviewer (FIX #6, 见下节), reviewer confirm 后 → hypothesis_conclude(id, final_statement, final_confidence)
    - 不满足 + 证据矛盾 → hypothesis_abandon(id, reason)
    - 不满足 + 证据不足 → 回到 B 继续
+   - **已 concluded 但最终交付不需要引用** → hypothesis_archive(id, reason) (FIX #7)
+     - 例:你 conclude 了 H3="binary 不用 RSA"(排除分析), 但最终 recovered.py 不需要在叙事里点 H3
+     - archive 让 H3 退出 "concluded 必须被引用" 的硬约束, 但 audit log 仍保留
 
 E. 交付
-   - write_artifact 的内容必须用 H<id> 引用 concluded 假设
-   - server 反查每个 H<id>: 必须 state="concluded" + confidence>=medium + 有真实 supporting
-   - 没引用 + ledger 有 concluded 假设 → 拒收 ("bypass ledger")
-   - 引用了但 H<id> 不合规 → 拒收 + 列具体错误
+   - write_artifact 的内容必须用 [H<id>] 引用 concluded 假设 (v0.9.1: bracket format)
+     - 旧格式 H1 / H2 不再被识别为引用 —— 这是为了避免 Python 变量名 / SHA-512 H1/H2 状态量误伤
+   - server 反查每个 [H<id>]: 必须 state="concluded" + confidence>=medium + 有真实 supporting
+   - 没引用 + ledger 有 (非 archived 的) concluded 假设 → 拒收 ("bypass ledger")
+   - 引用了但 [H<id>] 不合规 → 拒收 + 列具体错误
 ```
 
 ### Inject 机制
 
 每 5 次 tool call, server 自动把当前 active ledger summary 附在工具返回里. 你不需要主动 `hypothesis_list`——但**看到 inject summary 后必须更新状态**: 没进展的 active 假设要么补 evidence 要么 abandon. 长期挂着 falsification_attempted=false 是 3.25 行为.
 
-### conclude(high) 必经蓝军审查 (v0.9.0+)
+### conclude(high) 必经蓝军审查 (v0.9.0 文档级, v0.9.1 升级为 server 端硬 gate)
 
-**任何 load-bearing 假设升 high 之前必须 spawn `hypothesis-reviewer` agent 做独立审查**。规则:
+**任何 load-bearing 假设升 high 之前必须 spawn `hypothesis-reviewer` agent 做独立审查**。**v0.9.1 升级**:server 端 FIX #6 现在直接检查 `reviewer_verdict == 'confirm'` 且 `reviewed_at_tool_call` 不能比当前调用早超过 30 次——没记录的话 conclude(high) 直接被拒。
 
-- 这个 reviewer 是**独立 context 的蓝军**, 看不到你的推理过程, 只看 ledger state + 用 trace_search 抽查 evidence excerpt 是否真支持 statement。
-- 调用方式:
-  ```
-  Agent(subagent_type="hypothesis-reviewer",
-        prompt="Review H<N>. Main agent is preparing hypothesis_conclude(id='H<N>', final_confidence='high'). \
-                H<N> statement: '<full statement>'. Bound trace: <trace path> (mode=ciphertext)")
-  ```
-- reviewer 返回 JSON: `{"recommendation": "confirm" | "refute" | "abandon", "reason": "...", "next_steps_for_main_agent": "..."}`
-- recommendation = `confirm` → 你可以 `hypothesis_conclude(id, ..., final_confidence="high")`
-- recommendation = `refute` → 按 next_steps 补 evidence 或换思路, 不要硬 conclude
-- recommendation = `abandon` → 调 `hypothesis_abandon(id, reason)`, 重新规划
+工作流:
 
-**什么算 load-bearing**: 这个假设的结论会被 `write_artifact` 的最终交付物以 H<N> 引用。简单说"决定 recovered.py 里哪段代码长什么样"的, 都是 load-bearing。
+1. **主 agent 准备 conclude(high) 之前** spawn reviewer:
+   ```
+   Agent(subagent_type="hypothesis-reviewer",
+         prompt="Review H<N>. Main agent is preparing hypothesis_conclude(id='H<N>', final_confidence='high'). \
+                 H<N> statement: '<full statement>'. Bound trace: <trace path> (mode=ciphertext)")
+   ```
 
-**为什么强制走 reviewer**: server 端 FIX#1-#4 拦得住"凭空捏造证据 / 数量不够 / 没反证"——但拦不住"你为这个假设花了 20 轮调用, 沉没成本让你倾向 confirm"。reviewer 没沉没成本, 客观性更高。**这是 algokiller v0.9.0 反幻觉护城河的第三层。**
+2. **Reviewer 独立审查** (独立 context、看不到你的推理),走完 5 步:
+   - load ledger → gate-check FIX#1-#7 → audit evidence excerpts → 找反证 → **调 mark_hypothesis_reviewed(id, verdict, reason) 落锤**
+
+3. **Reviewer 返回 JSON**:
+   ```json
+   {"recommendation": "confirm" | "refute" | "abandon",
+    "reason": "...", "next_steps_for_main_agent": "..."}
+   ```
+
+4. **主 agent 根据 recommendation 行动**:
+   - `confirm` → `hypothesis_conclude(id, ..., final_confidence="high")` ✓ (server gate FIX #6 已满足)
+   - `refute` → 按 next_steps 补 evidence 或换思路, **不要硬 conclude**(server 也会拒)
+   - `abandon` → 调 `hypothesis_abandon(id, reason)`, 重新规划
+
+**什么算 load-bearing**: 这个假设的结论会被 `write_artifact` 的最终交付物以 `[H<N>]` 引用。简单说"决定 recovered.py 里哪段代码长什么样"的, 都是 load-bearing。
+
+**v0.9.1 关键约束**:
+- **不要自己调 mark_hypothesis_reviewed** —— 这是 reviewer 的 verdict 落锤动作,主 agent 自调会在 jsonl audit log 上留下 "同一 context spawn 自审" 的痕迹,事后翻车有据
+- **超过 30 次 tool 调用前的 review 已过期** —— 需要重新 spawn reviewer
+- **reviewer verdict != confirm 就别 retry conclude(high)** —— 重新走完 reviewer workflow
+
+**为什么强制走 reviewer**: server 端 FIX#1-#5 拦得住"凭空捏造证据 / 数量不够 / 没反证 / 反证捏造"——但拦不住"你为这个假设花了 20 轮调用, 沉没成本让你倾向 confirm"。reviewer 没沉没成本, 客观性更高。**这是 algokiller v0.9.1 反幻觉护城河的第四层 (FIX #6)。**
 
 **medium 可选走 reviewer**: 不强制, 但对会驱动主要分支的关键假设建议过一遍——花 1 次 spawn 换"早期纠偏", 比走到 write_artifact 才被拒收 cost 低得多。
 
@@ -146,13 +168,19 @@ E. 交付
 
 | 幻觉模式 | 被哪一道防线挡住 |
 |---|---|
-| 凭空给结论 | write_artifact 引用 H<id> 强校验 |
-| 引用不存在的证据 | tool_call_id 范围校验 |
-| confidence=high 但证据不足 | conclude gate 数量校验 |
-| 跳过反驳直接 conclude high | falsification_attempted 校验 |
+| 凭空给结论 | write_artifact `[H<id>]` 引用强校验 (v0.9.1 bracket-only) |
+| 引用不存在的证据 | tool_call_id 范围校验 (FIX #1) |
+| 引用文本不是真证据 | excerpt verbatim verification 校验 (FIX #1) |
+| confidence=high 但证据不足 | conclude gate 数量校验 (FIX #2 / #3) |
+| supporting 三条全来自同一工具 | source diversity ≥ 2 distinct tools (FIX #3) |
+| **跳过反驳直接 conclude high** | **v0.8.x**: falsification_attempted boolean / **v0.9.1**: falsification_evidence verbatim 校验 (FIX #5) |
+| 反证捏造 boolean=True 但没真跑 | FIX #5 verbatim + tool_call_id 必须晚于 created_at |
+| 互斥假设双 conclude | conflicts_with 图 (FIX #4) |
 | 下游错误传播 | abandon 时自动 surface 依赖者 |
-| 隐式断言 (写报告不引用 H<id>) | write_artifact 检测到 ledger 有 concluded 但 0 引用 → 拒收 |
-| **沉没成本驱动的 conclude(high)** (v0.9.0+) | **必经独立蓝军 hypothesis-reviewer 审查** |
+| 隐式断言 (写报告不引用 [H<id>]) | write_artifact 检测到 ledger 有 (非 archived) concluded 但 0 引用 → 拒收 |
+| **不相关 concluded 假设硬塞进交付物** (v0.9.1) | **hypothesis_archive(id, reason) (FIX #7) 退出引用约束** |
+| **沉没成本驱动的 conclude(high)** (v0.9.0 / v0.9.1) | **v0.9.0 文档级 + v0.9.1 mark_hypothesis_reviewed server 端硬 gate (FIX #6)** |
+| Python 变量名 H1/H2 被误识为引用 (v0.8.x 真实 bug) | 引用语法收紧为 `[H<n>]` 或 `<H<n>>` (FIX A-8) |
 
 **底层逻辑**: ledger 让 AI 不能瞎说. 它把推理从"AI 自说自话"变成"AI 必须显式构建可证伪 + 可审计的论证链".
 

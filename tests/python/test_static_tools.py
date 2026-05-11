@@ -15,6 +15,7 @@ from static_tools import (  # noqa: E402
     ALLOWED_TOOLS,
     R2_FORBIDDEN_FLAGS,
     R2_FORBIDDEN_R2_COMMANDS,
+    R2_FORBIDDEN_TOKEN_PREFIXES,
     R2_REQUIRED_FLAGS,
     _validate_r2_args,
     _validate_generic,
@@ -70,6 +71,52 @@ class TestR2Boundary(unittest.TestCase):
         err = _validate_r2_args(["-q", "-2", "-n", "/bin/ls"])
         self.assertIsNotNone(err)
         self.assertIn("-c", err)
+
+    # FIX F-12 (v0.9.1) — token-prefix blacklist closes the r2 shell-escape /
+    # script-eval / iterate / network / macro routes that bypassed the
+    # earlier `aaa/aac/...` head-token check.
+
+    def test_shell_escape_bang_rejected(self):
+        err = _validate_r2_args(
+            ["-q", "-2", "-n", "-c", "!rm -rf ~", "/bin/ls"])
+        self.assertIsNotNone(err)
+        self.assertIn("'!'", err)
+
+    def test_shell_escape_bang_inside_chain_rejected(self):
+        err = _validate_r2_args(
+            ["-q", "-2", "-n", "-c", "iI; !whoami", "/bin/ls"])
+        self.assertIsNotNone(err)
+
+    def test_r2_script_eval_dot_rejected(self):
+        # `.script.r2` is r2's script-interpret prefix — must be blocked.
+        err = _validate_r2_args(
+            ["-q", "-2", "-n", "-c", ".script.r2", "/bin/ls"])
+        self.assertIsNotNone(err)
+        self.assertIn("'.'", err)
+
+    def test_iterate_at_at_rejected(self):
+        err = _validate_r2_args(
+            ["-q", "-2", "-n", "-c", "@@=sym.imp.malloc; ?", "/bin/ls"])
+        self.assertIsNotNone(err)
+        self.assertIn("'@@'", err)
+
+    def test_rap_equals_rejected(self):
+        err = _validate_r2_args(
+            ["-q", "-2", "-n", "-c", "=h", "/bin/ls"])
+        self.assertIsNotNone(err)
+        self.assertIn("'='", err)
+
+    def test_pipe_to_shell_rejected(self):
+        # r2's pipe-to-shell syntax — `|sh` would route through system.
+        err = _validate_r2_args(
+            ["-q", "-2", "-n", "-c", "iI; |sh", "/bin/ls"])
+        self.assertIsNotNone(err)
+        self.assertIn("'|'", err)
+
+    def test_forbidden_prefix_table_locked(self):
+        for bad in ("!", ".", "@@", "=", "#!", "$", "|"):
+            self.assertIn(bad, R2_FORBIDDEN_TOKEN_PREFIXES,
+                          f"{bad!r} must remain in R2_FORBIDDEN_TOKEN_PREFIXES")
 
 
 class TestForbidArgs(unittest.TestCase):

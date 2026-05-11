@@ -36,7 +36,7 @@ claude plugin update algokiller@algokiller-suite
 2. **Slash commands**（强激活）
    - `/algokiller:ciphertext <trace> <task>`
    - `/algokiller:general <trace> <task>`
-3. **17 个 MCP 工具**
+3. **25 个 MCP 工具**(18 trace/artifact/static + 7 hypothesis-ledger)
    - 绑定 / 制品：`bind_trace` / `write_artifact` / `list_artifacts` / `read_artifact`
    - 基础检索：`trace_search` / `trace_context`
    - 数据流：`trace_regflow`（寄存器演化）/ `trace_producer`（找值的最近写入者）/ `trace_semop`（指令语义分类，11 类）
@@ -185,7 +185,7 @@ printf '%s\n' \
   | python3 server/algokiller_mcp.py
 ```
 
-期望：`initialize` 响应 + `tools/list` 返回 23 个工具（18 个 trace/artifact/static 工具 + 5 个 hypothesis-ledger 工具）。
+期望：`initialize` 响应 + `tools/list` 返回 25 个工具（18 个 trace/artifact/static 工具 + 7 个 hypothesis-ledger 工具,含 v0.9.1 新增的 `mark_hypothesis_reviewed` 和 `hypothesis_archive`）。
 
 ---
 

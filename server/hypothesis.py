@@ -1,8 +1,8 @@
-"""Hypothesis Ledger v2 — anti-hallucination scaffold for trace analysis.
+"""Hypothesis Ledger v3 — anti-hallucination scaffold for trace analysis.
 
 v0.8.0 introduced the ledger with falsification + conclude gates + artifact
-reference guard. External review surfaced 4 critical gaps; this revision
-closes them:
+reference guard. v0.8.1 closed four review-surfaced gaps (FIX #1-#4).
+v0.9.1 closes the next layer:
 
   Fix #1  Evidence excerpt verification — every evidence item MUST cite an
           excerpt string that the server can locate inside the actual
@@ -19,15 +19,35 @@ closes them:
   Fix #4  Conflict graph — hypotheses can declare conflicts_with, and
           conclude rejects if a conflicting hypothesis is already
           concluded with confidence >= medium.
+  Fix #5  Falsification evidence (v0.9.1) — conclude(high) now requires a
+          verifiable falsification_evidence item ({tool_call_id, excerpt})
+          whose tool_call_id is GREATER than the hypothesis's
+          created_at_tool_call (experiment must run after hypothesis was
+          formed). Replaces the v0.8.x boolean self-report which could be
+          set without ever running the experiment. excerpt is verbatim-
+          checked through the same FIX#1 anchor.
+  Fix #6  Reviewer gate (v0.9.1) — conclude(high) requires the
+          hypothesis-reviewer sub-agent to have called
+          mark_hypothesis_reviewed(verdict="confirm") within the last 30
+          tool calls. Closes the sunk-cost-bias hole that server-side
+          gates cannot detect: an agent that worked on H<N> for 20 calls
+          will pick the *minimally sufficient* evidence to clear the
+          gates. An independent context with no sunk cost stays objective.
+  Fix #7  Archive state (v0.9.1) — concluded hypotheses that turn out NOT
+          to be load-bearing for the final deliverable can be archived
+          (state=archived), exempting them from the validate_artifact_
+          references "concluded but unreferenced → bypass" gate. Removes
+          the reverse-prompt-injection failure mode where agents were
+          forced to either cite irrelevant H<id>s or abandon (impossible
+          on concluded state).
 
 Out of scope for this revision (intentional):
   - Bayesian / numeric belief scores: AI doesn't actually compute
     P(H|E), forcing numbers invites fake precision. Discrete
     confidence + contradiction pressure already covers 80%.
-  - Cross-session trace epoch: ledger is per-bind_trace, fresh state
-    each session — no contamination risk in current usage.
-  - Independent Decision Ledger: the next_experiment + reason fields
-    on hypotheses approximate decision tracking adequately.
+  - Evidence weighting / Independence anchor model / Confidence decay:
+    deferred to v0.9.5+; building those on top of tools with structural
+    biases (see CHANGELOG v0.9.1 deferred items) amplifies error.
 """
 
 from __future__ import annotations
@@ -41,7 +61,15 @@ from typing import Optional
 
 
 VALID_CONFIDENCE = ("unknown", "low", "medium", "high")
-VALID_STATE = ("active", "concluded", "abandoned")
+# FIX #7 (v0.9.1): "archived" is concluded-but-deliberately-deprioritised so
+# the artifact-reference gate doesn't force agents to cite hypotheses that
+# turned out non-load-bearing. Cannot transition from abandoned.
+VALID_STATE = ("active", "concluded", "abandoned", "archived")
+# FIX #6 (v0.9.1): reviewer verdict alphabet shared with the sub-agent.
+VALID_REVIEWER_VERDICT = ("confirm", "refute", "abandon")
+# FIX #6 staleness window: a reviewer verdict older than this many tool
+# calls back from the conclude attempt no longer satisfies the gate.
+REVIEWER_STALENESS_LIMIT = 30
 
 
 # ---------------------------------------------------------------------------
@@ -135,18 +163,24 @@ class Evidence:
 class Hypothesis:
     id: str                          # "H1", "H2", ...
     statement: str
-    state: str                       # active | concluded | abandoned
+    state: str                       # active | concluded | abandoned | archived
     confidence: str                  # unknown | low | medium | high
     falsification_plan: str
-    falsification_attempted: bool = False
+    falsification_attempted: bool = False     # deprecated: derived from falsification_evidence (v0.9.1)
+    falsification_evidence: Optional[dict] = None  # FIX #5: verifiable replacement for the boolean
     supporting: list = field(default_factory=list)
     contradicting: list = field(default_factory=list)
     depends_on: list = field(default_factory=list)
     conflicts_with: list = field(default_factory=list)   # FIX #4
+    # FIX #6: independent-reviewer gate
+    reviewed_at_tool_call: int = 0
+    reviewer_verdict: Optional[str] = None
+    reviewer_reason: Optional[str] = None
     next_experiment: Optional[str] = None
     reason_for_experiment: Optional[str] = None
     conclude_statement: Optional[str] = None
     abandon_reason: Optional[str] = None
+    archive_reason: Optional[str] = None     # FIX #7
     created_at_tool_call: int = 0
     created_at_iso: str = ""
     updated_at_iso: str = ""
@@ -287,6 +321,12 @@ class HypothesisLedger:
                     "Either gather more supporting or resolve the contradicting items.")
 
         if target_confidence == "high":
+            # Gate order = cheapest-first → most-expensive last. Diversity
+            # and contradiction are both count-only and run before the
+            # FIX#5 / FIX#6 lookups so the agent sees the most fundamental
+            # problem with its evidence pile first (otherwise it would chase
+            # the falsification-evidence message back through ledger updates
+            # only to hit a diversity wall on the retry).
             if n_sup < 3:
                 return False, (f"conclude(high) needs >=3 supporting; current={n_sup}")
             if n_sup < n_con * 2:
@@ -295,10 +335,6 @@ class HypothesisLedger:
                     f"have supporting={n_sup}, contradicting={n_con}. "
                     "Either gather more supporting (need >= {target}) or address "
                     "contradictions explicitly.".format(target=n_con * 2))
-            if not h.falsification_attempted:
-                return False, (
-                    "conclude(high) requires falsification_attempted=true. Run "
-                    "your falsification_plan first then update(falsification_attempted=True).")
             diversity = self._supporting_tool_diversity(h)
             if diversity < 2:
                 return False, (
@@ -306,6 +342,37 @@ class HypothesisLedger:
                     f"tool sources (FIX #3 source diversity); currently from "
                     f"{diversity} distinct tool(s). 3 hits from the same tool is "
                     "correlated evidence, not independent.")
+            # FIX #5: verifiable falsification evidence replaces the boolean
+            # self-report. The boolean was bypassable — agents could pass the
+            # gate without ever running the experiment.
+            if h.falsification_evidence is None:
+                return False, (
+                    "conclude(high) requires falsification_evidence — a single "
+                    "{tool_call_id, excerpt} pair from running the falsification_plan "
+                    "experiment (FIX #5). Setting falsification_attempted=True alone "
+                    "no longer satisfies the gate. Call "
+                    "hypothesis_update(id, falsification_evidence={tool_call_id, excerpt}) "
+                    "with the actual tool call that performed the refutation attempt.")
+            # FIX #6: independent reviewer gate. Closes the sunk-cost bias
+            # hole that server-side counting cannot see.
+            if h.reviewer_verdict != "confirm":
+                return False, (
+                    f"conclude(high) requires an independent hypothesis-reviewer "
+                    f"verdict of 'confirm' (current: {h.reviewer_verdict or 'none'}). "
+                    f"Spawn the reviewer via "
+                    f"Agent(subagent_type='hypothesis-reviewer', "
+                    f"prompt='Review {h.id}'); the reviewer will call "
+                    f"mark_hypothesis_reviewed once it has audited the evidence "
+                    f"(FIX #6).")
+            current_call_now = self.get_tool_call_count()
+            staleness = current_call_now - h.reviewed_at_tool_call
+            if h.reviewed_at_tool_call > 0 and staleness > REVIEWER_STALENESS_LIMIT:
+                return False, (
+                    f"hypothesis-reviewer verdict is stale (reviewed at call "
+                    f"{h.reviewed_at_tool_call}, currently at call {current_call_now} — "
+                    f"{staleness} > {REVIEWER_STALENESS_LIMIT} call window). "
+                    f"Spawn a fresh reviewer before concluding (evidence may have "
+                    f"shifted since the review).")
 
         elif target_confidence == "medium":
             if n_sup < 2:
@@ -392,7 +459,8 @@ class HypothesisLedger:
                add_supporting=None, add_contradicting=None,
                next_experiment: Optional[str] = None,
                reason_for_experiment: Optional[str] = None,
-               falsification_attempted: Optional[bool] = None) -> dict:
+               falsification_attempted: Optional[bool] = None,
+               falsification_evidence: Optional[dict] = None) -> dict:
         h = self._by_id.get(hid)
         if h is None:
             return {"status": "error", "error": f"unknown hypothesis '{hid}'"}
@@ -418,10 +486,99 @@ class HypothesisLedger:
             h.next_experiment = next_experiment.strip() or None
         if reason_for_experiment is not None:
             h.reason_for_experiment = reason_for_experiment.strip() or None
-        if falsification_attempted is not None:
+        # FIX #5: falsification_evidence — a single verifiable Evidence-form
+        # entry. Validates through the same FIX#1 verbatim check as supporting
+        # evidence, plus a temporal constraint (experiment must run AFTER the
+        # hypothesis was formed; otherwise it's pre-existing data being
+        # repackaged as deliberate refutation).
+        if falsification_evidence is not None:
+            ok, err, items = self._validate_evidence([falsification_evidence], current)
+            if not ok:
+                return {"status": "error",
+                        "error": f"falsification_evidence: {err}"}
+            ev = items[0]
+            if ev["tool_call_id"] <= h.created_at_tool_call:
+                return {"status": "error", "error": (
+                    f"falsification_evidence.tool_call_id={ev['tool_call_id']} must be "
+                    f"GREATER than hypothesis created_at_tool_call={h.created_at_tool_call}. "
+                    "The falsification experiment must run AFTER the hypothesis is created — "
+                    "otherwise the evidence is pre-existing observation, not a deliberate "
+                    "refutation attempt (FIX #5).")}
+            h.falsification_evidence = ev
+            h.falsification_attempted = True
+        elif falsification_attempted is not None:
+            # Backward-compat: the boolean still flips, but conclude(high)
+            # now reads falsification_evidence — setting only the boolean
+            # no longer satisfies the gate. Emit a hint in the response.
             h.falsification_attempted = bool(falsification_attempted)
         h.updated_at_iso = self._now_iso()
         self._append_log({"event": "update", "iso": h.updated_at_iso, **asdict(h)})
+        response = {"status": "ok", "hypothesis": asdict(h)}
+        if (falsification_attempted is True and falsification_evidence is None
+                and h.falsification_evidence is None):
+            response["warning"] = (
+                "falsification_attempted=True alone no longer satisfies conclude(high) "
+                "(FIX #5): supply falsification_evidence={tool_call_id, excerpt} from "
+                "the actual experiment run.")
+        return response
+
+    def mark_reviewed(self, hid: str, verdict: str, reason: str) -> dict:
+        """FIX #6: hypothesis-reviewer sub-agent records its verdict here.
+
+        This tool is callable in principle by any agent context; the
+        anti-cheat is on the gate side — conclude(high) only accepts a
+        recent verdict, and the reviewer sub-agent's tool permission set
+        (declared in agents/hypothesis-reviewer.md) is the narrowest of
+        any agent in the project. Pre-meditated bypass (main agent calling
+        this directly) is reflected on the on-disk hypothesis_ledger.jsonl
+        audit log — the call sequence shows mark_reviewed was followed by
+        conclude on the same agent context, which a post-mortem catches.
+        """
+        h = self._by_id.get(hid)
+        if h is None:
+            return {"status": "error", "error": f"unknown hypothesis '{hid}'"}
+        if h.state != "active":
+            return {"status": "error", "error":
+                    f"hypothesis {hid} is {h.state}, not 'active' — cannot review"}
+        if verdict not in VALID_REVIEWER_VERDICT:
+            return {"status": "error", "error":
+                    f"verdict must be one of {VALID_REVIEWER_VERDICT}"}
+        if not isinstance(reason, str) or len(reason.strip()) < 6:
+            return {"status": "error", "error":
+                    "review reason must be a non-trivial string (>=6 chars)"}
+        h.reviewed_at_tool_call = self.get_tool_call_count()
+        h.reviewer_verdict = verdict
+        h.reviewer_reason = reason.strip()[:600]
+        h.updated_at_iso = self._now_iso()
+        self._append_log({"event": "reviewed", "iso": h.updated_at_iso,
+                          "hypothesis_id": hid, "verdict": verdict,
+                          "reviewed_at_tool_call": h.reviewed_at_tool_call,
+                          "reason": h.reviewer_reason})
+        return {"status": "ok", "hypothesis": asdict(h)}
+
+    def archive(self, hid: str, reason: str) -> dict:
+        """FIX #7: move a concluded (or active) hypothesis to 'archived' so
+        the validate_artifact_references gate doesn't force agents to cite
+        non-load-bearing hypotheses in the final deliverable. abandoned
+        cannot be archived (it's already terminal-negative); archived
+        cannot be cited via [H<n>] in the artifact."""
+        h = self._by_id.get(hid)
+        if h is None:
+            return {"status": "error", "error": f"unknown hypothesis '{hid}'"}
+        if h.state == "archived":
+            return {"status": "error",
+                    "error": f"hypothesis {hid} is already archived"}
+        if h.state == "abandoned":
+            return {"status": "error", "error":
+                    f"hypothesis {hid} is abandoned — archive does not apply "
+                    "(abandoned is already terminal-negative)"}
+        if not isinstance(reason, str) or len(reason.strip()) < 6:
+            return {"status": "error",
+                    "error": "archive reason must be a non-trivial string (>=6 chars)"}
+        h.state = "archived"
+        h.archive_reason = reason.strip()[:600]
+        h.updated_at_iso = self._now_iso()
+        self._append_log({"event": "archive", "iso": h.updated_at_iso, **asdict(h)})
         return {"status": "ok", "hypothesis": asdict(h)}
 
     def conclude(self, hid: str, final_statement: str, final_confidence: str) -> dict:
@@ -496,20 +653,45 @@ class HypothesisLedger:
             n_sup = len(h.supporting)
             n_con = len(h.contradicting)
             diversity = self._supporting_tool_diversity(h)
-            falsify_tag = "✓falsify-tried" if h.falsification_attempted else "✗falsify-pending"
+            # FIX #5: prefer verifiable evidence tag over the bare boolean
+            if h.falsification_evidence is not None:
+                falsify_tag = "✓falsify-evidence"
+            elif h.falsification_attempted:
+                falsify_tag = "✗falsify-bool-only"  # boolean without evidence: gate will reject
+            else:
+                falsify_tag = "✗falsify-pending"
+            # FIX #6: surface reviewer state
+            if h.reviewer_verdict == "confirm":
+                rev_tag = " ✓reviewed"
+            elif h.reviewer_verdict in ("refute", "abandon"):
+                rev_tag = f" ⚠reviewer={h.reviewer_verdict}"
+            else:
+                rev_tag = ""
             ratio_tag = "" if n_sup >= n_con else " ⚠CONTRA-DOMINANT"
             div_tag = f" sources={diversity}" if h.supporting else ""
             lines.append(f"  {h.id} [{h.confidence}] {h.statement[:80]} "
                          f"(sup={n_sup} contra={n_con}{div_tag} "
-                         f"{falsify_tag}{ratio_tag})")
+                         f"{falsify_tag}{rev_tag}{ratio_tag})")
         return "\n".join(lines)
 
     def validate_artifact_references(self, content: str) -> dict:
+        # FIX A-8: bracketed [H<n>] is the canonical citation form.
+        # The pre-v0.9.1 regex \bH(\d+)\b silently false-matched on:
+        #   - Python source variable names (H1 = some_value)
+        #   - SHA-3 / SHA-512 state vector names (h0, h1, ...) when capitalised
+        #   - Any markdown header / acronym containing 'H<digit>' at a word
+        #     boundary in the deliverable narrative
+        # Requiring an explicit bracket makes citations syntactically obvious
+        # to both human readers and the validator. Skill docs are updated to
+        # teach the [H<n>] form.
         import re
-        ids = sorted(set(re.findall(r"\bH(\d+)\b", content or "")))
+        # Capture bracketed and angle-bracketed forms — both visually obvious
+        # citations that no naturally-occurring identifier would collide with.
+        ids = sorted(set(re.findall(r"\[H(\d+)\]|<H(\d+)>", content or "")))
+        ids_flat = [a or b for (a, b) in ids]
         errors: list[str] = []
         referenced = []
-        for n in ids:
+        for n in ids_flat:
             hid = f"H{n}"
             referenced.append(hid)
             h = self._by_id.get(hid)

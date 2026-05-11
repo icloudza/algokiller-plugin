@@ -94,6 +94,18 @@ R2_FORBIDDEN_R2_COMMANDS: set[str] = {
     "aas", "aaef", "aaft", "aanr", "aaw",
 }
 
+# FIX F-12: token prefixes that route to r2's *internal* dispatchers and
+# can shell out / source scripts / iterate / pipe — outside the bounded
+# disassembly surface this wrapper is meant to expose.
+#   "!"   → system shell escape (`r2 -c "!rm -rf ~"` was previously allowed)
+#   "."   → run-as-r2-script / interpret output as r2 commands
+#   "@@"  → iterate-command-over-targets (can fan out arbitrary commands)
+#   "="   → r2's network/RAP/HTTP layer (=h/=H/=+ etc)
+#   "#!"  → r2 macro/scripting
+#   "$"   → r2 alias dereference (can expand to arbitrary script)
+#   "|"   → pipe to system command (shell escape vector)
+R2_FORBIDDEN_TOKEN_PREFIXES: tuple[str, ...] = ("!", ".", "@@", "=", "#!", "$", "|")
+
 R2_REQUIRED_FLAGS: set[str] = {"-q", "-2", "-n"}
 
 
@@ -139,6 +151,17 @@ def _validate_r2_args(args: list[str]) -> Optional[str]:
                         f"r2 command '{tok}' is forbidden (full-analysis verb). "
                         "Use spot commands like pd/pi/px/iI/iS/iE/iz/is."
                     )
+                # FIX F-12: reject r2's internal dispatch prefixes (! shell
+                # escape, . script eval, @@ iterate, = net, |/macro). These
+                # bypass the disassembly-only contract.
+                for bad_prefix in R2_FORBIDDEN_TOKEN_PREFIXES:
+                    if tok.startswith(bad_prefix):
+                        return (
+                            f"r2 command token {tok!r} is forbidden — leading "
+                            f"{bad_prefix!r} routes into r2's shell/script/network/"
+                            f"iterate dispatcher and escapes the bounded "
+                            f"disassembly contract. Use plain pd/pi/px/iI/iS/iE/iz/is."
+                        )
     if not has_c:
         return "r2 must be invoked with -c \"<single command>\" in this wrapper."
 
