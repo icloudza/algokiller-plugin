@@ -421,7 +421,7 @@ trace 提供"运行时实际发生了什么"，Binary Ninja 提供"代码静态�
 
 会话上下文里出现以下任一 namespace 的工具时，说明 BN MCP 已就位：
 
-- `binary_ninja_mcp.*` —— fosdickio/binary_ninja_mcp（stdio、348⭐、主流，工具粒度细）
+- `binary_ninja_mcp.*` —— fosdickio/binary_ninja_mcp（stdio，主流，工具粒度细）
 - `binassist.*` —— jtang613/BinAssistMCP（HTTP/SSE，含异步 task）
 
 任一可用即视为"BN 在线"。**不要尝试加载 binary**——用户已在 Binary Ninja UI 里打开二进制后插件才提供工具。先调 `list_binaries` / `get_binary_status` / `get_binary_info` 确认当前 active binary 的模块名/架构/base address 与 trace 中 `0xABS!0xREL` 的模块一致。不一致时调 `select_binary`（如可用）切到对应 binary，否则在交付里标注模块不匹配。
