@@ -48,13 +48,31 @@ cp ak_search ../../server/bin/ak_search
 
 ## 安装
 
-**方式 1（推荐）**：Claude Desktop → `+` → **Plugins** → **Add plugin** → 选目录或 zip。
-
-**方式 2**：
+**方式 1（推荐 / 一行装好）**：Claude Code marketplace。
 
 ```bash
-zip -r algokiller-plugin.zip algokiller-plugin -x '*.pyc' '__pycache__/*'
-# 上传到 Plugins → Add plugin → Upload a file
+claude plugin marketplace add icloudza/algokiller-plugin
+claude plugin install algokiller@algokiller-suite
+```
+
+> 在 Claude Code REPL 里也可以用 slash 命令：
+>
+> ```
+> /plugin marketplace add icloudza/algokiller-plugin
+> /plugin install algokiller@algokiller-suite
+> ```
+
+后续更新：
+
+```bash
+claude plugin marketplace update
+claude plugin update algokiller@algokiller-suite
+```
+
+**方式 2（手动）**：克隆仓库后在 Claude Desktop → `+` → **Plugins** → **Add plugin** → 选本地目录。
+
+```bash
+git clone https://github.com/icloudza/algokiller-plugin
 ```
 
 装完应能看到 `algokiller` 在 **Plugins** 菜单，`/algokiller:ciphertext` 和 `/algokiller:general` 在 **Slash commands**。

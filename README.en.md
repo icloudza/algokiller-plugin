@@ -48,13 +48,31 @@ cp ak_search ../../server/bin/ak_search
 
 ## Install
 
-**Option 1 (recommended)**: Claude Desktop → `+` → **Plugins** → **Add plugin** → pick directory or zip.
-
-**Option 2**:
+**Option 1 (recommended — one-line install)**: Claude Code marketplace.
 
 ```bash
-zip -r algokiller-plugin.zip algokiller-plugin -x '*.pyc' '__pycache__/*'
-# upload via Plugins → Add plugin → Upload a file
+claude plugin marketplace add icloudza/algokiller-plugin
+claude plugin install algokiller@algokiller-suite
+```
+
+> Inside the Claude Code REPL you can also use slash commands:
+>
+> ```
+> /plugin marketplace add icloudza/algokiller-plugin
+> /plugin install algokiller@algokiller-suite
+> ```
+
+Updates:
+
+```bash
+claude plugin marketplace update
+claude plugin update algokiller@algokiller-suite
+```
+
+**Option 2 (manual)**: clone the repo, then Claude Desktop → `+` → **Plugins** → **Add plugin** → pick the directory.
+
+```bash
+git clone https://github.com/icloudza/algokiller-plugin
 ```
 
 After install you should see `algokiller` under **Plugins** and `/algokiller:ciphertext` + `/algokiller:general` under **Slash commands**.

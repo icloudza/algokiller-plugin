@@ -1,0 +1,36 @@
+{
+    "$schema": "https://json.schemastore.org/claude-code-plugin-marketplace.json",
+    "name": "algokiller-suite",
+    "description": "ARM64 trace evidence analysis & cipher algorithm recovery. Claude Desktop plugin packaging the AlgoKiller methodology as skills + a local MCP server driving the native ak_search engine (13 subcommands) over GB-scale trace files.",
+    "owner": {
+        "name": "cloudza",
+        "url": "https://github.com/icloudza"
+    },
+    "plugins": [
+        {
+            "name": "algokiller",
+            "description": "ARM64 trace evidence analysis & cipher algorithm recovery. 17 MCP tools (search / regflow / producer / semop / lint / fold / callgraph / modgraph / hexblock / constscan / bytes + artifact / static-tool), 4 skills (ciphertext-recovery / general / trace-analysis / ciphertext), evidence-classified verdict engine (real / weak / alu_only), 71-fingerprint crypto-constant scanner.",
+            "version": "0.6.0",
+            "source": "./",
+            "author": {
+                "name": "cloudza",
+                "url": "https://github.com/icloudza"
+            },
+            "homepage": "https://github.com/icloudza/algokiller-plugin",
+            "license": "MIT",
+            "keywords": [
+                "reverse-engineering",
+                "arm64",
+                "trace-analysis",
+                "cipher-recovery",
+                "algorithm-recovery",
+                "cryptanalysis",
+                "binary-analysis",
+                "mcp",
+                "claude-desktop",
+                "frida",
+                "gumtrace"
+            ]
+        }
+    ]
+}
