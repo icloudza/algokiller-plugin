@@ -31,7 +31,7 @@ from tools.handlers import LEDGER_INTERNAL_TOOLS  # noqa: E402
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "algokiller"
-SERVER_VERSION = "0.9.4"
+SERVER_VERSION = "0.9.5"
 
 
 # ---------------------------------------------------------------------------
