@@ -200,6 +200,44 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "trace_lint",
+        "description": (
+            "Single-pass health-check of the bound trace. Returns JSON: line count, average line "
+            "length, module distribution, top mnemonics, call_func / hexdump / ret block counts, "
+            "and whether register / memory observations are present. Use this RIGHT AFTER bind_trace "
+            "to confirm the file is a valid GumTrace-format capture before sinking analysis tokens "
+            "into it. Warnings highlight likely problems (wrong format / missing call blocks / "
+            "missing register observations)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "top": {"type": "integer", "minimum": 1, "maximum": 50, "description": "Top-K rows for modules and mnemonics (default 10)."},
+            },
+        },
+    },
+    {
+        "name": "trace_fold",
+        "description": (
+            "Write a derivative trace file with repeated W-line blocks collapsed to "
+            "first-block + sentinel + last-block. Default block=1 collapses runs of a single "
+            "identical-signature instruction; block=4 catches ARM64 4-instruction hot loops "
+            "(typical DJB/Bernstein hash loops with ldrsb / madd / subs / b.ne). Threshold is "
+            "the minimum number of block repetitions required before collapsing. Real WeChat "
+            "startup trace (115 MB / 1.12 M lines) folds to ~1 MB / 12 K lines with "
+            "block=4 / threshold=100, retaining all data-flow boundary evidence."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "out_path": {"type": "string", "description": "Absolute output path for the folded trace."},
+                "threshold": {"type": "integer", "minimum": 3, "description": "Min repetitions to trigger a fold (default 100)."},
+                "block": {"type": "integer", "minimum": 1, "maximum": 32, "description": "Block window size in lines (default 1)."},
+            },
+            "required": ["out_path"],
+        },
+    },
+    {
         "name": "trace_semop",
         "description": (
             "Classify each instruction's semantic role. Classes: zero (xor x,x,x), "
@@ -521,6 +559,71 @@ def tool_trace_semop(args: dict[str, Any]) -> dict:
     return STATE.daemon.run_cli("semop", cli_args)
 
 
+def tool_trace_lint(args: dict[str, Any]) -> dict:
+    err = _require_bound()
+    if err is not None:
+        return err
+    cli_args: list[str] = []
+    if "top" in args:
+        try:
+            top = int(args["top"])
+        except (TypeError, ValueError):
+            return {"status": "error", "error": "top must be an integer"}
+        if not (1 <= top <= 50):
+            return {"status": "error", "error": "top must be in [1, 50]"}
+        cli_args += ["--top", str(top)]
+    return STATE.daemon.run_cli("lint", cli_args, timeout=120, max_output_chars=400_000)
+
+
+def tool_trace_fold(args: dict[str, Any]) -> dict:
+    err = _require_bound()
+    if err is not None:
+        return err
+    out_path = str(args.get("out_path", "")).strip()
+    if not out_path:
+        return {"status": "error", "error": "out_path is required"}
+    if not out_path.startswith("/"):
+        return {"status": "error", "error": "out_path must be an absolute path"}
+    if STATE.daemon is None or STATE.trace_file is None:
+        return {"status": "error", "error": "no trace bound"}
+    cli_args: list[str] = ["--in", str(STATE.trace_file), "--out", out_path]
+    if "threshold" in args:
+        try:
+            thr = int(args["threshold"])
+        except (TypeError, ValueError):
+            return {"status": "error", "error": "threshold must be an integer"}
+        if thr < 3:
+            return {"status": "error", "error": "threshold must be >= 3"}
+        cli_args += ["--threshold", str(thr)]
+    if "block" in args:
+        try:
+            blk = int(args["block"])
+        except (TypeError, ValueError):
+            return {"status": "error", "error": "block must be an integer"}
+        if not (1 <= blk <= 32):
+            return {"status": "error", "error": "block must be in [1, 32]"}
+        cli_args += ["--block", str(blk)]
+    # fold's CLI takes --in/--out itself; run_cli always inserts --file, so we
+    # call subprocess directly bypassing run_cli's --file injection.
+    import subprocess as _sp
+    try:
+        result = _sp.run(
+            [str(STATE.daemon.binary), "fold", *cli_args],
+            capture_output=True, text=True, timeout=600, check=False,
+        )
+    except _sp.TimeoutExpired:
+        return {"status": "error", "error": "fold timed out after 600s"}
+    except OSError as exc:
+        return {"status": "error", "error": f"fold exec failed: {exc}"}
+    return {
+        "status": "ok" if result.returncode == 0 else "error",
+        "stdout": result.stdout or "",
+        "stderr": result.stderr or "",
+        "returncode": result.returncode,
+        "out_path": out_path,
+    }
+
+
 HANDLERS = {
     "bind_trace": tool_bind_trace,
     "trace_search": tool_trace_search,
@@ -528,6 +631,8 @@ HANDLERS = {
     "trace_regflow": tool_trace_regflow,
     "trace_producer": tool_trace_producer,
     "trace_semop": tool_trace_semop,
+    "trace_lint": tool_trace_lint,
+    "trace_fold": tool_trace_fold,
     "write_artifact": tool_write_artifact,
     "list_artifacts": tool_list_artifacts,
     "read_artifact": tool_read_artifact,

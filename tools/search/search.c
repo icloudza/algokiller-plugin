@@ -54,6 +54,8 @@ static void usage(FILE *stream) {
             "  ak_search regflow  --file PATH --reg xN [--from-line N] [--to-line N] [--limit N]\n"
             "  ak_search producer --file PATH --value 0xVAL --sink-line N [--max-back N]\n"
             "  ak_search semop    --file PATH (--line N | --from-line N --to-line N) [--limit N]\n"
+            "  ak_search lint     --file PATH [--top N]\n"
+            "  ak_search fold     --in PATH --out PATH [--threshold N] [--block N]\n"
             "\n"
             "Match mode is ASCII case-insensitive. --before-line searches backward, nearest first.\n"
             "regflow emits one row per line where the target register receives an output value.\n"
@@ -1135,6 +1137,560 @@ static int cmd_semop(int argc, char **argv) {
     return result;
 }
 
+/* ===========================================================================
+ * Sprint 2 extensions: lint / fold
+ *
+ * lint  — single-pass scan of a trace, emit a JSON summary: line count,
+ *         module distribution, top mnemonics, call-func block count,
+ *         presence of register/memory observations. Run before bind_trace
+ *         to confirm the file is a usable GumTrace-format capture.
+ *
+ * fold  — write a derivative trace with long runs of identical-signature
+ *         instructions (same mnemonic + same operands) collapsed to first
+ *         line + sentinel + last line. Reduces 110 MB hash-loop traces to
+ *         ~20 MB without losing data-flow boundary evidence.
+ * ===========================================================================
+ */
+
+typedef struct {
+    char name[96];
+    uint64_t count;
+} CountEntry;
+
+typedef struct {
+    CountEntry *entries;
+    size_t count;
+    size_t capacity;
+} CountTable;
+
+static void count_table_init(CountTable *tbl) {
+    tbl->entries = NULL;
+    tbl->count = 0;
+    tbl->capacity = 0;
+}
+
+static void count_table_free(CountTable *tbl) {
+    free(tbl->entries);
+    tbl->entries = NULL;
+    tbl->count = 0;
+    tbl->capacity = 0;
+}
+
+static int count_table_bump(CountTable *tbl, const unsigned char *name, size_t name_len) {
+    if (name_len >= sizeof(tbl->entries[0].name)) {
+        name_len = sizeof(tbl->entries[0].name) - 1;
+    }
+    for (size_t i = 0; i < tbl->count; i++) {
+        if (strlen(tbl->entries[i].name) == name_len &&
+            memcmp(tbl->entries[i].name, name, name_len) == 0) {
+            tbl->entries[i].count++;
+            return 0;
+        }
+    }
+    if (tbl->count == tbl->capacity) {
+        size_t new_cap = tbl->capacity == 0 ? 32 : tbl->capacity * 2;
+        CountEntry *nx = realloc(tbl->entries, new_cap * sizeof(CountEntry));
+        if (nx == NULL) return -1;
+        tbl->entries = nx;
+        tbl->capacity = new_cap;
+    }
+    memcpy(tbl->entries[tbl->count].name, name, name_len);
+    tbl->entries[tbl->count].name[name_len] = '\0';
+    tbl->entries[tbl->count].count = 1;
+    tbl->count++;
+    return 0;
+}
+
+static int count_entry_cmp_desc(const void *a, const void *b) {
+    uint64_t ca = ((const CountEntry *)a)->count;
+    uint64_t cb = ((const CountEntry *)b)->count;
+    if (ca < cb) return 1;
+    if (ca > cb) return -1;
+    return 0;
+}
+
+/* Parse just the "[module]" prefix of a line. Returns (start, len) into the
+ * tag content (between '[' and ']'), or false if line doesn't start with '['.
+ */
+static bool parse_module_tag(LineView line,
+                             const unsigned char **tag_start, size_t *tag_len) {
+    if (line.len < 2 || line.start[0] != '[') return false;
+    const unsigned char *end = line.start + line.len;
+    const unsigned char *close = NULL;
+    for (const unsigned char *p = line.start + 1; p < end; p++) {
+        if (*p == ']') { close = p; break; }
+        if (*p == ' ') return false;  /* missing close bracket */
+    }
+    if (close == NULL) return false;
+    *tag_start = line.start + 1;
+    *tag_len = (size_t)(close - (line.start + 1));
+    return true;
+}
+
+/* Scan a line for "<reg>=0x" patterns. Returns true if at least one is found.
+ * Caller passes scratch buffer for one-shot regex-free probe.
+ */
+static bool line_has_reg_eq_hex(LineView line) {
+    const unsigned char *end = line.start + line.len;
+    for (const unsigned char *p = line.start; p + 4 < end; p++) {
+        /* Look for "xN=" or "wN=" or "spN=" boundary */
+        if ((*p == 'x' || *p == 'w') && p > line.start && (p[-1] == ' ' || p[-1] == '>')) {
+            const unsigned char *q = p + 1;
+            while (q < end && *q >= '0' && *q <= '9') q++;
+            if (q > p + 1 && q + 3 < end && *q == '=' && q[1] == '0' && q[2] == 'x') {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static int run_lint(const IndexedFile *indexed, uint64_t top_k) {
+    CountTable modules; count_table_init(&modules);
+    CountTable mnemonics; count_table_init(&mnemonics);
+
+    uint64_t call_func_count = 0;
+    uint64_t hexdump_count = 0;
+    uint64_t ret_marker_count = 0;
+    uint64_t lines_with_mod_tag = 0;
+    uint64_t lines_with_reg_obs = 0;
+    uint64_t lines_with_mem_r = 0;
+    uint64_t lines_with_mem_w = 0;
+    uint64_t blank_lines = 0;
+    uint64_t total_text_bytes = 0;
+
+    const unsigned char call_prefix[] = "call func:";
+    const unsigned char hex_prefix[] = "hexdump at";
+    const unsigned char ret_prefix[] = "ret:";
+    const unsigned char mem_r_token[] = "mem_r=";
+    const unsigned char mem_w_token[] = "mem_w=";
+
+    for (uint64_t line_no = 1; line_no <= indexed->index.count; line_no++) {
+        size_t offset = indexed->index.offsets[line_no - 1];
+        LineView line = line_at_offset(indexed->mapped.data, indexed->mapped.size, offset);
+        total_text_bytes += line.len;
+        if (line.len == 0) { blank_lines++; continue; }
+
+        const unsigned char *mod_tag = NULL;
+        size_t mod_tag_len = 0;
+        if (parse_module_tag(line, &mod_tag, &mod_tag_len)) {
+            lines_with_mod_tag++;
+            count_table_bump(&modules, mod_tag, mod_tag_len);
+
+            const unsigned char *mnem, *op;
+            size_t mnem_len, op_len;
+            if (parse_mnem_and_operands(line, &mnem, &mnem_len, &op, &op_len)) {
+                count_table_bump(&mnemonics, mnem, mnem_len);
+            }
+
+            if (line_has_reg_eq_hex(line)) lines_with_reg_obs++;
+            if (mem_find(line.start, line.len, mem_r_token, sizeof(mem_r_token) - 1) != NULL) {
+                lines_with_mem_r++;
+            }
+            if (mem_find(line.start, line.len, mem_w_token, sizeof(mem_w_token) - 1) != NULL) {
+                lines_with_mem_w++;
+            }
+        } else if (line.len >= sizeof(call_prefix) - 1 &&
+                   memcmp(line.start, call_prefix, sizeof(call_prefix) - 1) == 0) {
+            call_func_count++;
+        } else if (line.len >= sizeof(hex_prefix) - 1 &&
+                   memcmp(line.start, hex_prefix, sizeof(hex_prefix) - 1) == 0) {
+            hexdump_count++;
+        } else if (line.len >= sizeof(ret_prefix) - 1 &&
+                   memcmp(line.start, ret_prefix, sizeof(ret_prefix) - 1) == 0) {
+            ret_marker_count++;
+        }
+    }
+
+    qsort(modules.entries, modules.count, sizeof(CountEntry), count_entry_cmp_desc);
+    qsort(mnemonics.entries, mnemonics.count, sizeof(CountEntry), count_entry_cmp_desc);
+
+    uint64_t total = indexed->index.count;
+    uint64_t mod_emit = modules.count < top_k ? modules.count : top_k;
+    uint64_t mnem_emit = mnemonics.count < top_k ? mnemonics.count : top_k;
+
+    fputs("{\"type\":\"lint\"", stdout);
+    printf(",\"size_bytes\":%" PRIu64, (uint64_t)indexed->mapped.size);
+    printf(",\"line_count\":%" PRIu64, total);
+    if (total > 0) {
+        printf(",\"avg_line_len\":%" PRIu64, total_text_bytes / total);
+    } else {
+        fputs(",\"avg_line_len\":0", stdout);
+    }
+    printf(",\"blank_lines\":%" PRIu64, blank_lines);
+    printf(",\"lines_with_module_tag\":%" PRIu64, lines_with_mod_tag);
+    printf(",\"call_func_blocks\":%" PRIu64, call_func_count);
+    printf(",\"hexdump_blocks\":%" PRIu64, hexdump_count);
+    printf(",\"ret_markers\":%" PRIu64, ret_marker_count);
+    printf(",\"has_register_observations\":%s", lines_with_reg_obs > 0 ? "true" : "false");
+    printf(",\"register_obs_lines\":%" PRIu64, lines_with_reg_obs);
+    printf(",\"has_memory_reads\":%s", lines_with_mem_r > 0 ? "true" : "false");
+    printf(",\"memory_read_lines\":%" PRIu64, lines_with_mem_r);
+    printf(",\"has_memory_writes\":%s", lines_with_mem_w > 0 ? "true" : "false");
+    printf(",\"memory_write_lines\":%" PRIu64, lines_with_mem_w);
+
+    fputs(",\"top_modules\":[", stdout);
+    for (uint64_t i = 0; i < mod_emit; i++) {
+        if (i > 0) putchar(',');
+        fputs("{\"name\":", stdout);
+        json_write_cstr(modules.entries[i].name);
+        printf(",\"lines\":%" PRIu64, modules.entries[i].count);
+        if (total > 0) {
+            double frac = (double)modules.entries[i].count / (double)total;
+            printf(",\"fraction\":%.4f", frac);
+        }
+        putchar('}');
+    }
+    fputs("]", stdout);
+
+    fputs(",\"top_mnemonics\":[", stdout);
+    for (uint64_t i = 0; i < mnem_emit; i++) {
+        if (i > 0) putchar(',');
+        fputs("{\"mnem\":", stdout);
+        json_write_cstr(mnemonics.entries[i].name);
+        printf(",\"count\":%" PRIu64, mnemonics.entries[i].count);
+        if (total > 0) {
+            double frac = (double)mnemonics.entries[i].count / (double)total;
+            printf(",\"fraction\":%.4f", frac);
+        }
+        putchar('}');
+    }
+    fputs("]", stdout);
+
+    bool format_ok = (total > 0) && (lines_with_mod_tag * 2 >= total);
+    fputs(",\"format_ok\":", stdout);
+    fputs(format_ok ? "true" : "false", stdout);
+
+    fputs(",\"warnings\":[", stdout);
+    bool first_warn = true;
+    if (total == 0) {
+        if (!first_warn) putchar(',');
+        json_write_cstr("trace file has zero lines");
+        first_warn = false;
+    }
+    if (total > 0 && !format_ok) {
+        if (!first_warn) putchar(',');
+        json_write_cstr("fewer than 50% of lines look like '[module] 0xABS!0xREL mnem ...' — likely not GumTrace format");
+        first_warn = false;
+    }
+    if (total > 0 && call_func_count == 0) {
+        if (!first_warn) putchar(',');
+        json_write_cstr("no 'call func:' blocks — ciphertext-mode hexdump tracing will be limited");
+        first_warn = false;
+    }
+    if (total > 0 && lines_with_reg_obs == 0) {
+        if (!first_warn) putchar(',');
+        json_write_cstr("no register observations (xN=0x...) — register-flow analysis unavailable");
+        first_warn = false;
+    }
+    (void)first_warn;
+    fputs("]}\n", stdout);
+
+    count_table_free(&modules);
+    count_table_free(&mnemonics);
+    return 0;
+}
+
+/* extract_line_signature - build a "<mnem> <operands>" string from a line.
+ * Returns false if the line doesn't have the [mod] 0xABS!0xREL prefix.
+ */
+static bool extract_line_signature(LineView line, char *out, size_t out_sz) {
+    const unsigned char *m, *o;
+    size_t mlen, olen;
+    if (!parse_mnem_and_operands(line, &m, &mlen, &o, &olen)) return false;
+    if (mlen + 1 + olen + 1 > out_sz) {
+        /* Truncate to fit; equality compare will then bucket truncated runs
+         * together — acceptable since signatures this long don't realistically
+         * appear in ARM64 trace lines.
+         */
+        size_t cap = out_sz - 1;
+        size_t take_m = mlen < cap ? mlen : cap;
+        memcpy(out, m, take_m);
+        cap -= take_m;
+        if (cap > 0) { out[take_m] = ' '; cap--; take_m++; }
+        size_t take_o = olen < cap ? olen : cap;
+        memcpy(out + take_m, o, take_o);
+        out[take_m + take_o] = '\0';
+        return true;
+    }
+    memcpy(out, m, mlen);
+    out[mlen] = ' ';
+    memcpy(out + mlen + 1, o, olen);
+    size_t total = mlen + 1 + olen;
+    while (total > 0 && out[total - 1] == ' ') total--;
+    out[total] = '\0';
+    return true;
+}
+
+static void fold_flush_run(const IndexedFile *indexed, FILE *out,
+                           uint64_t run_first, uint64_t run_last,
+                           const char *signature, uint64_t threshold,
+                           uint64_t *fold_count, uint64_t *skipped_lines) {
+    if (run_first == 0) return;
+    uint64_t cnt = run_last - run_first + 1;
+    if (cnt < threshold || cnt < 3) {
+        /* expand: write every original line */
+        for (uint64_t i = run_first; i <= run_last; i++) {
+            size_t off = indexed->index.offsets[i - 1];
+            LineView lv = line_at_offset(indexed->mapped.data, indexed->mapped.size, off);
+            fwrite(lv.start, 1, lv.len, out);
+            fputc('\n', out);
+        }
+        return;
+    }
+    /* fold: first + sentinel + last */
+    size_t off_first = indexed->index.offsets[run_first - 1];
+    LineView first_lv = line_at_offset(indexed->mapped.data, indexed->mapped.size, off_first);
+    fwrite(first_lv.start, 1, first_lv.len, out);
+    fputc('\n', out);
+    fprintf(out, "# ak_fold: skipped %" PRIu64 " identical lines (op=\"%s\", first=%" PRIu64 ", last=%" PRIu64 ")\n",
+            cnt - 2, signature, run_first, run_last);
+    size_t off_last = indexed->index.offsets[run_last - 1];
+    LineView last_lv = line_at_offset(indexed->mapped.data, indexed->mapped.size, off_last);
+    fwrite(last_lv.start, 1, last_lv.len, out);
+    fputc('\n', out);
+    (*fold_count)++;
+    *skipped_lines += (cnt - 2);
+}
+
+/* FNV-1a 64-bit hash of mnem+operands signature, or 0 for non-instruction lines. */
+static uint64_t line_signature_hash(LineView line) {
+    const unsigned char *m, *o;
+    size_t mlen, olen;
+    if (!parse_mnem_and_operands(line, &m, &mlen, &o, &olen)) return 0;
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (size_t i = 0; i < mlen; i++) {
+        h ^= m[i];
+        h *= 0x100000001b3ULL;
+    }
+    h ^= ' ';
+    h *= 0x100000001b3ULL;
+    for (size_t i = 0; i < olen; i++) {
+        h ^= o[i];
+        h *= 0x100000001b3ULL;
+    }
+    if (h == 0) h = 1;  /* reserve 0 for "no signature" */
+    return h;
+}
+
+static void write_line_no_n(const IndexedFile *indexed, FILE *out, uint64_t line_no) {
+    size_t off = indexed->index.offsets[line_no - 1];
+    LineView lv = line_at_offset(indexed->mapped.data, indexed->mapped.size, off);
+    fwrite(lv.start, 1, lv.len, out);
+    fputc('\n', out);
+}
+
+/* Block-aware fold: for each window W, find consecutive line stretches where
+ * the W-block ending at line i is identical (signature-wise) to the W-block
+ * ending at line i-W. Such a stretch means the W-block is repeating.
+ *
+ * Algorithm (linear): precompute signature hash per line; then walk a sliding
+ * cursor — at each position i, see how far hashes[i..] matches hashes[i+W..]
+ * (the next-block shift). The full repeated span covers [i, i+W+match-1].
+ *
+ * If the span contains >= threshold repetitions of the W-block, emit:
+ *   - the first W block lines (original prologue)
+ *   - one sentinel comment
+ *   - the last W block lines (original epilogue, showing final accumulator state)
+ * else emit lines verbatim.
+ */
+static int run_fold_block(const IndexedFile *indexed, FILE *out,
+                          uint64_t threshold, uint64_t window) {
+    uint64_t N = indexed->index.count;
+    if (N == 0) {
+        fprintf(stdout, "{\"type\":\"fold_summary\",\"folds_applied\":0,"
+                        "\"lines_skipped\":0,\"original_line_count\":0,"
+                        "\"threshold\":%" PRIu64 ",\"window\":%" PRIu64 "}\n",
+                threshold, window);
+        return 0;
+    }
+    uint64_t *hashes = calloc((size_t)N, sizeof(uint64_t));
+    if (hashes == NULL) {
+        fprintf(stderr, "fold: out of memory for hash table\n");
+        return 1;
+    }
+    for (uint64_t i = 0; i < N; i++) {
+        size_t off = indexed->index.offsets[i];
+        LineView lv = line_at_offset(indexed->mapped.data, indexed->mapped.size, off);
+        hashes[i] = line_signature_hash(lv);
+    }
+
+    uint64_t fold_count = 0;
+    uint64_t skipped_lines = 0;
+    uint64_t i = 0;
+    while (i < N) {
+        /* Can we even start a W-block here? Need W non-zero-sig lines starting at i. */
+        bool block_ok = true;
+        for (uint64_t k = 0; k < window; k++) {
+            if (i + k >= N || hashes[i + k] == 0) { block_ok = false; break; }
+        }
+        if (!block_ok) {
+            write_line_no_n(indexed, out, i + 1);
+            i++;
+            continue;
+        }
+        /* Count how many consecutive lines after i+window match the W-stride. */
+        uint64_t j = i + window;
+        while (j < N && hashes[j] != 0 && hashes[j] == hashes[j - window]) {
+            j++;
+        }
+        uint64_t match = j - (i + window);  /* lines after the first block that mirror it */
+        uint64_t reps = (match / window) + 1;  /* total block-copies in [i, i+window+match-1] (only count full reps) */
+        uint64_t span_len = reps * window;     /* full lines covered by complete reps */
+        uint64_t span_end = i + span_len;      /* exclusive */
+        if (reps >= threshold) {
+            /* Emit first W lines verbatim */
+            for (uint64_t k = 0; k < window; k++) {
+                write_line_no_n(indexed, out, i + k + 1);
+            }
+            fprintf(out,
+                    "# ak_fold: block_reps=%" PRIu64 " window=%" PRIu64
+                    " first_block=[%" PRIu64 "..%" PRIu64 "] last_block=[%" PRIu64 "..%" PRIu64
+                    "] hidden_lines=%" PRIu64 "\n",
+                    reps, window,
+                    i + 1, i + window,
+                    span_end - window + 1, span_end,
+                    (reps - 2) * window);
+            /* Emit last W lines verbatim (preserves final accumulator state) */
+            for (uint64_t k = 0; k < window; k++) {
+                write_line_no_n(indexed, out, span_end - window + k + 1);
+            }
+            fold_count++;
+            skipped_lines += (reps - 2) * window;
+            i = span_end;
+        } else {
+            /* No fold — write line i verbatim and advance one. */
+            write_line_no_n(indexed, out, i + 1);
+            i++;
+        }
+    }
+    free(hashes);
+    fprintf(stdout,
+            "{\"type\":\"fold_summary\",\"folds_applied\":%" PRIu64
+            ",\"lines_skipped\":%" PRIu64
+            ",\"original_line_count\":%" PRIu64
+            ",\"threshold\":%" PRIu64
+            ",\"window\":%" PRIu64 "}\n",
+            fold_count, skipped_lines, N, threshold, window);
+    return 0;
+}
+
+static int run_fold(const IndexedFile *indexed, FILE *out, uint64_t threshold) {
+    char prev_sig[512] = "";
+    char cur_sig[512];
+    uint64_t run_first = 0, run_last = 0;
+    bool prev_has_sig = false;
+    uint64_t fold_count = 0;
+    uint64_t skipped_lines = 0;
+
+    for (uint64_t line_no = 1; line_no <= indexed->index.count; line_no++) {
+        size_t off = indexed->index.offsets[line_no - 1];
+        LineView lv = line_at_offset(indexed->mapped.data, indexed->mapped.size, off);
+        bool has_sig = extract_line_signature(lv, cur_sig, sizeof(cur_sig));
+
+        if (!has_sig) {
+            /* non-instruction line (call func / class / ret / blank) — flush any
+             * pending run, then emit this line verbatim. Reset state.
+             */
+            fold_flush_run(indexed, out, run_first, run_last, prev_sig, threshold,
+                           &fold_count, &skipped_lines);
+            fwrite(lv.start, 1, lv.len, out);
+            fputc('\n', out);
+            run_first = 0;
+            run_last = 0;
+            prev_has_sig = false;
+            prev_sig[0] = '\0';
+            continue;
+        }
+
+        if (prev_has_sig && strcmp(cur_sig, prev_sig) == 0) {
+            run_last = line_no;
+        } else {
+            fold_flush_run(indexed, out, run_first, run_last, prev_sig, threshold,
+                           &fold_count, &skipped_lines);
+            strncpy(prev_sig, cur_sig, sizeof(prev_sig) - 1);
+            prev_sig[sizeof(prev_sig) - 1] = '\0';
+            run_first = line_no;
+            run_last = line_no;
+            prev_has_sig = true;
+        }
+    }
+    /* trailing run */
+    fold_flush_run(indexed, out, run_first, run_last, prev_sig, threshold,
+                   &fold_count, &skipped_lines);
+
+    /* summary to stdout (not the output file) so callers can verify */
+    fprintf(stdout, "{\"type\":\"fold_summary\",\"folds_applied\":%" PRIu64
+                    ",\"lines_skipped\":%" PRIu64
+                    ",\"original_line_count\":%" PRIu64
+                    ",\"threshold\":%" PRIu64 "}\n",
+            fold_count, skipped_lines, indexed->index.count, threshold);
+    return 0;
+}
+
+static int cmd_lint(int argc, char **argv) {
+    const char *path = NULL;
+    uint64_t top_k = 10;
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--file") == 0 && i + 1 < argc) path = argv[++i];
+        else if (strcmp(argv[i], "--top") == 0 && i + 1 < argc) {
+            if (!parse_u64(argv[++i], &top_k)) { fprintf(stderr, "invalid --top\n"); return 2; }
+            if (top_k == 0) top_k = 10;
+        }
+        else { usage(stderr); return 2; }
+    }
+    if (path == NULL) { usage(stderr); return 2; }
+
+    IndexedFile indexed;
+    if (indexed_file_open(path, &indexed) != 0) return 1;
+    int result = run_lint(&indexed, top_k);
+    indexed_file_close(&indexed);
+    return result;
+}
+
+static int cmd_fold(int argc, char **argv) {
+    const char *in_path = NULL;
+    const char *out_path = NULL;
+    uint64_t threshold = 100;
+    uint64_t window = 1;
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--in") == 0 && i + 1 < argc) in_path = argv[++i];
+        else if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) out_path = argv[++i];
+        else if (strcmp(argv[i], "--threshold") == 0 && i + 1 < argc) {
+            if (!parse_u64(argv[++i], &threshold) || threshold < 3) {
+                fprintf(stderr, "invalid --threshold (must be >= 3)\n");
+                return 2;
+            }
+        }
+        else if (strcmp(argv[i], "--block") == 0 && i + 1 < argc) {
+            if (!parse_u64(argv[++i], &window) || window == 0 || window > 32) {
+                fprintf(stderr, "invalid --block (must be in [1, 32])\n");
+                return 2;
+            }
+        }
+        else { usage(stderr); return 2; }
+    }
+    if (in_path == NULL || out_path == NULL) { usage(stderr); return 2; }
+
+    IndexedFile indexed;
+    if (indexed_file_open(in_path, &indexed) != 0) return 1;
+
+    FILE *out = fopen(out_path, "w");
+    if (out == NULL) {
+        fprintf(stderr, "fopen failed: %s: %s\n", out_path, strerror(errno));
+        indexed_file_close(&indexed);
+        return 1;
+    }
+
+    int result = window > 1
+        ? run_fold_block(&indexed, out, threshold, window)
+        : run_fold(&indexed, out, threshold);
+    fflush(out);
+    fclose(out);
+    indexed_file_close(&indexed);
+    return result;
+}
+
 static int cmd_match(int argc, char **argv) {
     const char *path = NULL;
     const char *query = NULL;
@@ -1394,6 +1950,12 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "semop") == 0) {
         return cmd_semop(argc, argv);
+    }
+    if (strcmp(argv[1], "lint") == 0) {
+        return cmd_lint(argc, argv);
+    }
+    if (strcmp(argv[1], "fold") == 0) {
+        return cmd_fold(argc, argv);
     }
     usage(stderr);
     return 2;

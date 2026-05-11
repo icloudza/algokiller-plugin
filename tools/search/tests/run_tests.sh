@@ -150,6 +150,96 @@ count=$(printf '%s\n' "$out" | grep -c '^{"type":"semop"')
 assert_eq "semop range respects limit=5" "5" "$count"
 
 # -----------------------------------------------------------------------------
+echo "[test] new: lint"
+
+out=$($BIN lint --file "$FIXTURE" --top 5)
+count=$(printf '%s\n' "$out" | grep -c '^{"type":"lint"' || true)
+assert_eq "lint emits 1 JSON object" "1" "$count"
+assert_contains "lint reports 15 lines" '"line_count":15' "$out"
+assert_contains "lint sees WeChat module" '"name":"WeChat"' "$out"
+assert_contains "lint detects register obs" '"has_register_observations":true' "$out"
+assert_contains "lint detects memory reads" '"has_memory_reads":true' "$out"
+assert_contains "lint detects memory writes" '"has_memory_writes":true' "$out"
+assert_contains "lint sees 1 call_func block" '"call_func_blocks":1' "$out"
+assert_contains "lint format_ok=true" '"format_ok":true' "$out"
+assert_contains "lint sees mov mnemonic" '"mnem":"mov"' "$out"
+assert_contains "lint sees eor mnemonic" '"mnem":"eor"' "$out"
+
+# lint on a non-GumTrace file (use the test script itself as a fake trace) → format_ok=false
+out=$($BIN lint --file "tests/run_tests.sh")
+assert_contains "lint flags non-GumTrace format" '"format_ok":false' "$out"
+assert_contains "lint warns on non-GumTrace" "not GumTrace format" "$out"
+
+# -----------------------------------------------------------------------------
+echo "[test] new: fold"
+
+FOLD_IN=tests/fixtures/fold-input.trace
+FOLD_OUT=tests/fixtures/fold-output.trace
+
+# fold-input: 1 unique mov, 11 identical madd lines, 1 unique ldr, then call/ret
+# threshold=5 → the 11-line madd run collapses to first + sentinel + last (3 lines)
+summary=$($BIN fold --in "$FOLD_IN" --out "$FOLD_OUT" --threshold 5)
+assert_contains "fold reports 1 fold applied" '"folds_applied":1' "$summary"
+assert_contains "fold reports 9 lines skipped" '"lines_skipped":9' "$summary"
+assert_contains "fold reports threshold" '"threshold":5' "$summary"
+assert_contains "fold reports original 15 lines" '"original_line_count":15' "$summary"
+
+# Resulting file: 15 original - 11 madd + 3 (first+sentinel+last) = 7 lines
+out_lines=$(wc -l < "$FOLD_OUT" | tr -d ' ')
+assert_eq "fold-output has 7 lines" "7" "$out_lines"
+
+# Sentinel comment must be present and reference the madd op
+assert_contains "fold sentinel present" "ak_fold: skipped 9 identical lines" "$(cat $FOLD_OUT)"
+assert_contains "fold sentinel mentions madd" 'op="madd x9, x9, x10, x11"' "$(cat $FOLD_OUT)"
+
+# First line of the run is preserved (initial accumulator value)
+assert_contains "fold preserves first run line" "x9=0x1 x10=0x83 x11=0x10 -> x9=0x93" "$(cat $FOLD_OUT)"
+# Last line of the run is preserved (final accumulator value)
+assert_contains "fold preserves last run line" "-> x9=0x2eb87b094c0a8c91" "$(cat $FOLD_OUT)"
+# Non-instruction lines (call func / ret) are passed through verbatim
+assert_contains "fold passes call func through" "call func: objc_retain" "$(cat $FOLD_OUT)"
+
+# fold with high threshold should not collapse (run of 11 < 50)
+summary=$($BIN fold --in "$FOLD_IN" --out "$FOLD_OUT" --threshold 50)
+assert_contains "fold below threshold: 0 folds" '"folds_applied":0' "$summary"
+out_lines=$(wc -l < "$FOLD_OUT" | tr -d ' ')
+assert_eq "fold below threshold: no shrink (15 lines)" "15" "$out_lines"
+
+rm -f "$FOLD_OUT"
+
+# -----------------------------------------------------------------------------
+echo "[test] new: fold --block 4 (DJB-style 4-instr loop)"
+
+FOLD_BLOCK_IN=tests/fixtures/fold-block-input.trace
+FOLD_BLOCK_OUT=tests/fixtures/fold-block-output.trace
+
+# fold-block-input: 1 mov, then 5 iterations of a 4-instr loop (ldrsb / madd /
+# subs / b.ne), then 1 ldr, then call/ret. Total 24 lines.
+# With --block 4 --threshold 3, the 5 iterations should be detected (>=3) and
+# folded into first-block + sentinel + last-block (= 4 + 1 + 4 = 9 lines).
+# Output: 1 (mov) + 9 (fold) + 1 (ldr) + 2 (call/ret) = 13 lines.
+summary=$($BIN fold --in "$FOLD_BLOCK_IN" --out "$FOLD_BLOCK_OUT" --threshold 3 --block 4)
+assert_contains "block-fold reports 1 fold applied" '"folds_applied":1' "$summary"
+assert_contains "block-fold reports window=4" '"window":4' "$summary"
+assert_contains "block-fold skips 12 lines (3 middle reps * 4)" '"lines_skipped":12' "$summary"
+
+out_lines=$(wc -l < "$FOLD_BLOCK_OUT" | tr -d ' ')
+assert_eq "block-fold output has 13 lines" "13" "$out_lines"
+
+assert_contains "block-fold sentinel mentions block_reps=5" "block_reps=5" "$(cat $FOLD_BLOCK_OUT)"
+assert_contains "block-fold preserves first iteration ldrsb" "x9=0x182" "$(cat $FOLD_BLOCK_OUT)"
+assert_contains "block-fold preserves last iteration final x9" "x9=0x1aa2f37d36" "$(cat $FOLD_BLOCK_OUT)"
+assert_contains "block-fold passes ldr through" "0xa1b2c3d4" "$(cat $FOLD_BLOCK_OUT)"
+
+# Threshold above repetitions → no fold
+summary=$($BIN fold --in "$FOLD_BLOCK_IN" --out "$FOLD_BLOCK_OUT" --threshold 10 --block 4)
+assert_contains "block-fold above threshold: 0 folds" '"folds_applied":0' "$summary"
+out_lines=$(wc -l < "$FOLD_BLOCK_OUT" | tr -d ' ')
+assert_eq "block-fold above threshold: 24 lines" "24" "$out_lines"
+
+rm -f "$FOLD_BLOCK_OUT"
+
+# -----------------------------------------------------------------------------
 echo ""
 echo "==================================================="
 echo "  PASS=$PASS  FAIL=$FAIL"
