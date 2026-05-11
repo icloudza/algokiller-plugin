@@ -289,6 +289,26 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "trace_cryptoinstr",
+        "description": (
+            "Scan the trace for ARM Crypto Extensions instructions — the only signal when a "
+            "binary uses hardware-accelerated crypto (AES-NI equivalent on ARM). Detects: "
+            "AES (aese/aesmc/aesd/aesimc), SHA-1 (sha1c/m/p/h/su0/su1), SHA-256 (sha256h/h2/su0/su1), "
+            "SHA-512 (sha512h/h2/su0/su1, ARMv8.2), SHA-3 (eor3/rax1/xar/bcax, ARMv8.2), "
+            "GHASH (pmull/pmull2), SM3 (sm3*, ARMv8.2), SM4 (sm4e/sm4ekey, ARMv8.2). "
+            "Critical companion to trace_constscan: if constscan reports 0 AES constants but "
+            "cryptoinstr finds aese hits, you're looking at hardware AES — NOT a missing crypto "
+            "implementation. Most modern OEM SDKs (iOS CryptoKit, BoringSSL ARM, libsodium-arm, "
+            "Android Keystore HW path) use these instructions on iPhone 5s+ / Pixel / etc."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "samples": {"type": "integer", "minimum": 1, "maximum": 8, "description": "Sample line numbers per mnemonic (default 5)."},
+            },
+        },
+    },
+    {
         "name": "trace_lint",
         "description": (
             "Single-pass health-check of the bound trace. Returns JSON: line count, average line "
@@ -755,6 +775,22 @@ def tool_trace_bytes(args: dict[str, Any]) -> dict:
     return STATE.daemon.run_cli("bytes", cli, timeout=120)
 
 
+def tool_trace_cryptoinstr(args: dict[str, Any]) -> dict:
+    err = _require_bound()
+    if err is not None:
+        return err
+    cli: list[str] = []
+    if "samples" in args:
+        try:
+            s = int(args["samples"])
+        except (TypeError, ValueError):
+            return {"status": "error", "error": "samples must be an integer"}
+        if not (1 <= s <= 8):
+            return {"status": "error", "error": "samples must be in [1, 8]"}
+        cli += ["--samples", str(s)]
+    return STATE.daemon.run_cli("cryptoinstr", cli, timeout=120)
+
+
 def tool_trace_lint(args: dict[str, Any]) -> dict:
     err = _require_bound()
     if err is not None:
@@ -834,6 +870,7 @@ HANDLERS = {
     "trace_hexblock": tool_trace_hexblock,
     "trace_constscan": tool_trace_constscan,
     "trace_bytes": tool_trace_bytes,
+    "trace_cryptoinstr": tool_trace_cryptoinstr,
     "write_artifact": tool_write_artifact,
     "list_artifacts": tool_list_artifacts,
     "read_artifact": tool_read_artifact,

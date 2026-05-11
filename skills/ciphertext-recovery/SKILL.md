@@ -18,6 +18,7 @@ description: ARM64 trace 密文还原方法论。当用户给出一段 ARM64 执
 **🔍 体检与总览（bind_trace 之后第一波必做）**
 - `algokiller.trace_lint`：单遍扫 trace 得 JSON 体检——行数/模块分布/Top-K mnemonic/call_func 块数/有无寄存器观察/format_ok + warnings。先调一次，确认 trace 格式可用、结构画像清晰。
 - `algokiller.trace_constscan`：扫 71 个密码学常数指纹（MD5/SHA-1/SHA-256/SHA-512/SM3/SHA-3/CRC32/FNV1a/AES sbox/AES Te0/SM4/ChaCha20/TEA/Whirlpool/Poly1305/SipHash + P-256/secp256k1/Ed25519/Curve25519）。**必看 `verdict` 字段而不是 `total_hits`**：`real` = load_imm 或 mem_r 真信号；`alu_only` = ALU 运算碰撞假阳，必须忽略；`weak` = 仅 mem_w/mem_r_addr 间接信号。每个命中带 `evidence` 分项（load_imm / mem_r / alu / ...）和 `sample_lines` 锚点。`category` 分类：hash / cipher_sym / ecc / crc / mac；`confidence` 分级：strong / medium / weak。
+- `algokiller.trace_cryptoinstr`：扫 ARM Crypto Extensions 硬件加密指令（AES `aese/aesmc/aesd/aesimc`、SHA-1 `sha1c/m/p/h/su0/su1`、SHA-256 `sha256h/h2/su0/su1`、SHA-512 `sha512h/h2/su0/su1`、SHA-3 `eor3/rax1/xar/bcax`、GHASH `pmull/pmull2`、SM3 `sm3*`、SM4 `sm4e/sm4ekey`）。**这是 constscan 的盲区补丁**：当 binary 走硬件加密（iOS CryptoKit / BoringSSL ARM / libsodium-arm / Android Keystore HW path / iPhone 5s+ 默认），软件 sbox/常数完全消失——只有硬件指令本身能识别。**必须 constscan + cryptoinstr 一起跑**：如果 constscan 报 AES.Te0 = 0 但 cryptoinstr 报 aese hits > 0，那就是 AES-NI 在跑，不是没加密。
 - `algokiller.trace_callgraph --top N`：Top-K 最常被调的 `call func: NAME(args)` 符号 + 计数。一眼看见热路径（malloc/memcpy/objc_msgSend/CCCrypt/...）。
 - `algokiller.trace_modgraph --top N`：跨模块跳转矩阵。看 caller_mod → callee_mod 邻接 + 边权重，定位密码学边界（如 WeChat → openssl / metasec → libc++）。
 
@@ -53,13 +54,54 @@ description: ARM64 trace 密文还原方法论。当用户给出一段 ARM64 执
 **bind_trace 后第一波动作（务必按序）**：
 
 1. `trace_lint` —— 确认 trace 是合法 GumTrace 格式（`format_ok: true`）、模块分布、有无 `call_func_blocks` / 寄存器观察。如果 `warnings` 非空、`format_ok: false`，立即向用户报告并停止——别在残废 trace 上烧 token。
-2. `trace_constscan` —— 拿密码学算法清单。**必须按 `verdict` 字段过滤**：
+2. `trace_constscan` —— 拿软件密码学算法清单（71 个常数指纹）。**必须按 `verdict` 字段过滤**：
    - 只信 `verdict: "real"`（load_imm > 0 或 mem_r > 0）的指纹。
    - **明确忽略 `verdict: "alu_only"`**——这些是 ALU 运算碰撞的假阳。例如 0x9e3779b9（TEA delta）加自己等于 0x3c6ef372（SHA-256.h2）——agent 必须看 verdict 不被 total_hits 误导。
    - `verdict: "weak"` 仅作为辅助提示。
-3. `trace_callgraph --top 10` + `trace_modgraph --top 10` —— 热点函数 + 跨模块边界。结合 constscan 真信号，初步定位密码学发生在哪段代码 / 哪个模块。
+3. `trace_cryptoinstr` —— 扫 ARM Crypto Extensions 硬件加密指令清单。**必须跟 constscan 一起读**：
+   - constscan 命中 + cryptoinstr 0 命中 → **纯软件实现**（如字节 metasec_ov.so 跑 MD5/SHA-1/AES Te0/SM3）。
+   - constscan 0 命中 + cryptoinstr 命中 → **纯硬件加密**（如 iOS CryptoKit 跑 AES-NI）。
+   - 两者都命中 → **混合**（某些热路径走硬件，慢路径走软件兜底）。
+   - 两者都 0 → 这个 trace 段不涉及加密；OR 走了白盒密码 / OLLVM 化整、constscan 和 cryptoinstr 都瞎了——这种情况下转 Stage 1 "Hardened 大厂样本" 路径。
+4. `trace_callgraph --top 10` + `trace_modgraph --top 10` —— 热点函数 + 跨模块边界。结合 constscan + cryptoinstr 真信号，初步定位密码学发生在哪段代码 / 哪个模块。
 
 完成 Stage 0 后再进入具体证据链构建。这一步约束保护你在大 trace 上避免盲搜耗 token。
+
+---
+
+## Stage 1: 对抗大厂的 Hardened Binary 路径
+
+constscan + cryptoinstr 都瞎掉时（**两者都报 0 命中或全 alu_only**），目标可能是大厂典型反逆向手段。按以下顺序排查：
+
+| 大厂常见手段 | 识别信号 | 反制 |
+|---|---|---|
+| **AES-NI 硬件加速** | constscan 0 sbox + cryptoinstr 命中 `aese/aesmc` | 直接看硬件指令命中行就是算法实锤 |
+| **NEON SIMD bitslicing** | `tbl/tbx`(查表)、`shrn/shll`(位平面)、`ushr/sli` 大量；但 sbox 字面量为 0 | trace_callgraph + 跨函数 hexblock 看密钥/密文边界 |
+| **AES T-table（OpenSSL aes_core 风格）** | constscan 命中 `AES.Te0[0..3]` + `mem_r=Te0表基址 + idx*4` | 已被 constscan 覆盖（verdict=real），直接抓 sample_lines |
+| **白盒密码 (T-box / wide encoding)** | 无任何 constscan 命中 + 大量 `ldr` 顺序读连续表 + 表大小 > 4KB | 用 trace_search "mem_r=" + trace_regflow 看表项读取顺序；用 trace_fold 折叠重复访问 |
+| **OLLVM 控制流平展** | 大量小 basic block + 反复 `cbz/cbnz` + 同一 dispatch state 变量频繁更新 | trace_semop 标 branch + 找 dispatch state var → trace_regflow 还原状态机 |
+| **OLLVM 字符串/常量混淆** | constscan 0 命中但运行时 trace 中能看到字符串 | trace_search 找 trace 中的字符串字面量 ASCII，反推被构造之处 |
+| **VMP / VMProtect / OLLVM `obfu`** | 单函数极长 (1M+ 行), trace_fold --block 4 仍压不下来 | 先 fold --block 2/3/8/16 试各种循环宽度；再看 trace_modgraph 边界 |
+| **国密 (SM2/SM3/SM4)** | constscan 命中 SM3.IV* / SM4.FK*/CK*/sbox | 已识别；trace_callgraph 找 sm3_compress / sm4_crypt 入口 |
+| **签名 (Ed25519 / secp256k1)** | constscan 命中 P256.b_lo / secp256k1.p_lo / Ed25519.d_lo | 已识别；trace_callgraph 找 ed25519_sign / ecdsa_sign 入口 |
+| **HMAC / KDF 串联** | constscan 命中 hash IV 且有 outer pad / inner pad（0x36/0x5c 重复 64 次）| trace_bytes 搜 0x3636363636363636 / 0x5c5c5c5c5c5c5c5c |
+
+**通用准则**：硬件加速识别用 cryptoinstr；软件实现识别用 constscan；都瞎用 trace_callgraph + trace_modgraph + 静态 BN/r2 联动从函数语义反推。
+
+### ARM Crypto Extensions 指令 cheatsheet (cryptoinstr 输出对照)
+
+| mnem | primitive | 含义 |
+|---|---|---|
+| `aese`, `aesmc`, `aesd`, `aesimc` | AES | 加/解密 round 各一条 |
+| `sha1c/m/p`, `sha1h`, `sha1su0/su1` | SHA-1 | hash update + schedule |
+| `sha256h`, `sha256h2`, `sha256su0/su1` | SHA-256 | hash update part1/part2 + schedule |
+| `sha512h`, `sha512h2`, `sha512su0/su1` | SHA-512 | ARMv8.2 |
+| `eor3`, `rax1`, `xar`, `bcax` | SHA-3 | Keccak χ/θ/ρ-π (ARMv8.2; eor3 也用于通用 3-way XOR → confidence=medium) |
+| `pmull`, `pmull2` | GHASH/GCM | 多项式乘 (confidence=medium, 也用于通用 GF mul) |
+| `sm3partw1/2`, `sm3ss1`, `sm3tt1a/1b/2a/2b` | SM3 | ARMv8.2 |
+| `sm4e`, `sm4ekey` | SM4 | ARMv8.2 |
+
+看到这些指令 = 算法实锤，比 constscan 常数还硬——constscan 软件常数可能被 OLLVM/白盒抹掉，但硬件指令必须保留（mnemonic 是编码而非数据）。
 
 ---
 

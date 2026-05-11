@@ -21,6 +21,7 @@ description: ARM64 trace 通用证据分析方法论。当用户给出一段 ARM
 - `algokiller.trace_callgraph --to NAME`：查询哪些行调用了指定函数（substring 匹配）。比手动 `trace_search "call func: NAME"` 干净。
 - `algokiller.trace_modgraph --top N`：跨模块跳转矩阵——caller_mod → callee_mod 边权重 + 每模块行数。看模块边界跳转密度（如 WeChat ↔ mmcronet、libmetasec ↔ libc++）。
 - `algokiller.trace_constscan`：扫 71 个密码学常数指纹。**必看 `verdict` 字段而不是 `total_hits`**：`real` = 真信号；`alu_only` = ALU 碰撞假阳必须忽略；`weak` = 间接信号。即使 general 模式，constscan 也能快速回答"代码里有没有 hash / 加密"。
+- `algokiller.trace_cryptoinstr`：扫 ARM Crypto Extensions 硬件加密指令（aese/sha256h/sm4e/pmull/...）。constscan 看软件，cryptoinstr 看硬件——必须配对：constscan 0 + cryptoinstr 命中 = 硬件加密；constscan 命中 + cryptoinstr 0 = 软件加密；两者都 0 = 无加密 OR 白盒/混淆。
 
 **🔬 精准搜索与上下文**
 - `algokiller.trace_search`：大小写不敏感精确子串搜索。`limit ≤ 100`，二选一 `from_line` / `before_line`。

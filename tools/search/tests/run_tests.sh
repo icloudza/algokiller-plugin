@@ -350,6 +350,41 @@ out=$($BIN bytes --file "$S34" --query 0xa1b2c3d4 --with-text --limit 3)
 assert_contains "bytes --with-text emits instr" '"instr":' "$out"
 
 # -----------------------------------------------------------------------------
+echo "[test] new: cryptoinstr (ARM Crypto Extensions detection)"
+
+S6=tests/fixtures/sprint6-cryptoinstr.trace
+out=$($BIN cryptoinstr --file "$S6" --samples 2)
+assert_contains "cryptoinstr emits type=cryptoinstr" '"type":"cryptoinstr"' "$out"
+
+# fixture covers 8 primitives
+for prim in AES SHA-1 SHA-256 SHA-512 SHA-3 GHASH SM3 SM4; do
+    assert_contains "cryptoinstr detects $prim" "\"$prim\"" "$out"
+done
+
+# specific strong-confidence mnemonics
+for mnem in aese aesmc sha256h sha512h sm3ss1 sm4e bcax xar; do
+    assert_contains "cryptoinstr matches $mnem" "\"mnem\":\"$mnem\"" "$out"
+done
+
+assert_contains "cryptoinstr has confidence field" '"confidence":' "$out"
+assert_contains "cryptoinstr has note field" '"note":' "$out"
+assert_contains "cryptoinstr has primitives_present array" '"primitives_present":' "$out"
+
+# pmull is medium (also generic GF mul)
+assert_contains "pmull marked medium" '"mnem":"pmull","primitive":"GHASH","confidence":"medium"' "$out"
+
+# eor3 is medium (also general 3-way XOR)
+assert_contains "eor3 marked medium" '"mnem":"eor3","primitive":"SHA-3","confidence":"medium"' "$out"
+
+# AES variants all strong
+assert_contains "aese marked strong" '"mnem":"aese","primitive":"AES","confidence":"strong"' "$out"
+
+# Non-crypto noise line should not trigger anything
+out_noise=$($BIN cryptoinstr --file "$FIXTURE" --samples 2)
+count=$(printf '%s\n' "$out_noise" | python3 -c "import json,sys; print(len(json.loads(sys.stdin.read())['hits']))")
+assert_eq "cryptoinstr on mini.trace returns 0 hits" "0" "$count"
+
+# -----------------------------------------------------------------------------
 echo ""
 echo "==================================================="
 echo "  PASS=$PASS  FAIL=$FAIL"

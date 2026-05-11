@@ -50,6 +50,7 @@ ALLOWED_TOOLS: dict[str, dict[str, Any]] = {
     "strings":       {"timeout": 30, "category": "strings"},
     "c++filt":       {"timeout": 10, "category": "demangle"},
     "llvm-cxxfilt":  {"timeout": 10, "category": "demangle"},
+    "swift-demangle": {"timeout": 10, "category": "demangle"},
     "addr2line":     {"timeout": 10, "category": "addr"},
     "lipo":          {"timeout": 10, "category": "fat", "forbid_args": ["-create", "-replace", "-remove"]},
 
@@ -68,6 +69,12 @@ ALLOWED_TOOLS: dict[str, dict[str, Any]] = {
 
     # Tier D — Mach-O / iOS specific
     "class-dump":    {"timeout": 60, "category": "objc"},
+    # iOS code-signing / entitlements (read-only sub-commands enforced via forbid_args)
+    "codesign":      {"timeout": 30, "category": "codesign",
+                      "forbid_args": ["--sign", "-s", "--remove-signature", "--force",
+                                      "--deep-sign", "--detached-database", "-r"]},
+    "ldid":          {"timeout": 30, "category": "codesign",
+                      "forbid_args": ["-S", "-s"]},  # -S<file> writes entitlements; -s replaces signature
 
     # Tier C — r2 STRICTLY bounded (see validate_r2_args)
     "r2":            {"timeout": 60, "category": "r2_bounded", "guard": "r2"},

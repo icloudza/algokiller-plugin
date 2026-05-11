@@ -59,8 +59,9 @@ static void usage(FILE *stream) {
             "  ak_search callgraph --file PATH (--to NAME | --top N) [--limit N]\n"
             "  ak_search modgraph  --file PATH [--top N]\n"
             "  ak_search hexblock  --file PATH --line N [--max-lines N]\n"
-            "  ak_search constscan --file PATH [--samples N]\n"
-            "  ak_search bytes     --file PATH --query 0xVAL [--limit N] [--with-text]\n"
+            "  ak_search constscan   --file PATH [--samples N]\n"
+            "  ak_search bytes       --file PATH --query 0xVAL [--limit N] [--with-text]\n"
+            "  ak_search cryptoinstr --file PATH [--samples N]\n"
             "\n"
             "Match mode is ASCII case-insensitive. --before-line searches backward, nearest first.\n"
             "regflow emits one row per line where the target register receives an output value.\n"
@@ -2702,6 +2703,195 @@ static int cmd_bytes(int argc, char **argv) {
     return result;
 }
 
+/* ===========================================================================
+ * Sprint 6 extensions: cryptoinstr — ARM Crypto Extensions instruction scanner
+ *
+ * Detects hardware-accelerated cryptographic primitives that constscan
+ * is structurally blind to. When a binary uses ARMv8 Crypto Extensions
+ * (AES-NI equivalent on ARM, available since ARMv8.0 / iPhone 5s+), the
+ * software S-box / round-constant tables are NOT loaded — the magic numbers
+ * never appear in the trace. The only signal is the mnemonic itself.
+ *
+ * Real-world coverage:
+ *   ARMv8.0  AES (aese/aesmc/aesd/aesimc), SHA-1, SHA-256
+ *   ARMv8.2  SHA-512, SM3, SM4, GHASH (pmull double-length)
+ *   ARMv8.4  SHA-3 (eor3/rax1/xar/bcax)
+ *   ARMv8.5+ no new crypto opcodes
+ *
+ * Used by: iOS CryptoKit, BoringSSL ARM backend, Android Keystore HW path,
+ * libsodium-arm, mbedtls ARMv8 build, and most modern OEM crypto SDKs.
+ * If a trace shows aese but constscan shows zero AES.sbox hits, that is
+ * AES-NI in action — NOT a missing implementation.
+ *
+ * Mnemonic → primitive references:
+ *   ARM ARM (DDI 0487) §C7.2 Crypto and SHA instructions
+ *   FIPS 197 (AES)  + FIPS 180-4 (SHA-1/256/512) + FIPS 202 (SHA-3)
+ *   GM/T 0002-2012 (SM4)  + GM/T 0004-2012 (SM3)
+ * ===========================================================================
+ */
+
+typedef struct {
+    const char *mnem;
+    const char *primitive;   /* AES / SHA-1 / SHA-256 / SHA-512 / SHA-3 / GHASH / SM3 / SM4 */
+    Confidence  conf;
+    const char *note;
+} CryptoInsn;
+
+static const CryptoInsn CRYPTO_INSNS[] = {
+    /* AES (ARMv8.0) */
+    {"aese",      "AES",     FP_STRONG, "SubBytes + ShiftRows + AddRoundKey"},
+    {"aesmc",     "AES",     FP_STRONG, "MixColumns"},
+    {"aesd",      "AES",     FP_STRONG, "InvSubBytes + InvShiftRows + AddRoundKey"},
+    {"aesimc",    "AES",     FP_STRONG, "InvMixColumns"},
+
+    /* SHA-1 (ARMv8.0) */
+    {"sha1c",     "SHA-1",   FP_STRONG, "hash update (Ch round)"},
+    {"sha1m",     "SHA-1",   FP_STRONG, "hash update (Maj round)"},
+    {"sha1p",     "SHA-1",   FP_STRONG, "hash update (Parity round)"},
+    {"sha1h",     "SHA-1",   FP_STRONG, "fixed rotate"},
+    {"sha1su0",   "SHA-1",   FP_STRONG, "schedule update 0"},
+    {"sha1su1",   "SHA-1",   FP_STRONG, "schedule update 1"},
+
+    /* SHA-256 (ARMv8.0) */
+    {"sha256h",   "SHA-256", FP_STRONG, "hash update part 1"},
+    {"sha256h2",  "SHA-256", FP_STRONG, "hash update part 2"},
+    {"sha256su0", "SHA-256", FP_STRONG, "schedule update 0"},
+    {"sha256su1", "SHA-256", FP_STRONG, "schedule update 1"},
+
+    /* SHA-512 (ARMv8.2) */
+    {"sha512h",   "SHA-512", FP_STRONG, "hash update part 1"},
+    {"sha512h2",  "SHA-512", FP_STRONG, "hash update part 2"},
+    {"sha512su0", "SHA-512", FP_STRONG, "schedule update 0"},
+    {"sha512su1", "SHA-512", FP_STRONG, "schedule update 1"},
+
+    /* SHA-3 / Keccak (ARMv8.2) — eor3 is widely used outside SHA-3 so medium */
+    {"eor3",      "SHA-3",   FP_MEDIUM, "triple-XOR (Keccak χ step; also general 3-way XOR)"},
+    {"rax1",      "SHA-3",   FP_STRONG, "rotate-add-XOR (Keccak ρ+π)"},
+    {"xar",       "SHA-3",   FP_STRONG, "XOR-and-rotate (Keccak θ)"},
+    {"bcax",      "SHA-3",   FP_STRONG, "bit-clear-AND-XOR (Keccak χ)"},
+
+    /* GHASH / GCM (ARMv8.0 pmull, ARMv8.4 pmull2 for 64x64→128 fully) — medium
+     * because pmull also encodes generic GF(2^n) multiply for non-GHASH uses. */
+    {"pmull",     "GHASH",   FP_MEDIUM, "polynomial multiply low (GHASH/GMAC; also generic GF(2^n) mul)"},
+    {"pmull2",    "GHASH",   FP_MEDIUM, "polynomial multiply high"},
+
+    /* SM3 (ARMv8.2) */
+    {"sm3partw1", "SM3",     FP_STRONG, "schedule update part 1"},
+    {"sm3partw2", "SM3",     FP_STRONG, "schedule update part 2"},
+    {"sm3ss1",    "SM3",     FP_STRONG, "sigma_1"},
+    {"sm3tt1a",   "SM3",     FP_STRONG, "hash update T1 part A"},
+    {"sm3tt1b",   "SM3",     FP_STRONG, "hash update T1 part B"},
+    {"sm3tt2a",   "SM3",     FP_STRONG, "hash update T2 part A"},
+    {"sm3tt2b",   "SM3",     FP_STRONG, "hash update T2 part B"},
+
+    /* SM4 (ARMv8.2) */
+    {"sm4e",      "SM4",     FP_STRONG, "encryption round"},
+    {"sm4ekey",   "SM4",     FP_STRONG, "key expansion"},
+
+    {NULL, NULL, FP_WEAK, NULL},
+};
+
+static int run_cryptoinstr(const IndexedFile *indexed, uint64_t limit_per_insn) {
+    size_t insn_count = 0;
+    while (CRYPTO_INSNS[insn_count].mnem != NULL) insn_count++;
+
+    /* Per-insn counters + sample lines */
+    uint64_t *hits = calloc(insn_count, sizeof(uint64_t));
+    uint64_t (*samples)[8] = calloc(insn_count, sizeof(*samples));
+    uint64_t *sample_n = calloc(insn_count, sizeof(uint64_t));
+    if (!hits || !samples || !sample_n) {
+        free(hits); free(samples); free(sample_n);
+        fprintf(stderr, "cryptoinstr: out of memory\n");
+        return 1;
+    }
+    if (limit_per_insn > 8) limit_per_insn = 8;
+
+    /* Single pass over the trace */
+    for (uint64_t line_no = 1; line_no <= indexed->index.count; line_no++) {
+        size_t off = indexed->index.offsets[line_no - 1];
+        LineView line = line_at_offset(indexed->mapped.data, indexed->mapped.size, off);
+        const unsigned char *mn, *op;
+        size_t mn_len, op_len;
+        if (!parse_mnem_and_operands(line, &mn, &mn_len, &op, &op_len)) continue;
+        (void)op; (void)op_len;
+        /* Exact mnemonic match (case-sensitive — GumTrace emits lowercase). */
+        for (size_t i = 0; i < insn_count; i++) {
+            size_t l = strlen(CRYPTO_INSNS[i].mnem);
+            if (mn_len == l && memcmp(mn, CRYPTO_INSNS[i].mnem, l) == 0) {
+                hits[i]++;
+                if (sample_n[i] < limit_per_insn) {
+                    samples[i][sample_n[i]++] = line_no;
+                }
+                break;
+            }
+        }
+    }
+
+    /* Aggregate per-primitive verdict */
+    fputs("{\"type\":\"cryptoinstr\",\"hits\":[", stdout);
+    bool emitted = false;
+    for (size_t i = 0; i < insn_count; i++) {
+        if (hits[i] == 0) continue;
+        if (emitted) putchar(',');
+        emitted = true;
+        fputs("{\"mnem\":", stdout);
+        json_write_cstr(CRYPTO_INSNS[i].mnem);
+        fputs(",\"primitive\":", stdout);
+        json_write_cstr(CRYPTO_INSNS[i].primitive);
+        fputs(",\"confidence\":", stdout);
+        json_write_cstr(confidence_str(CRYPTO_INSNS[i].conf));
+        fputs(",\"note\":", stdout);
+        json_write_cstr(CRYPTO_INSNS[i].note);
+        printf(",\"total_hits\":%" PRIu64, hits[i]);
+        fputs(",\"sample_lines\":[", stdout);
+        for (uint64_t k = 0; k < sample_n[i]; k++) {
+            if (k > 0) putchar(',');
+            printf("%" PRIu64, samples[i][k]);
+        }
+        fputs("]}", stdout);
+    }
+    fputs("],\"primitives_present\":[", stdout);
+    /* dedupe primitive names */
+    bool first_prim = true;
+    for (size_t i = 0; i < insn_count; i++) {
+        if (hits[i] == 0) continue;
+        bool dup = false;
+        for (size_t j = 0; j < i; j++) {
+            if (hits[j] > 0 && strcmp(CRYPTO_INSNS[j].primitive, CRYPTO_INSNS[i].primitive) == 0) {
+                dup = true; break;
+            }
+        }
+        if (dup) continue;
+        if (!first_prim) putchar(',');
+        first_prim = false;
+        json_write_cstr(CRYPTO_INSNS[i].primitive);
+    }
+    fputs("]}\n", stdout);
+
+    free(hits); free(samples); free(sample_n);
+    return 0;
+}
+
+static int cmd_cryptoinstr(int argc, char **argv) {
+    const char *path = NULL;
+    uint64_t samples = 5;
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--file") == 0 && i + 1 < argc) path = argv[++i];
+        else if (strcmp(argv[i], "--samples") == 0 && i + 1 < argc) {
+            if (!parse_u64(argv[++i], &samples) || samples == 0) {
+                fprintf(stderr, "invalid --samples\n"); return 2;
+            }
+        }
+        else { usage(stderr); return 2; }
+    }
+    if (path == NULL) { usage(stderr); return 2; }
+    IndexedFile indexed;
+    if (indexed_file_open(path, &indexed) != 0) return 1;
+    int result = run_cryptoinstr(&indexed, samples);
+    indexed_file_close(&indexed);
+    return result;
+}
+
 static int cmd_match(int argc, char **argv) {
     const char *path = NULL;
     const char *query = NULL;
@@ -2982,6 +3172,9 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "bytes") == 0) {
         return cmd_bytes(argc, argv);
+    }
+    if (strcmp(argv[1], "cryptoinstr") == 0) {
+        return cmd_cryptoinstr(argc, argv);
     }
     usage(stderr);
     return 2;
