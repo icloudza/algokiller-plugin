@@ -10,6 +10,24 @@ Claude Desktop plugin for ARM64 trace evidence analysis and cipher/algorithm rec
 
 ---
 
+## 🚀 Quick install
+
+```bash
+claude plugin marketplace add icloudza/algokiller-plugin
+claude plugin install algokiller@algokiller-suite
+```
+
+Updates:
+
+```bash
+claude plugin marketplace update
+claude plugin update algokiller@algokiller-suite
+```
+
+> Inside the Claude Code REPL you can also use the equivalent `/plugin marketplace add ...` / `/plugin install ...` slash commands. Manual install is covered below in [Install](#install).
+
+---
+
 ## Capabilities
 
 1. **Skills** (model-invoked, auto-loaded)
@@ -48,34 +66,21 @@ cp ak_search ../../server/bin/ak_search
 
 ## Install
 
-**Option 1 (recommended — one-line install)**: Claude Code marketplace.
+> One-line install is at the top under [🚀 Quick install](#-quick-install).
 
-```bash
-claude plugin marketplace add icloudza/algokiller-plugin
-claude plugin install algokiller@algokiller-suite
-```
-
-> Inside the Claude Code REPL you can also use slash commands:
->
-> ```
-> /plugin marketplace add icloudza/algokiller-plugin
-> /plugin install algokiller@algokiller-suite
-> ```
-
-Updates:
-
-```bash
-claude plugin marketplace update
-claude plugin update algokiller@algokiller-suite
-```
-
-**Option 2 (manual)**: clone the repo, then Claude Desktop → `+` → **Plugins** → **Add plugin** → pick the directory.
+**Manual install (fallback)**: clone the repo, then Claude Desktop → `+` → **Plugins** → **Add plugin** → pick the directory.
 
 ```bash
 git clone https://github.com/icloudza/algokiller-plugin
 ```
 
 After install you should see `algokiller` under **Plugins** and `/algokiller:ciphertext` + `/algokiller:general` under **Slash commands**.
+
+If you previously installed the plugin manually (e.g. `algokiller@local-desktop-app-uploads`), uninstall it after switching to the marketplace install to avoid double-registration:
+
+```bash
+claude plugin uninstall algokiller@local-desktop-app-uploads
+```
 
 ---
 

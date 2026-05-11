@@ -10,6 +10,24 @@
 
 ---
 
+## 🚀 快速安装
+
+```bash
+claude plugin marketplace add icloudza/algokiller-plugin
+claude plugin install algokiller@algokiller-suite
+```
+
+更新：
+
+```bash
+claude plugin marketplace update
+claude plugin update algokiller@algokiller-suite
+```
+
+> Claude Code REPL 里也可以用 `/plugin marketplace add ...` / `/plugin install ...` slash 等价命令。手动安装方式见下方 [完整安装说明](#安装)。
+
+---
+
 ## 能力
 
 1. **Skills**（model-invoked 自动加载）
@@ -48,34 +66,21 @@ cp ak_search ../../server/bin/ak_search
 
 ## 安装
 
-**方式 1（推荐 / 一行装好）**：Claude Code marketplace。
+> 一行装机命令见顶部 [🚀 快速安装](#-快速安装)。
 
-```bash
-claude plugin marketplace add icloudza/algokiller-plugin
-claude plugin install algokiller@algokiller-suite
-```
-
-> 在 Claude Code REPL 里也可以用 slash 命令：
->
-> ```
-> /plugin marketplace add icloudza/algokiller-plugin
-> /plugin install algokiller@algokiller-suite
-> ```
-
-后续更新：
-
-```bash
-claude plugin marketplace update
-claude plugin update algokiller@algokiller-suite
-```
-
-**方式 2（手动）**：克隆仓库后在 Claude Desktop → `+` → **Plugins** → **Add plugin** → 选本地目录。
+**手动安装（备选）**：克隆仓库后在 Claude Desktop → `+` → **Plugins** → **Add plugin** → 选本地目录。
 
 ```bash
 git clone https://github.com/icloudza/algokiller-plugin
 ```
 
 装完应能看到 `algokiller` 在 **Plugins** 菜单，`/algokiller:ciphertext` 和 `/algokiller:general` 在 **Slash commands**。
+
+如果之前手动装过同名 plugin（如 `algokiller@local-desktop-app-uploads`），用 marketplace 装新版后先卸老版避免双注册：
+
+```bash
+claude plugin uninstall algokiller@local-desktop-app-uploads
+```
 
 ---
 
