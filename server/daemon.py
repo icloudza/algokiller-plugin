@@ -144,6 +144,39 @@ class AkSearchDaemon:
             return ""
         return data[-tail_chars:].strip()
 
+    def run_cli(self, subcommand: str, args: list[str],
+                timeout: int = 30, max_output_chars: int = 200_000) -> dict:
+        """Run ak_search in one-shot CLI mode (no daemon protocol) for the
+        Sprint-1 subcommands (regflow / producer / semop). Daemon-mode wiring
+        for these is deferred to Sprint 2.
+        """
+        if not self.binary.exists():
+            return {"status": "error", "error": f"ak_search binary not found: {self.binary}"}
+        if not self.trace_file.exists():
+            return {"status": "error", "error": f"trace file not found: {self.trace_file}"}
+        try:
+            result = subprocess.run(
+                [str(self.binary), subcommand, "--file", str(self.trace_file), *args],
+                capture_output=True, text=True, timeout=timeout, check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return {"status": "error", "error": f"{subcommand} timed out after {timeout}s"}
+        except OSError as exc:
+            return {"status": "error", "error": f"{subcommand} exec failed: {exc}"}
+
+        stdout = _scrub_text(result.stdout or "")
+        truncated = False
+        if len(stdout) > max_output_chars:
+            stdout = stdout[:max_output_chars]
+            truncated = True
+        return {
+            "status": "ok" if result.returncode == 0 else "error",
+            "stdout": stdout,
+            "stderr": _scrub_text(result.stderr or ""),
+            "returncode": result.returncode,
+            "truncated": truncated,
+        }
+
     def close(self) -> None:
         process = self.process
         self.process = None

@@ -161,6 +161,64 @@ TOOLS: list[dict[str, Any]] = [
             "required": ["tool", "args"],
         },
     },
+    {
+        "name": "trace_regflow",
+        "description": (
+            "Emit the value-write sequence for a target register over a line range. "
+            "Each row corresponds to a trace line where the register receives an output value "
+            "(the '-> regN=0xVAL' portion of GumTrace format). Use this to follow how a key, "
+            "hash accumulator, or buffer pointer evolves across instructions — far cheaper than "
+            "repeated trace_search calls + manual reconstruction."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "reg": {"type": "string", "description": "Register name, e.g. 'x0', 'x9', 'w12', 'sp', 'fp'."},
+                "from_line": {"type": "integer", "minimum": 1, "description": "1-based start line (default 1)."},
+                "to_line": {"type": "integer", "minimum": 1, "description": "1-based end line (default last)."},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Max records (default 100)."},
+            },
+            "required": ["reg"],
+        },
+    },
+    {
+        "name": "trace_producer",
+        "description": (
+            "Scan backward from sink_line to find the most recent instruction whose '-> regN=0xVAL' "
+            "matches the requested value. Returns a single producer row with the writing register "
+            "and instruction text. Replaces the 'before_line + manual bisect' loop the agent does "
+            "when chasing where a value came from."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "value": {"type": "string", "description": "Target value as 0x-prefixed hex, e.g. '0xa1b2c3d4'."},
+                "sink_line": {"type": "integer", "minimum": 2, "description": "1-based sink line; search scans lines strictly before this."},
+                "max_back": {"type": "integer", "minimum": 1, "description": "Maximum lines to scan backward (default 100000)."},
+            },
+            "required": ["value", "sink_line"],
+        },
+    },
+    {
+        "name": "trace_semop",
+        "description": (
+            "Classify each instruction's semantic role. Classes: zero (xor x,x,x), "
+            "crypto_candidate (eor with distinct regs), hash_loop_candidate (madd/msub), "
+            "stack_save/restore, memory_load/store, branch, data_move, addr_calc, alu, "
+            "compare, unknown. Use to prune non-crypto candidates before deep dive, or to "
+            "stage-classify a hot region. Either --line for a single instruction, or "
+            "--from-line + --to-line + --limit for a range."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "line": {"type": "integer", "minimum": 1, "description": "Single line to classify."},
+                "from_line": {"type": "integer", "minimum": 1, "description": "Range start (use with to_line)."},
+                "to_line": {"type": "integer", "minimum": 1, "description": "Range end (use with from_line)."},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Max records (default 100)."},
+            },
+        },
+    },
 ]
 
 
@@ -379,10 +437,97 @@ def tool_run_static_tool(args: dict[str, Any]) -> dict:
     return run_static_tool(tool=tool_name, args=tool_args, input_stdin=stdin)
 
 
+def tool_trace_regflow(args: dict[str, Any]) -> dict:
+    err = _require_bound()
+    if err is not None:
+        return err
+    reg = str(args.get("reg", "")).strip()
+    if not reg:
+        return {"status": "error", "error": "reg must not be empty"}
+    cli_args: list[str] = ["--reg", reg]
+    if "from_line" in args:
+        try:
+            cli_args += ["--from-line", str(int(args["from_line"]))]
+        except (TypeError, ValueError):
+            return {"status": "error", "error": "from_line must be an integer"}
+    if "to_line" in args:
+        try:
+            cli_args += ["--to-line", str(int(args["to_line"]))]
+        except (TypeError, ValueError):
+            return {"status": "error", "error": "to_line must be an integer"}
+    if "limit" in args:
+        try:
+            limit = int(args["limit"])
+        except (TypeError, ValueError):
+            return {"status": "error", "error": "limit must be an integer"}
+        if not (1 <= limit <= 1000):
+            return {"status": "error", "error": "limit must be in [1, 1000]"}
+        cli_args += ["--limit", str(limit)]
+    return STATE.daemon.run_cli("regflow", cli_args)
+
+
+def tool_trace_producer(args: dict[str, Any]) -> dict:
+    err = _require_bound()
+    if err is not None:
+        return err
+    value = str(args.get("value", "")).strip()
+    if not value or not value.lower().startswith("0x"):
+        return {"status": "error", "error": "value must be a 0x-prefixed hex literal, e.g. '0xa1b2c3d4'"}
+    try:
+        sink_line = int(args.get("sink_line", 0))
+    except (TypeError, ValueError):
+        return {"status": "error", "error": "sink_line must be an integer"}
+    if sink_line < 2:
+        return {"status": "error", "error": "sink_line must be >= 2"}
+    cli_args: list[str] = ["--value", value, "--sink-line", str(sink_line)]
+    if "max_back" in args:
+        try:
+            mb = int(args["max_back"])
+        except (TypeError, ValueError):
+            return {"status": "error", "error": "max_back must be an integer"}
+        if mb < 1:
+            return {"status": "error", "error": "max_back must be >= 1"}
+        cli_args += ["--max-back", str(mb)]
+    return STATE.daemon.run_cli("producer", cli_args)
+
+
+def tool_trace_semop(args: dict[str, Any]) -> dict:
+    err = _require_bound()
+    if err is not None:
+        return err
+    has_line = "line" in args
+    has_range = "from_line" in args and "to_line" in args
+    if not has_line and not has_range:
+        return {"status": "error", "error": "provide either 'line' or both 'from_line' and 'to_line'"}
+    cli_args: list[str] = []
+    if has_line:
+        try:
+            cli_args += ["--line", str(int(args["line"]))]
+        except (TypeError, ValueError):
+            return {"status": "error", "error": "line must be an integer"}
+    else:
+        try:
+            cli_args += ["--from-line", str(int(args["from_line"])), "--to-line", str(int(args["to_line"]))]
+        except (TypeError, ValueError):
+            return {"status": "error", "error": "from_line / to_line must be integers"}
+    if "limit" in args:
+        try:
+            limit = int(args["limit"])
+        except (TypeError, ValueError):
+            return {"status": "error", "error": "limit must be an integer"}
+        if not (1 <= limit <= 1000):
+            return {"status": "error", "error": "limit must be in [1, 1000]"}
+        cli_args += ["--limit", str(limit)]
+    return STATE.daemon.run_cli("semop", cli_args)
+
+
 HANDLERS = {
     "bind_trace": tool_bind_trace,
     "trace_search": tool_trace_search,
     "trace_context": tool_trace_context,
+    "trace_regflow": tool_trace_regflow,
+    "trace_producer": tool_trace_producer,
+    "trace_semop": tool_trace_semop,
     "write_artifact": tool_write_artifact,
     "list_artifacts": tool_list_artifacts,
     "read_artifact": tool_read_artifact,

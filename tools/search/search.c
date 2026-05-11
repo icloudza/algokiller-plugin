@@ -47,12 +47,20 @@ typedef struct {
 static void usage(FILE *stream) {
     fprintf(stream,
             "Usage:\n"
-            "  ak_search match --file PATH --query TEXT [--from-line N | --before-line N] [--limit N]\n"
-            "  ak_search context --file PATH --line N [--context N]\n"
-            "  ak_search context --file PATH --line N [--before N] [--after N]\n"
-            "  ak_search daemon --file PATH\n"
+            "  ak_search match    --file PATH --query TEXT [--from-line N | --before-line N] [--limit N]\n"
+            "  ak_search context  --file PATH --line N [--context N]\n"
+            "  ak_search context  --file PATH --line N [--before N] [--after N]\n"
+            "  ak_search daemon   --file PATH\n"
+            "  ak_search regflow  --file PATH --reg xN [--from-line N] [--to-line N] [--limit N]\n"
+            "  ak_search producer --file PATH --value 0xVAL --sink-line N [--max-back N]\n"
+            "  ak_search semop    --file PATH (--line N | --from-line N --to-line N) [--limit N]\n"
             "\n"
             "Match mode is ASCII case-insensitive. --before-line searches backward, nearest first.\n"
+            "regflow emits one row per line where the target register receives an output value.\n"
+            "producer scans backward from --sink-line for the most recent instruction whose\n"
+            "  '-> regN=0xVAL' matches --value.\n"
+            "semop classifies each instruction (zero, crypto_candidate, hash_loop_candidate,\n"
+            "  stack_save/restore, memory_load/store, branch, data_move, addr_calc, alu, ...).\n"
             "Output: one JSON object per line with 1-based line numbers.\n");
 }
 
@@ -705,6 +713,428 @@ static int run_context_direct(const MappedFile *mapped,
     return 0;
 }
 
+/* ===========================================================================
+ * Sprint 1 extensions: regflow / producer / semop
+ *
+ * regflow   — emit register output-value sequence for a target register
+ *             over a line range. Uses the GumTrace " -> regN=0xVAL " pattern.
+ *
+ * producer  — find the most recent line that wrote a given value to any
+ *             register, scanning backward from a sink line. Reduces multi-step
+ *             "before_line + bisect" loops the agent does manually.
+ *
+ * semop     — classify each instruction's semantic role (zero / crypto_candidate
+ *             / hash_loop_candidate / stack_save|restore / memory_load|store /
+ *             branch / data_move / addr_calc / alu / unknown). Lets the agent
+ *             prune non-crypto candidates before deep dive.
+ * ===========================================================================
+ */
+
+static const unsigned char *mem_find(const unsigned char *h, size_t hlen,
+                                     const unsigned char *n, size_t nlen) {
+    if (nlen == 0 || hlen < nlen) return NULL;
+    for (size_t i = 0; i + nlen <= hlen; i++) {
+        if (memcmp(h + i, n, nlen) == 0) return h + i;
+    }
+    return NULL;
+}
+
+/* parse_hex_run - read "0x" + hex chars starting at pos, write into out (NUL-term).
+ * Returns ptr just past the last hex digit on success, NULL on failure.
+ */
+static const unsigned char *parse_hex_run(const unsigned char *pos,
+                                          const unsigned char *end,
+                                          char *out, size_t out_sz) {
+    if (end - pos < 2 || pos[0] != '0' || pos[1] != 'x') return NULL;
+    if (out_sz < 3) return NULL;
+    out[0] = '0'; out[1] = 'x';
+    size_t i = 2;
+    const unsigned char *p = pos + 2;
+    while (p < end && i + 1 < out_sz) {
+        unsigned char c = *p;
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) break;
+        out[i++] = (char)c;
+        p++;
+    }
+    if (i == 2) return NULL;
+    out[i] = '\0';
+    return p;
+}
+
+/* Extract the value written to a specific register on a line, by parsing the
+ * "-> regKey0xVAL" portion. regKey example: "x0=" (caller supplies the `=`).
+ * Returns true and fills out_val on success.
+ */
+static bool extract_output_value(LineView line, const char *reg_key,
+                                 char *out_val, size_t out_val_sz) {
+    static const unsigned char arrow[] = " -> ";
+    const unsigned char *a = mem_find(line.start, line.len, arrow, 4);
+    if (a == NULL) return false;
+    const unsigned char *region = a + 4;
+    const unsigned char *end = line.start + line.len;
+    size_t klen = strlen(reg_key);
+    for (const unsigned char *p = region; p + klen <= end; p++) {
+        /* require space or arrow boundary before key */
+        if (p > region && p[-1] != ' ') continue;
+        if (memcmp(p, reg_key, klen) != 0) continue;
+        return parse_hex_run(p + klen, end, out_val, out_val_sz) != NULL;
+    }
+    return false;
+}
+
+/* Find any "-> <reg>=<wanted_value>" on a line; return matched register name in
+ * out_reg (e.g. "x7"). Used by producer search.
+ */
+static bool find_output_reg_for_value(LineView line, const char *wanted_value,
+                                      char *out_reg, size_t out_reg_sz) {
+    static const unsigned char arrow[] = " -> ";
+    const unsigned char *a = mem_find(line.start, line.len, arrow, 4);
+    if (a == NULL) return false;
+    const unsigned char *region = a + 4;
+    const unsigned char *end = line.start + line.len;
+    /* Scan tokens of form "<reg>=0xVAL " */
+    const unsigned char *p = region;
+    while (p < end) {
+        while (p < end && *p == ' ') p++;
+        const unsigned char *tok_start = p;
+        while (p < end && *p != '=' && *p != ' ') p++;
+        if (p >= end || *p != '=') break;
+        const unsigned char *eq = p;
+        p++;
+        char val_buf[64];
+        const unsigned char *after = parse_hex_run(p, end, val_buf, sizeof(val_buf));
+        if (after == NULL) { p++; continue; }
+        if (strcmp(val_buf, wanted_value) == 0) {
+            size_t reg_len = (size_t)(eq - tok_start);
+            if (reg_len + 1 > out_reg_sz) return false;
+            memcpy(out_reg, tok_start, reg_len);
+            out_reg[reg_len] = '\0';
+            return true;
+        }
+        p = after;
+    }
+    return false;
+}
+
+/* Parse mnemonic + operand region from a line of form:
+ *   [WeChat] 0xABS!0xREL mnem operands; ...
+ * Returns false if line doesn't match the expected GumTrace prefix.
+ */
+static bool parse_mnem_and_operands(LineView line,
+                                    const unsigned char **mnem_start, size_t *mnem_len,
+                                    const unsigned char **op_start, size_t *op_len) {
+    if (line.len == 0 || line.start[0] != '[') return false;
+    const unsigned char *bang = mem_find(line.start, line.len, (const unsigned char *)"!", 1);
+    if (bang == NULL) return false;
+    const unsigned char *end = line.start + line.len;
+    const unsigned char *space = NULL;
+    for (const unsigned char *q = bang; q < end; q++) {
+        if (*q == ' ') { space = q; break; }
+    }
+    if (space == NULL) return false;
+    const unsigned char *m = space + 1;
+    if (m >= end) return false;
+    const unsigned char *m_end = m;
+    while (m_end < end && *m_end != ' ' && *m_end != ';') m_end++;
+    *mnem_start = m;
+    *mnem_len = (size_t)(m_end - m);
+    const unsigned char *o = m_end;
+    if (o < end && *o == ' ') o++;
+    const unsigned char *semi = NULL;
+    for (const unsigned char *q = o; q < end; q++) {
+        if (*q == ';') { semi = q; break; }
+    }
+    const unsigned char *o_end = semi != NULL ? semi : end;
+    *op_start = o;
+    *op_len = o_end > o ? (size_t)(o_end - o) : 0;
+    return true;
+}
+
+/* Classify an instruction by mnemonic + operand pattern. */
+static const char *classify_semop(const unsigned char *mnem, size_t mnem_len,
+                                  const unsigned char *op, size_t op_len) {
+    /* branch family */
+    if (mnem_len >= 1 && mnem[0] == 'b') {
+        if (mnem_len == 1) return "branch";
+        if (mnem_len == 2 && (mnem[1] == 'l' || mnem[1] == 'r')) return "branch";
+        if (mnem_len == 3 && memcmp(mnem, "blr", 3) == 0) return "branch";
+        if (mnem_len >= 3 && memcmp(mnem, "b.", 2) == 0) return "branch";
+    }
+    if (mnem_len == 3 && (memcmp(mnem, "cbz", 3) == 0 || memcmp(mnem, "ret", 3) == 0)) return "branch";
+    if (mnem_len == 4 && memcmp(mnem, "cbnz", 4) == 0) return "branch";
+    if (mnem_len == 3 && (memcmp(mnem, "tbz", 3) == 0)) return "branch";
+    if (mnem_len == 4 && (memcmp(mnem, "tbnz", 4) == 0)) return "branch";
+
+    /* stp / ldp: stack save/restore vs generic memory */
+    if (mnem_len == 3 && memcmp(mnem, "stp", 3) == 0) {
+        if (mem_find(op, op_len, (const unsigned char *)"x29, x30", 8) != NULL ||
+            mem_find(op, op_len, (const unsigned char *)"fp, lr", 6) != NULL ||
+            mem_find(op, op_len, (const unsigned char *)"[sp", 3) != NULL) {
+            return "stack_save";
+        }
+        return "memory_store";
+    }
+    if (mnem_len == 3 && memcmp(mnem, "ldp", 3) == 0) {
+        if (mem_find(op, op_len, (const unsigned char *)"x29, x30", 8) != NULL ||
+            mem_find(op, op_len, (const unsigned char *)"fp, lr", 6) != NULL ||
+            mem_find(op, op_len, (const unsigned char *)"[sp", 3) != NULL) {
+            return "stack_restore";
+        }
+        return "memory_load";
+    }
+
+    /* madd / msub — Bernstein / DJB / FNV-style polynomial accumulators */
+    if (mnem_len == 4 && (memcmp(mnem, "madd", 4) == 0 || memcmp(mnem, "msub", 4) == 0)) {
+        return "hash_loop_candidate";
+    }
+    if (mnem_len == 5 && (memcmp(mnem, "smaddl", 6) == 0)) return "hash_loop_candidate";
+
+    /* eor / xor — distinguish zero-self vs crypto candidate */
+    if (mnem_len == 3 && (memcmp(mnem, "eor", 3) == 0 || memcmp(mnem, "xor", 3) == 0)) {
+        char regs[3][32] = {{0}};
+        int reg_idx = 0;
+        size_t reg_len = 0;
+        for (size_t i = 0; i < op_len && reg_idx < 3; i++) {
+            unsigned char ch = op[i];
+            if (ch == ',' || ch == ' ') {
+                if (reg_len > 0) {
+                    regs[reg_idx][reg_len] = '\0';
+                    reg_idx++;
+                    reg_len = 0;
+                }
+            } else {
+                if (reg_len + 1 < sizeof(regs[0])) {
+                    regs[reg_idx][reg_len++] = (char)ch;
+                }
+            }
+        }
+        if (reg_len > 0 && reg_idx < 3) regs[reg_idx][reg_len] = '\0';
+        if (regs[0][0] && regs[1][0] && regs[2][0] &&
+            strcmp(regs[0], regs[1]) == 0 && strcmp(regs[1], regs[2]) == 0) {
+            return "zero";
+        }
+        return "crypto_candidate";
+    }
+
+    /* memory loads/stores */
+    if (mnem_len >= 3 && memcmp(mnem, "ldr", 3) == 0) return "memory_load";
+    if (mnem_len >= 3 && memcmp(mnem, "str", 3) == 0) return "memory_store";
+    if (mnem_len == 4 && (memcmp(mnem, "ldur", 4) == 0)) return "memory_load";
+    if (mnem_len == 4 && (memcmp(mnem, "stur", 4) == 0)) return "memory_store";
+
+    /* address calc */
+    if (mnem_len == 4 && memcmp(mnem, "adrp", 4) == 0) return "addr_calc";
+    if (mnem_len == 3 && memcmp(mnem, "adr", 3) == 0) return "addr_calc";
+
+    /* data movement */
+    if (mnem_len >= 3 && memcmp(mnem, "mov", 3) == 0) return "data_move";
+
+    /* ALU */
+    if (mnem_len == 3 && (memcmp(mnem, "add", 3) == 0 || memcmp(mnem, "sub", 3) == 0 ||
+                          memcmp(mnem, "and", 3) == 0 || memcmp(mnem, "orr", 3) == 0 ||
+                          memcmp(mnem, "mul", 3) == 0 || memcmp(mnem, "neg", 3) == 0 ||
+                          memcmp(mnem, "lsl", 3) == 0 || memcmp(mnem, "lsr", 3) == 0 ||
+                          memcmp(mnem, "asr", 3) == 0 || memcmp(mnem, "ror", 3) == 0)) {
+        return "alu";
+    }
+
+    /* compare */
+    if (mnem_len == 3 && (memcmp(mnem, "cmp", 3) == 0 || memcmp(mnem, "tst", 3) == 0)) return "compare";
+    if (mnem_len == 4 && memcmp(mnem, "subs", 4) == 0) return "compare";
+
+    return "unknown";
+}
+
+static void emit_regflow(uint64_t line_no, const char *value, LineView line) {
+    fputs("{\"type\":\"regflow\",\"line\":", stdout);
+    printf("%" PRIu64, line_no);
+    fputs(",\"value\":", stdout);
+    json_write_cstr(value);
+    fputs(",\"instr\":", stdout);
+    json_write_string(line.start, line.len);
+    fputs("}\n", stdout);
+}
+
+static void emit_producer(uint64_t line_no, const char *reg, const char *value, LineView line) {
+    fputs("{\"type\":\"producer\",\"line\":", stdout);
+    printf("%" PRIu64, line_no);
+    fputs(",\"reg\":", stdout);
+    json_write_cstr(reg);
+    fputs(",\"value\":", stdout);
+    json_write_cstr(value);
+    fputs(",\"instr\":", stdout);
+    json_write_string(line.start, line.len);
+    fputs("}\n", stdout);
+}
+
+static void emit_semop(uint64_t line_no, const unsigned char *mnem, size_t mnem_len,
+                       const char *klass, const unsigned char *op, size_t op_len,
+                       LineView line) {
+    fputs("{\"type\":\"semop\",\"line\":", stdout);
+    printf("%" PRIu64, line_no);
+    fputs(",\"mnem\":", stdout);
+    json_write_string(mnem, mnem_len);
+    fputs(",\"class\":", stdout);
+    json_write_cstr(klass);
+    fputs(",\"operands\":", stdout);
+    json_write_string(op, op_len);
+    fputs(",\"instr\":", stdout);
+    json_write_string(line.start, line.len);
+    fputs("}\n", stdout);
+}
+
+static int run_regflow(const IndexedFile *indexed, const char *reg,
+                       uint64_t from_line, uint64_t to_line, uint64_t limit) {
+    if (limit == 0 || indexed->mapped.size == 0) return 0;
+    if (from_line == 0) from_line = 1;
+    if (to_line == 0 || to_line > indexed->index.count) to_line = indexed->index.count;
+    if (from_line > to_line) return 0;
+
+    char reg_key[40];
+    snprintf(reg_key, sizeof(reg_key), "%s=", reg);
+
+    uint64_t emitted = 0;
+    char value[64];
+    for (uint64_t line_no = from_line; line_no <= to_line && emitted < limit; line_no++) {
+        size_t offset = indexed->index.offsets[line_no - 1];
+        LineView line = line_at_offset(indexed->mapped.data, indexed->mapped.size, offset);
+        if (extract_output_value(line, reg_key, value, sizeof(value))) {
+            emit_regflow(line_no, value, line);
+            emitted++;
+        }
+    }
+    return 0;
+}
+
+static int run_producer(const IndexedFile *indexed, const char *value,
+                        uint64_t sink_line, uint64_t max_back) {
+    if (indexed->mapped.size == 0 || sink_line <= 1) return 0;
+    if (sink_line - 1 > indexed->index.count) sink_line = indexed->index.count + 1;
+    uint64_t start = sink_line - 1;
+    uint64_t end = (max_back == 0 || max_back >= start) ? 1 : start - max_back + 1;
+
+    char reg[32];
+    for (uint64_t line_no = start; line_no >= end; line_no--) {
+        size_t offset = indexed->index.offsets[line_no - 1];
+        LineView line = line_at_offset(indexed->mapped.data, indexed->mapped.size, offset);
+        if (find_output_reg_for_value(line, value, reg, sizeof(reg))) {
+            emit_producer(line_no, reg, value, line);
+            return 0;
+        }
+        if (line_no == 1) break;
+    }
+    return 0;
+}
+
+static int run_semop_range(const IndexedFile *indexed, uint64_t from_line,
+                           uint64_t to_line, uint64_t limit) {
+    if (limit == 0 || indexed->mapped.size == 0) return 0;
+    if (from_line == 0) from_line = 1;
+    if (to_line == 0 || to_line > indexed->index.count) to_line = indexed->index.count;
+    if (from_line > to_line) return 0;
+
+    uint64_t emitted = 0;
+    for (uint64_t line_no = from_line; line_no <= to_line && emitted < limit; line_no++) {
+        size_t offset = indexed->index.offsets[line_no - 1];
+        LineView line = line_at_offset(indexed->mapped.data, indexed->mapped.size, offset);
+        const unsigned char *mnem, *op;
+        size_t mnem_len, op_len;
+        if (!parse_mnem_and_operands(line, &mnem, &mnem_len, &op, &op_len)) continue;
+        const char *klass = classify_semop(mnem, mnem_len, op, op_len);
+        emit_semop(line_no, mnem, mnem_len, klass, op, op_len, line);
+        emitted++;
+    }
+    return 0;
+}
+
+static int cmd_regflow(int argc, char **argv) {
+    const char *path = NULL;
+    const char *reg = NULL;
+    uint64_t from_line = 0, to_line = 0, limit = 100;
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--file") == 0 && i + 1 < argc) path = argv[++i];
+        else if (strcmp(argv[i], "--reg") == 0 && i + 1 < argc) reg = argv[++i];
+        else if (strcmp(argv[i], "--from-line") == 0 && i + 1 < argc) {
+            if (!parse_u64(argv[++i], &from_line)) { fprintf(stderr, "invalid --from-line\n"); return 2; }
+        }
+        else if (strcmp(argv[i], "--to-line") == 0 && i + 1 < argc) {
+            if (!parse_u64(argv[++i], &to_line)) { fprintf(stderr, "invalid --to-line\n"); return 2; }
+        }
+        else if (strcmp(argv[i], "--limit") == 0 && i + 1 < argc) {
+            if (!parse_u64(argv[++i], &limit)) { fprintf(stderr, "invalid --limit\n"); return 2; }
+        }
+        else { usage(stderr); return 2; }
+    }
+    if (path == NULL || reg == NULL || reg[0] == '\0') { usage(stderr); return 2; }
+
+    IndexedFile indexed;
+    if (indexed_file_open(path, &indexed) != 0) return 1;
+    int result = run_regflow(&indexed, reg, from_line, to_line, limit);
+    indexed_file_close(&indexed);
+    return result;
+}
+
+static int cmd_producer(int argc, char **argv) {
+    const char *path = NULL;
+    const char *value = NULL;
+    uint64_t sink_line = 0, max_back = 100000;
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--file") == 0 && i + 1 < argc) path = argv[++i];
+        else if (strcmp(argv[i], "--value") == 0 && i + 1 < argc) value = argv[++i];
+        else if (strcmp(argv[i], "--sink-line") == 0 && i + 1 < argc) {
+            if (!parse_u64(argv[++i], &sink_line) || sink_line == 0) {
+                fprintf(stderr, "invalid --sink-line\n"); return 2;
+            }
+        }
+        else if (strcmp(argv[i], "--max-back") == 0 && i + 1 < argc) {
+            if (!parse_u64(argv[++i], &max_back)) { fprintf(stderr, "invalid --max-back\n"); return 2; }
+        }
+        else { usage(stderr); return 2; }
+    }
+    if (path == NULL || value == NULL || value[0] == '\0' || sink_line == 0) {
+        usage(stderr); return 2;
+    }
+
+    IndexedFile indexed;
+    if (indexed_file_open(path, &indexed) != 0) return 1;
+    int result = run_producer(&indexed, value, sink_line, max_back);
+    indexed_file_close(&indexed);
+    return result;
+}
+
+static int cmd_semop(int argc, char **argv) {
+    const char *path = NULL;
+    uint64_t line = 0, from_line = 0, to_line = 0, limit = 100;
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--file") == 0 && i + 1 < argc) path = argv[++i];
+        else if (strcmp(argv[i], "--line") == 0 && i + 1 < argc) {
+            if (!parse_u64(argv[++i], &line)) { fprintf(stderr, "invalid --line\n"); return 2; }
+        }
+        else if (strcmp(argv[i], "--from-line") == 0 && i + 1 < argc) {
+            if (!parse_u64(argv[++i], &from_line)) { fprintf(stderr, "invalid --from-line\n"); return 2; }
+        }
+        else if (strcmp(argv[i], "--to-line") == 0 && i + 1 < argc) {
+            if (!parse_u64(argv[++i], &to_line)) { fprintf(stderr, "invalid --to-line\n"); return 2; }
+        }
+        else if (strcmp(argv[i], "--limit") == 0 && i + 1 < argc) {
+            if (!parse_u64(argv[++i], &limit)) { fprintf(stderr, "invalid --limit\n"); return 2; }
+        }
+        else { usage(stderr); return 2; }
+    }
+    if (path == NULL) { usage(stderr); return 2; }
+    if (line == 0 && from_line == 0 && to_line == 0) {
+        fprintf(stderr, "semop requires --line, or --from-line + --to-line\n");
+        return 2;
+    }
+    if (line != 0) { from_line = line; to_line = line; }
+
+    IndexedFile indexed;
+    if (indexed_file_open(path, &indexed) != 0) return 1;
+    int result = run_semop_range(&indexed, from_line, to_line, limit);
+    indexed_file_close(&indexed);
+    return result;
+}
+
 static int cmd_match(int argc, char **argv) {
     const char *path = NULL;
     const char *query = NULL;
@@ -955,6 +1385,15 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "daemon") == 0) {
         return cmd_daemon(argc, argv);
+    }
+    if (strcmp(argv[1], "regflow") == 0) {
+        return cmd_regflow(argc, argv);
+    }
+    if (strcmp(argv[1], "producer") == 0) {
+        return cmd_producer(argc, argv);
+    }
+    if (strcmp(argv[1], "semop") == 0) {
+        return cmd_semop(argc, argv);
     }
     usage(stderr);
     return 2;
