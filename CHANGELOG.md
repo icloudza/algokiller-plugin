@@ -6,6 +6,94 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.9.2] — Loop-body crypto constants + trace-ui borrowed algorithms
+
+Comparative analysis against [imj01y/trace-ui](https://github.com/imj01y/trace-ui)
+surfaced a fundamental scan-strategy gap in algokiller's v0.5-v0.9.1
+`constscan`:
+
+> Pre-v0.9.2 the fingerprint table biased toward INIT-time constants
+> (IVs, state vectors, sigma, FK). The init constants appear ONCE per
+> algorithm run; the loop-body constants (MD5 T-table, SHA-256 K-table,
+> SM3 T_j) are referenced 64× per block compression. Active-hash traces
+> were therefore matched on the lowest-density signal possible — and on
+> short traces or hardened binaries the IV would miss entirely while
+> the loop-body constants were sitting right there unscanned.
+
+This release closes that strategy gap.
+
+### Added — 24 new fingerprints (71 → 95)
+
+- **MD5.T[1..4]** (RFC 1321 §3.4): `0xd76aa478` `0xe8c7b756`
+  `0x242070db` `0xc1bdceee`. T-table = floor(|sin(i)| * 2^32) — hit
+  64× per block compression vs A/B/C/D IVs which hit once.
+- **SHA-256.K[0..7]** (FIPS 180-4 §4.2.2): `0x428a2f98` `0x71374491`
+  `0xb5c0fbcf` `0xe9b5dba5` `0x3956c25b` `0x59f111f1` `0x923f82a4`
+  `0xab1c5ed5`. K[0..63] are first 32 bits of cube roots of first 64
+  primes; loaded 64× per block compression.
+- **SM3.T_j[0..15]** = `0x79cc4519`, **SM3.T_j[16..63]** = `0x7a879d8a`
+  (GM/T 0004-2012 §5.4). Two round constants covering all 64 rounds.
+- **HMAC.ipad** = `0x36363636`, **HMAC.opad** = `0x5c5c5c5c`
+  (RFC 2104 §2). Token-signing / API-auth signal — high-value for the
+  common WeChat-style X-Sign / X-Token reverse-engineering target.
+- **DES** (FIPS 46-3) — `DES.const0` / `const1` / `shifted0` /
+  `shifted1` + `DES.sbox_word[0..3]`. Imported from trace-ui's 28-magic
+  table; marked **FP_WEAK** (const0/const1/shifted0/shifted1) and
+  **FP_MEDIUM** (sbox_word) pending independent verification on a real
+  DES trace. Comment in the C table explicitly says: corroborate with
+  `bl/blr` to `des_*` / `3des` / `triple_des` call symbols before
+  naming DES as the algorithm.
+
+### Added — Native test coverage
+
+- `tools/search/tests/fixtures/v092-constscan.trace` — 24-line
+  synthetic trace exercising every new fingerprint via `mov w?, #imm`
+  (load_imm verdict path). Locks each new entry against schema drift.
+- `tools/search/tests/run_tests.sh` — 14 new `assert_contains`
+  assertions for the v0.9.2 batch. Native test count 132 → **146 PASS**
+  (0 FAIL).
+
+### Notes — What was NOT borrowed from trace-ui
+
+trace-ui ships 28 algorithm-name buckets vs algokiller's 95-entry
+classified fingerprint table. The other 5 algorithms trace-ui covers
+(Twofish / Blowfish / RC6 / Camellia / Serpent / Threefish) are
+**deferred to 0.9.3+** pending real-sample demand — the China-internet
+SDK landscape this plugin targets rarely uses these.
+
+trace-ui's parallel chunked scan + disk cache is a real performance
+win on multi-GB traces but is **deferred to 0.9.4+**: it's a
+performance optimisation, not a correctness one, and the Tool
+Reliability First pivot from v0.9.1 still applies.
+
+trace-ui does NOT have:
+
+- Per-hit `verdict` classification (real / weak / alu_only — the
+  algokiller v0.5 contribution that catches ALU collisions like
+  `0x9e3779b9 = TEA delta + TEA delta`).
+- `category` taxonomy or `confidence` levels.
+- ARM Crypto Extensions HW instruction scan (`trace_cryptoinstr`).
+- Endian variant exploration (`trace_bytes`).
+- Co-occurrence corroboration verdict (FIX F-5 in v0.9.1).
+- Hypothesis Ledger anti-hallucination scaffold.
+
+algokiller is keeping all of those.
+
+### Changed
+
+- Plugin version: `0.9.1` → `0.9.2`.
+- README.md / README.en.md / tools/search/README.md /
+  skills/ciphertext-recovery/SKILL.md — fingerprint count 71 → 95;
+  native test count 132 → 146.
+
+### Deferred — unchanged from v0.9.1
+
+The original v0.9.1 deferred items (F-4 constscan adrp+ldr,
+F-6 hexblock nested depth, F-9 fold samples_per_fold, F-15 hexblock
+direction, A-3 daemon extcall) are now **rebadged 0.9.3** — they
+require deeper C-engine work than v0.9.2's table additions and
+warrant their own focused release.
+
 ## [0.9.1] — Anti-hallucination layer 4 + tool-semantics correction batch
 
 External 29-point code-review surfaced two damaging gaps that the

@@ -17,7 +17,7 @@ description: ARM64 trace 密文还原方法论。当用户给出一段 ARM64 执
 
 **🔍 体检与总览（bind_trace 之后第一波必做）**
 - `algokiller.trace_lint`：单遍扫 trace 得 JSON 体检——行数/模块分布/Top-K mnemonic/call_func 块数/有无寄存器观察/format_ok + warnings。先调一次，确认 trace 格式可用、结构画像清晰。
-- `algokiller.trace_constscan`：扫 71 个密码学常数指纹（MD5/SHA-1/SHA-256/SHA-512/SM3/SHA-3/CRC32/FNV1a/AES sbox/AES Te0/SM4/ChaCha20/TEA/Whirlpool/Poly1305/SipHash + P-256/secp256k1/Ed25519/Curve25519）。**必看 `verdict` 字段而不是 `total_hits`**：`real` = load_imm 或 mem_r 真信号；`alu_only` = ALU 运算碰撞假阳，必须忽略；`weak` = 仅 mem_w/mem_r_addr 间接信号。每个命中带 `evidence` 分项（load_imm / mem_r / alu / ...）和 `sample_lines` 锚点。`category` 分类：hash / cipher_sym / ecc / crc / mac；`confidence` 分级：strong / medium / weak。
+- `algokiller.trace_constscan`：扫 **95 个**密码学常数指纹（MD5 init+T 表/SHA-1/SHA-256 init+K 表/SHA-512/SM3 init+T_j 轮常数/SHA-3/CRC32/FNV1a/AES sbox/AES Te0/SM4/ChaCha20/TEA/DES SP-box/Whirlpool/Poly1305/SipHash/**HMAC ipad-opad** + P-256/secp256k1/Ed25519/Curve25519）。**v0.9.2 关键升级**:除 IV 外还扫**主循环常数**(MD5 T 表 / SHA-256 K 表 / SM3 T_j),它们每个 block 命中 64 次而 IV 只命中 1 次——活跃 hash trace 的真实信号密度由这些主循环常数主导。**必看 `verdict` 字段而不是 `total_hits`**：`real` = load_imm 或 mem_r 真信号；`alu_only` = ALU 运算碰撞假阳，必须忽略；`weak` = 仅 mem_w/mem_r_addr 间接信号。每个命中带 `evidence` 分项（load_imm / mem_r / alu / ...）和 `sample_lines` 锚点。`category` 分类：hash / cipher_sym / ecc / crc / mac；`confidence` 分级：strong / medium / weak。
 - `algokiller.trace_cryptoinstr`：扫 ARM Crypto Extensions 硬件加密指令（AES `aese/aesmc/aesd/aesimc`、SHA-1 `sha1c/m/p/h/su0/su1`、SHA-256 `sha256h/h2/su0/su1`、SHA-512 `sha512h/h2/su0/su1`、SHA-3 `eor3/rax1/xar/bcax`、GHASH `pmull/pmull2`、SM3 `sm3*`、SM4 `sm4e/sm4ekey`）。**这是 constscan 的盲区补丁**：当 binary 走硬件加密（iOS CryptoKit / BoringSSL ARM / libsodium-arm / Android Keystore HW path / iPhone 5s+ 默认），软件 sbox/常数完全消失——只有硬件指令本身能识别。**必须 constscan + cryptoinstr 一起跑**：如果 constscan 报 AES.Te0 = 0 但 cryptoinstr 报 aese hits > 0，那就是 AES-NI 在跑，不是没加密。
 - `algokiller.trace_callgraph --top N`：Top-K 最常被调的 `call func: NAME(args)` 符号 + 计数。一眼看见热路径（malloc/memcpy/objc_msgSend/CCCrypt/...）。
 - `algokiller.trace_modgraph --top N`：跨模块跳转矩阵。看 caller_mod → callee_mod 邻接 + 边权重，定位密码学边界（如 WeChat → openssl / metasec → libc++）。
@@ -54,7 +54,7 @@ description: ARM64 trace 密文还原方法论。当用户给出一段 ARM64 执
 **bind_trace 后第一波动作（务必按序）**：
 
 1. `trace_lint` —— 确认 trace 是合法 GumTrace 格式（`format_ok: true`）、模块分布、有无 `call_func_blocks` / 寄存器观察。如果 `warnings` 非空、`format_ok: false`，立即向用户报告并停止——别在残废 trace 上烧 token。
-2. `trace_constscan` —— 拿软件密码学算法清单（71 个常数指纹）。**必须按 `verdict` 字段过滤**：
+2. `trace_constscan` —— 拿软件密码学算法清单(95 个常数指纹,v0.9.2 起包含主循环常数)。**必须按 `verdict` 字段过滤**：
    - 只信 `verdict: "real"`（load_imm > 0 或 mem_r > 0）的指纹。
    - **明确忽略 `verdict: "alu_only"`**——这些是 ALU 运算碰撞的假阳。例如 0x9e3779b9（TEA delta）加自己等于 0x3c6ef372（SHA-256.h2）——agent 必须看 verdict 不被 total_hits 误导。
    - `verdict: "weak"` 仅作为辅助提示。

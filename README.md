@@ -42,7 +42,7 @@ claude plugin update algokiller@algokiller-suite
    - 数据流：`trace_regflow`（寄存器演化）/ `trace_producer`（找值的最近写入者）/ `trace_semop`（指令语义分类，11 类）
    - 体检与降噪：`trace_lint`（一遍 JSON 体检）/ `trace_fold`（block-aware 折叠，115 MB → 1.1 MB）
    - 调用图：`trace_callgraph`（Top-K / xref）/ `trace_modgraph`（跨模块矩阵）/ `trace_hexblock`（call+args+hexdump+ret 结构化）
-   - 密码学指纹：`trace_constscan`（71 个 hash/cipher/ecc/crc/mac 常数，带 real/weak/alu_only verdict 分级）/ `trace_cryptoinstr`（ARM Crypto Extensions 硬件指令：AES/SHA-1/SHA-256/SHA-512/SHA-3/SM3/SM4/GHASH）/ `trace_bytes`（hex 字面量含自动反序）
+   - 密码学指纹：`trace_constscan`（**95 个** hash/cipher/ecc/crc/mac 常数,v0.9.2 起含 MD5 T 表 / SHA-256 K 表 / SM3 round constants / HMAC ipad/opad / DES SP-box,带 real/weak/alu_only verdict 分级）/ `trace_cryptoinstr`（ARM Crypto Extensions 硬件指令：AES/SHA-1/SHA-256/SHA-512/SHA-3/SM3/SM4/GHASH）/ `trace_bytes`（hex 字面量含自动反序）
    - 静态分析：`run_static_tool` —— 白名单调用系统 CLI（radare2 / binutils / LLVM / jtool2 / class-dump / ripgrep / jq）
 4. **反漂移注入**
    - 每次工具返回带 `discipline_reminder`；每 20 次附 `discipline_full_reinjection` 完整规则段

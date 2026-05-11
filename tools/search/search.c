@@ -2240,6 +2240,20 @@ static const Fingerprint FINGERPRINTS[] = {
     {"MD5.C",                "hash",       FP_STRONG, "0x98badcfe"},
     {"MD5.D",                "hash",       FP_STRONG, "0x10325476"},
 
+    /* ---- Hash: MD5 T table — RFC 1321 §3.4 step 4
+     *      T[i] = floor( |sin(i)| * 2^32 )  for i ∈ [1, 64]
+     *
+     *      v0.9.2 addition (closes a major scan-strategy blind spot):
+     *      The 4 IVs above appear ONCE per MD5 init. The T table is
+     *      referenced 64 times per block compression — so on any real
+     *      MD5 trace the T-table constants saturate hit counts while the
+     *      IVs barely register. Adding the first 4 T-words is enough
+     *      sentinel; full T[1..64] is in RFC 1321 Appendix A. */
+    {"MD5.T[1]",             "hash",       FP_STRONG, "0xd76aa478"},
+    {"MD5.T[2]",             "hash",       FP_STRONG, "0xe8c7b756"},
+    {"MD5.T[3]",             "hash",       FP_STRONG, "0x242070db"},
+    {"MD5.T[4]",             "hash",       FP_STRONG, "0xc1bdceee"},
+
     /* ---- Hash: SHA-1 ---- */
     {"SHA1.h4",              "hash",       FP_STRONG, "0xc3d2e1f0"},
     {"SHA1.K[0..19]",        "hash",       FP_STRONG, "0x5a827999"},
@@ -2256,6 +2270,23 @@ static const Fingerprint FINGERPRINTS[] = {
     {"SHA256.h5",            "hash",       FP_MEDIUM, "0x9b05688c"},
     {"SHA256.h6",            "hash",       FP_MEDIUM, "0x1f83d9ab"},
     {"SHA256.h7",            "hash",       FP_MEDIUM, "0x5be0cd19"},
+
+    /* ---- Hash: SHA-256 K table — FIPS 180-4 §4.2.2
+     *      K[i] = first 32 bits of fractional parts of cube roots of
+     *      first 64 primes.
+     *
+     *      v0.9.2 addition (same blind-spot fix as MD5.T): K is read 64
+     *      times per block compression. Active SHA-256 traces will hit
+     *      K-words far more frequently than IVs. We track K[0..7] as
+     *      sentinel; full K[0..63] is in FIPS 180-4 Appendix A. */
+    {"SHA256.K[0]",          "hash",       FP_STRONG, "0x428a2f98"},
+    {"SHA256.K[1]",          "hash",       FP_STRONG, "0x71374491"},
+    {"SHA256.K[2]",          "hash",       FP_STRONG, "0xb5c0fbcf"},
+    {"SHA256.K[3]",          "hash",       FP_STRONG, "0xe9b5dba5"},
+    {"SHA256.K[4]",          "hash",       FP_STRONG, "0x3956c25b"},
+    {"SHA256.K[5]",          "hash",       FP_STRONG, "0x59f111f1"},
+    {"SHA256.K[6]",          "hash",       FP_STRONG, "0x923f82a4"},
+    {"SHA256.K[7]",          "hash",       FP_STRONG, "0xab1c5ed5"},
 
     /* ---- Hash: SHA-512 (BLAKE2b IV identical → medium, ambiguous algorithm) */
     {"SHA512.h0",            "hash",       FP_MEDIUM, "0x6a09e667f3bcc908"},
@@ -2276,6 +2307,14 @@ static const Fingerprint FINGERPRINTS[] = {
     {"SM3.IV5",              "hash",       FP_STRONG, "0x163138aa"},
     {"SM3.IV6",              "hash",       FP_STRONG, "0xe38dee4d"},
     {"SM3.IV7",              "hash",       FP_STRONG, "0xb0fb0e4e"},
+
+    /* ---- Hash: SM3 round constants T_j (GM/T 0004-2012 §5.4)
+     *      T_j = 0x79CC4519     for j ∈ [0, 15]
+     *      T_j = 0x7A879D8A     for j ∈ [16, 63]
+     *      These appear ~64 times per block (loop-body) vs IVs which
+     *      appear once at init. v0.9.2 blind-spot fix. */
+    {"SM3.T_j[0..15]",       "hash",       FP_STRONG, "0x79cc4519"},
+    {"SM3.T_j[16..63]",      "hash",       FP_STRONG, "0x7a879d8a"},
 
     /* ---- Hash: SHA-3 / Keccak round constants (skip RC[0]=0x01, too generic) */
     {"SHA3.RC[1]",           "hash",       FP_STRONG, "0x0000000000008082"},
@@ -2318,6 +2357,28 @@ static const Fingerprint FINGERPRINTS[] = {
     /* ---- Cipher hint: Whirlpool S-box first 4 bytes ---- */
     {"Whirlpool.S[0..3]",    "cipher_sym", FP_WEAK,   "0x18233481"},
 
+    /* ---- Cipher: DES (FIPS 46-3) — implementation-specific tables
+     *
+     *      v0.9.2: imported from imj01y/trace-ui (28-magic table). DES
+     *      has no built-in IV — the const0/const1/shifted0/shifted1
+     *      values below come from a specific DES library's precomputed
+     *      PC / SP-box tables and do NOT appear in the FIPS spec text
+     *      directly. We add them as FP_WEAK pending verification on a
+     *      real DES trace + corroboration with bl/blr to des_* /
+     *      3des / triple_des call symbols.
+     *
+     *      DES.sbox_word[0..3] are the first 4 32-bit words of the
+     *      combined SP-box (S-box + P-permutation, a common
+     *      optimisation seen in libgcrypt / PolarSSL / mbedTLS DES). */
+    {"DES.const0",           "cipher_sym", FP_WEAK,   "0xfee1a2b3"},
+    {"DES.const1",           "cipher_sym", FP_WEAK,   "0xd7bef080"},
+    {"DES.shifted0",         "cipher_sym", FP_WEAK,   "0x3a322a22"},
+    {"DES.shifted1",         "cipher_sym", FP_WEAK,   "0x2a223a32"},
+    {"DES.sbox_word[0]",     "cipher_sym", FP_MEDIUM, "0x2c1e241b"},
+    {"DES.sbox_word[1]",     "cipher_sym", FP_MEDIUM, "0x5a7f361d"},
+    {"DES.sbox_word[2]",     "cipher_sym", FP_MEDIUM, "0x3d4793c6"},
+    {"DES.sbox_word[3]",     "cipher_sym", FP_MEDIUM, "0x0b0eedf8"},
+
     /* ---- MAC: Poly1305 r-mask clamp (RFC 8439 §2.5)
      *      r &= 0x0ffffffc0ffffffc0ffffffc0fffffff
      *      Split into two 64-bit limbs (BE word order). */
@@ -2329,6 +2390,15 @@ static const Fingerprint FINGERPRINTS[] = {
      *      Python str, libcrypto). */
     {"SipHash.k0",           "mac",        FP_STRONG, "0x736f6d6570736575"},
     {"SipHash.k1",           "mac",        FP_STRONG, "0x646f72616e646f6d"},
+
+    /* ---- MAC: HMAC ipad / opad (RFC 2104 §2)
+     *      ipad = 0x36 repeated 64×, opad = 0x5c repeated 64×.
+     *      As 32-bit words: 0x36363636 / 0x5c5c5c5c. These appear in
+     *      both the unmasked init and (after XOR) in the working buffer
+     *      of any HMAC-* construction (HMAC-SHA1, HMAC-SHA256, etc).
+     *      High-value signal for token-signing / API-auth flows. */
+    {"HMAC.ipad",            "mac",        FP_STRONG, "0x36363636"},
+    {"HMAC.opad",            "mac",        FP_STRONG, "0x5c5c5c5c"},
 
     /* ---- CRC: 32-bit polynomial constants ---- */
     {"CRC32.poly_reflected", "crc",        FP_STRONG, "0xedb88320"},

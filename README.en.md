@@ -42,7 +42,7 @@ claude plugin update algokiller@algokiller-suite
    - Data flow: `trace_regflow` (register-value evolution) / `trace_producer` (nearest writer of a value) / `trace_semop` (11-class instruction classifier)
    - Health & volume: `trace_lint` (one-pass JSON summary) / `trace_fold` (block-aware folding, 115 MB → 1.1 MB)
    - Call graph: `trace_callgraph` (Top-K / xref) / `trace_modgraph` (cross-module matrix) / `trace_hexblock` (structured call+args+hexdump+ret)
-   - Crypto fingerprints: `trace_constscan` (71 hash / cipher / ecc / crc / mac constants with real/weak/alu_only verdict classification) / `trace_cryptoinstr` (ARM Crypto Extensions hardware instructions: AES / SHA-1 / SHA-256 / SHA-512 / SHA-3 / SM3 / SM4 / GHASH) / `trace_bytes` (hex literal + auto byte-reverse)
+   - Crypto fingerprints: `trace_constscan` (**95** hash / cipher / ecc / crc / mac constants — v0.9.2 added MD5 T-table / SHA-256 K-table / SM3 round constants / HMAC ipad-opad / DES SP-box; each hit carries a real/weak/alu_only verdict) / `trace_cryptoinstr` (ARM Crypto Extensions hardware instructions: AES / SHA-1 / SHA-256 / SHA-512 / SHA-3 / SM3 / SM4 / GHASH) / `trace_bytes` (hex literal + auto byte-reverse)
    - Static analysis: `run_static_tool` — allow-listed system CLIs (radare2 / binutils / LLVM / jtool2 / class-dump / ripgrep / jq)
 4. **Anti-drift reinjection**
    - Every tool return carries `discipline_reminder`; every 20 calls also includes `discipline_full_reinjection`
