@@ -329,6 +329,31 @@ assert_contains "SipHash.k0 present" '"fingerprint":"SipHash.k0"' "$out"
 count=$(printf '%s\n' "$out" | grep -c '"fingerprint":"BKDR.mul131"' || true)
 assert_eq "BKDR.mul131 fingerprint removed (0 occurrences)" "0" "$count"
 
+# v0.9.2 additions — 24 new round-constant / HMAC / DES fingerprints.
+# Fixture exercises every new entry exactly once via load_imm (mov w?, #imm).
+S92=tests/fixtures/v092-constscan.trace
+out=$($BIN constscan --file "$S92" --samples 1)
+# MD5 T table — loop-body constants (closes the IV-only blind spot for MD5)
+assert_contains "v0.9.2 MD5.T[1] hit"         '"fingerprint":"MD5.T[1]"' "$out"
+assert_contains "v0.9.2 MD5.T[2] hit"         '"fingerprint":"MD5.T[2]"' "$out"
+assert_contains "v0.9.2 MD5.T[3] hit"         '"fingerprint":"MD5.T[3]"' "$out"
+assert_contains "v0.9.2 MD5.T[4] hit"         '"fingerprint":"MD5.T[4]"' "$out"
+# SHA-256 K table — loop-body constants (closes the IV-only blind spot for SHA-256)
+assert_contains "v0.9.2 SHA256.K[0] hit"      '"fingerprint":"SHA256.K[0]"' "$out"
+assert_contains "v0.9.2 SHA256.K[1] hit"      '"fingerprint":"SHA256.K[1]"' "$out"
+assert_contains "v0.9.2 SHA256.K[7] hit"      '"fingerprint":"SHA256.K[7]"' "$out"
+# SM3 round constants — T_j[0..15] vs T_j[16..63]
+assert_contains "v0.9.2 SM3.T_j[0..15] hit"   '"fingerprint":"SM3.T_j[0..15]"' "$out"
+assert_contains "v0.9.2 SM3.T_j[16..63] hit"  '"fingerprint":"SM3.T_j[16..63]"' "$out"
+# HMAC ipad/opad — token-signing detection
+assert_contains "v0.9.2 HMAC.ipad hit"        '"fingerprint":"HMAC.ipad"' "$out"
+assert_contains "v0.9.2 HMAC.opad hit"        '"fingerprint":"HMAC.opad"' "$out"
+# DES constants (imported trace-ui table, FP_WEAK pending real-trace verification)
+assert_contains "v0.9.2 DES.const0 hit"       '"fingerprint":"DES.const0"' "$out"
+assert_contains "v0.9.2 DES.sbox_word[0] hit" '"fingerprint":"DES.sbox_word[0]"' "$out"
+# Verdict on the new round constants: load_imm → real
+assert_contains "v0.9.2 new fingerprints classified real" '"verdict":"real"' "$out"
+
 # -----------------------------------------------------------------------------
 echo "[test] new: bytes"
 
