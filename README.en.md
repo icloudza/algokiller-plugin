@@ -4,6 +4,9 @@
 
 Claude Desktop plugin for ARM64 trace evidence analysis and cipher/algorithm recovery. Bundles the AlgoKiller methodology as skills, with a local MCP server driving the native `ak_search` engine over GB-scale traces.
 
+> **Upstream methodology & `ak_search` engine**: [AlgoKiller](https://github.com/lidongyooo/AlgoKiller) by [@lidongyooo](https://github.com/lidongyooo)
+> This repo is the Claude Desktop plugin wrapper; all methodology, the native engine, and the original harness belong to the upstream author.
+
 ---
 
 ## Capabilities
@@ -54,7 +57,7 @@ After install you should see `algokiller` under **Plugins** and `/algokiller:cip
 
 ## How to generate a trace
 
-This plugin expects the trace format produced by **[GumTrace](https://github.com/lidongyooo/GumTrace)** — an ARM64 dynamic instruction tracer built on the Frida Gum Stalker engine (334⭐, by [@lidongyooo](https://github.com/lidongyooo)).
+This plugin expects the trace format produced by **[GumTrace](https://github.com/lidongyooo/GumTrace)** — an ARM64 dynamic instruction tracer built on the Frida Gum Stalker engine, by [@lidongyooo](https://github.com/lidongyooo).
 
 | Aspect | Detail |
 |---|---|

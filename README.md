@@ -4,6 +4,9 @@
 
 面向 ARM64 trace 证据分析与算法/密文还原的 **Claude Desktop plugin**。把 AlgoKiller 方法论打包为 skill，配本地 MCP server 驱动 native `ak_search` 引擎，专攻 GB 级 trace。
 
+> **方法论与 `ak_search` 引擎原作**：[AlgoKiller](https://github.com/lidongyooo/AlgoKiller) by [@lidongyooo](https://github.com/lidongyooo)
+> 本仓库是其 Claude Desktop plugin 封装，所有方法论、native 引擎、原始 harness 归原作者所有。
+
 ---
 
 ## 能力
@@ -54,7 +57,7 @@ zip -r algokiller-plugin.zip algokiller-plugin -x '*.pyc' '__pycache__/*'
 
 ## 如何生成 trace
 
-本 plugin 期待的 trace 格式由配套采集器 **[GumTrace](https://github.com/lidongyooo/GumTrace)** 生成 —— 基于 Frida Gum Stalker 引擎的 ARM64 动态指令追踪工具（334⭐，作者 [@lidongyooo](https://github.com/lidongyooo)）。
+本 plugin 期待的 trace 格式由配套采集器 **[GumTrace](https://github.com/lidongyooo/GumTrace)** 生成 —— 基于 Frida Gum Stalker 引擎的 ARM64 动态指令追踪工具，作者 [@lidongyooo](https://github.com/lidongyooo)。
 
 | 维度 | 说明 |
 |---|---|
