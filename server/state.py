@@ -31,6 +31,7 @@ class SessionState:
         self.daemon = None
         self.tool_call_count: int = 0
         self.artifacts_dir: Optional[Path] = None
+        self.ledger = None  # HypothesisLedger, initialised on bind()
 
     def bind(self, trace_path: Path, mode: str) -> None:
         self.trace_file = trace_path
@@ -39,6 +40,13 @@ class SessionState:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.artifacts_dir = ARTIFACTS_ROOT / self.trace_basename / timestamp
         self.artifacts_dir.mkdir(parents=True, exist_ok=True)
+        # Lazy import to avoid circular dependency with algokiller_mcp.
+        # New per-session ledger — never carries state across bind() calls.
+        from hypothesis import HypothesisLedger
+        self.ledger = HypothesisLedger(
+            artifacts_dir=self.artifacts_dir,
+            get_tool_call_count=lambda: self.tool_call_count,
+        )
 
     def bump_tool_call(self) -> int:
         self.tool_call_count += 1

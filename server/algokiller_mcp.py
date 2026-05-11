@@ -366,6 +366,114 @@ TOOLS: list[dict[str, Any]] = [
             },
         },
     },
+    # ---- Hypothesis Ledger (anti-hallucination reasoning scaffold) ---------
+    {
+        "name": "hypothesis_add",
+        "description": (
+            "Create a new active hypothesis in the session's reasoning ledger. Every "
+            "claim you intend to put in a final deliverable MUST be backed by a "
+            "concluded hypothesis. Each hypothesis MUST declare a falsification_plan "
+            "(which experiment would refute it). Supporting/contradicting evidence "
+            "must cite real tool_call_ids from this session (look at the _tool_call_id "
+            "field returned by every other tool). The ledger is the anti-hallucination "
+            "scaffold: it stops the agent from giving structured-looking but "
+            "unsupported conclusions."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "statement": {"type": "string", "description": "One-sentence hypothesis. >=6 chars."},
+                "confidence": {"type": "string", "enum": ["unknown", "low", "medium", "high"],
+                               "description": "Initial confidence; start at unknown/low unless evidence already gathered."},
+                "falsification_plan": {"type": "string",
+                                       "description": "Required. Which tool + which result would refute this hypothesis? >=10 chars."},
+                "supporting": {"type": "array", "items": {"type": "object",
+                               "properties": {"tool_call_id": {"type": "integer"},
+                                              "summary": {"type": "string"},
+                                              "line_range": {"type": "array"},
+                                              "note": {"type": "string"}},
+                               "required": ["tool_call_id", "summary"]}},
+                "contradicting": {"type": "array", "items": {"type": "object",
+                                  "properties": {"tool_call_id": {"type": "integer"},
+                                                 "summary": {"type": "string"},
+                                                 "line_range": {"type": "array"},
+                                                 "note": {"type": "string"}},
+                                  "required": ["tool_call_id", "summary"]}},
+                "depends_on": {"type": "array", "items": {"type": "string"},
+                               "description": "Hypothesis ids this depends on, e.g. ['H1']."},
+                "next_experiment": {"type": "string", "description": "Optional. What tool you plan to run next to advance this."},
+            },
+            "required": ["statement", "confidence", "falsification_plan"],
+        },
+    },
+    {
+        "name": "hypothesis_update",
+        "description": (
+            "Append evidence or revise confidence on an active hypothesis. To mark "
+            "the falsification experiment as performed, pass falsification_attempted=true. "
+            "All evidence tool_call_ids must be real."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "Hypothesis id, e.g. 'H1'."},
+                "confidence": {"type": "string", "enum": ["unknown", "low", "medium", "high"]},
+                "add_supporting": {"type": "array", "items": {"type": "object"}},
+                "add_contradicting": {"type": "array", "items": {"type": "object"}},
+                "next_experiment": {"type": "string"},
+                "falsification_attempted": {"type": "boolean",
+                                            "description": "Set true after running the falsification_plan experiment (even if it found no contradicting evidence). Required for conclude(high)."},
+            },
+            "required": ["id"],
+        },
+    },
+    {
+        "name": "hypothesis_conclude",
+        "description": (
+            "Promote a hypothesis to concluded state. Gates: conclude(medium) needs >=2 "
+            "supporting; conclude(high) needs >=3 supporting AND falsification_attempted=true. "
+            "Concluded hypotheses with confidence >= medium are the only thing write_artifact "
+            "accepts as backing for claims."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string"},
+                "final_statement": {"type": "string", "description": "Refined conclusion text (>=6 chars)."},
+                "final_confidence": {"type": "string", "enum": ["low", "medium", "high"]},
+            },
+            "required": ["id", "final_statement", "final_confidence"],
+        },
+    },
+    {
+        "name": "hypothesis_abandon",
+        "description": (
+            "Mark a hypothesis as abandoned (refuted, replaced by a better one, or no longer "
+            "relevant). Server surfaces any active hypotheses that depended on this one."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string"},
+                "reason": {"type": "string", "description": ">=6 chars."},
+            },
+            "required": ["id", "reason"],
+        },
+    },
+    {
+        "name": "hypothesis_list",
+        "description": (
+            "List hypotheses with optional filter (state=active|concluded|abandoned). "
+            "Pass with_evidence=true to include the full evidence arrays (heavier)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "state": {"type": "string", "enum": ["active", "concluded", "abandoned"]},
+                "with_evidence": {"type": "boolean"},
+            },
+        },
+    },
 ]
 
 
@@ -541,11 +649,115 @@ def tool_trace_context(args: dict[str, Any]) -> dict:
 def tool_write_artifact(args: dict[str, Any]) -> dict:
     if STATE.artifacts_dir is None:
         return {"status": "error", "error": "artifacts dir not initialized; call bind_trace first"}
+    content = str(args.get("content", ""))
+    # Hypothesis-ledger reference guard (anti-hallucination final line of
+    # defence). If the deliverable contains H<N> citations, every one of them
+    # must resolve to a concluded hypothesis with confidence >= medium and
+    # actual supporting evidence. If the deliverable contains zero H<N>
+    # citations AND the ledger has at least one concluded hypothesis, the
+    # agent is silently bypassing the scaffold — also blocked, with guidance.
+    if STATE.ledger is not None:
+        check = STATE.ledger.validate_artifact_references(content)
+        ledger_has_concluded = any(
+            h["state"] == "concluded"
+            for h in STATE.ledger.list(state="concluded")["hypotheses"]
+        )
+        if check["errors"]:
+            return {"status": "error",
+                    "error": "artifact references invalid hypotheses",
+                    "validation_errors": check["errors"],
+                    "referenced_ids": check["referenced_ids"],
+                    "instruction": (
+                        "Each H<id> mentioned in the deliverable must be a CONCLUDED "
+                        "hypothesis with confidence >= medium and at least one supporting "
+                        "evidence. Either conclude the cited hypothesis first via "
+                        "hypothesis_conclude, or remove the citation if the claim cannot "
+                        "be backed."),
+                    }
+        if not check["referenced_ids"] and ledger_has_concluded and len(content) > 200:
+            return {"status": "error",
+                    "error": "deliverable bypasses hypothesis ledger",
+                    "instruction": (
+                        "You have concluded hypotheses in the ledger but the artifact "
+                        "cites none of them. Either cite the relevant H<id> in your "
+                        "claims, or abandon those hypotheses if they no longer apply."),
+                    }
     store = ArtifactStore(STATE.artifacts_dir, mode=STATE.mode)
     return store.write(
         rel_path=str(args.get("path", "")),
-        content=str(args.get("content", "")),
+        content=content,
         notes=args.get("notes"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Hypothesis Ledger tool handlers
+# ---------------------------------------------------------------------------
+
+def _require_ledger() -> dict | None:
+    if STATE.ledger is None:
+        return {"status": "error", "error":
+                "hypothesis ledger not initialised; call bind_trace first"}
+    return None
+
+
+def tool_hypothesis_add(args: dict[str, Any]) -> dict:
+    err = _require_ledger()
+    if err is not None:
+        return err
+    return STATE.ledger.add(
+        statement=str(args.get("statement", "")),
+        confidence=str(args.get("confidence", "low")),
+        falsification_plan=str(args.get("falsification_plan", "")),
+        supporting=args.get("supporting"),
+        contradicting=args.get("contradicting"),
+        depends_on=args.get("depends_on"),
+        next_experiment=args.get("next_experiment"),
+    )
+
+
+def tool_hypothesis_update(args: dict[str, Any]) -> dict:
+    err = _require_ledger()
+    if err is not None:
+        return err
+    return STATE.ledger.update(
+        hid=str(args.get("id", "")),
+        confidence=args.get("confidence"),
+        add_supporting=args.get("add_supporting"),
+        add_contradicting=args.get("add_contradicting"),
+        next_experiment=args.get("next_experiment"),
+        falsification_attempted=args.get("falsification_attempted"),
+    )
+
+
+def tool_hypothesis_conclude(args: dict[str, Any]) -> dict:
+    err = _require_ledger()
+    if err is not None:
+        return err
+    return STATE.ledger.conclude(
+        hid=str(args.get("id", "")),
+        final_statement=str(args.get("final_statement", "")),
+        final_confidence=str(args.get("final_confidence", "")),
+    )
+
+
+def tool_hypothesis_abandon(args: dict[str, Any]) -> dict:
+    err = _require_ledger()
+    if err is not None:
+        return err
+    return STATE.ledger.abandon(
+        hid=str(args.get("id", "")),
+        reason=str(args.get("reason", "")),
+    )
+
+
+def tool_hypothesis_list(args: dict[str, Any]) -> dict:
+    err = _require_ledger()
+    if err is not None:
+        return err
+    return STATE.ledger.list(
+        state=args.get("state"),
+        with_evidence=bool(args.get("with_evidence", False)),
     )
 
 
@@ -871,6 +1083,11 @@ HANDLERS = {
     "trace_constscan": tool_trace_constscan,
     "trace_bytes": tool_trace_bytes,
     "trace_cryptoinstr": tool_trace_cryptoinstr,
+    "hypothesis_add": tool_hypothesis_add,
+    "hypothesis_update": tool_hypothesis_update,
+    "hypothesis_conclude": tool_hypothesis_conclude,
+    "hypothesis_abandon": tool_hypothesis_abandon,
+    "hypothesis_list": tool_hypothesis_list,
     "write_artifact": tool_write_artifact,
     "list_artifacts": tool_list_artifacts,
     "read_artifact": tool_read_artifact,
@@ -898,6 +1115,18 @@ def _attach_discipline(name: str, payload: dict) -> dict:
         return payload
     call_count = STATE.bump_tool_call()
     payload.update(build_reminder(mode=STATE.mode, call_count=call_count))
+    # Anchor tool_call_id into the result so the agent can cite it as evidence
+    # in hypothesis_track. Without a real id the ledger's anti-hallucination
+    # check (which verifies cited ids fall inside 1..tool_call_count) would
+    # have nothing to verify against.
+    payload["_tool_call_id"] = call_count
+    # Periodic hypothesis-ledger summary inject (cheap, terse). Mirrors the
+    # discipline_reminder cadence — every N calls, surface the active ledger
+    # state so the agent doesn't drift away from its own working memory.
+    if STATE.ledger is not None and call_count > 0 and call_count % 5 == 0:
+        summary = STATE.ledger.summary_for_inject()
+        if summary:
+            payload["ledger_state"] = summary
     return payload
 
 

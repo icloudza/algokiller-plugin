@@ -69,6 +69,72 @@ description: ARM64 trace 密文还原方法论。当用户给出一段 ARM64 执
 
 ---
 
+## 🧠 Hypothesis Ledger — 思考模式脚手架（v0.8.0+ 必走）
+
+trace 工具给你"看到什么"的能力, ledger 给你"想清楚什么"的脚手架. **每一个你打算放进 write_artifact 的结论, 必须先在 ledger 里走完 add → update → conclude 的闭环, 且 confidence ≥ medium**. 这是反幻觉硬约束——不是建议。
+
+### 5 个 ledger MCP 工具
+
+| 工具 | 用途 |
+|---|---|
+| `hypothesis_add(statement, confidence, falsification_plan, [supporting], [contradicting], [depends_on], [next_experiment])` | 新建一个 active 假设. **falsification_plan 必填**——说明哪个工具结果能反驳它. |
+| `hypothesis_update(id, [confidence], [add_supporting], [add_contradicting], [next_experiment], [falsification_attempted])` | 累积证据 / 调置信度. evidence 引用的 `tool_call_id` 必须是真发生过的 tool call. |
+| `hypothesis_conclude(id, final_statement, final_confidence)` | 落锤. **gate**: medium 需 ≥2 supporting; **high 需 ≥3 supporting + falsification_attempted=true**. |
+| `hypothesis_abandon(id, reason)` | 弃用. server 会自动 surface 依赖它的下游假设. |
+| `hypothesis_list([state], [with_evidence])` | 看现在 active/concluded/abandoned 假设清单. |
+
+### 强制工作流（4 阶段）
+
+```
+A. 假设形成 (Stage 0 之后立即做)
+   - 基于 lint / constscan / cryptoinstr / callgraph / modgraph 的初步信号
+   - hypothesis_add 1-3 个 active hypothesis
+   - 每个起步 confidence="low" 或 "unknown"
+   - falsification_plan 必须具体到工具 + 期望结果, 不能空喊
+     ✗ bad: "如果错就反驳"
+     ✓ good: "trace_callgraph --to md5_compress 若 0 行调用, refute"
+
+B. 实验
+   - 调工具 → 拿到 tool 返回值中的 `_tool_call_id` 字段
+   - hypothesis_update 把该 tool_call_id 作为 supporting/contradicting 引用
+   - server 校验 id 必须在 [1, 当前 tool_call_count] 区间 (反"凭空捏造证据")
+
+C. 反驳尝试 (conclude=high 必经)
+   - 主动跑 falsification_plan 描述的实验, 即使预期会失败
+   - 跑完后调 hypothesis_update(falsification_attempted=true)
+   - 没跑 → server 拒绝 conclude(high)
+
+D. 收敛 / 弃用
+   - 满足 gate → hypothesis_conclude(id, final_statement, final_confidence)
+   - 不满足 + 证据矛盾 → hypothesis_abandon(id, reason)
+   - 不满足 + 证据不足 → 回到 B 继续
+
+E. 交付
+   - write_artifact 的内容必须用 H<id> 引用 concluded 假设
+   - server 反查每个 H<id>: 必须 state="concluded" + confidence>=medium + 有真实 supporting
+   - 没引用 + ledger 有 concluded 假设 → 拒收 ("bypass ledger")
+   - 引用了但 H<id> 不合规 → 拒收 + 列具体错误
+```
+
+### Inject 机制
+
+每 5 次 tool call, server 自动把当前 active ledger summary 附在工具返回里. 你不需要主动 `hypothesis_list`——但**看到 inject summary 后必须更新状态**: 没进展的 active 假设要么补 evidence 要么 abandon. 长期挂着 falsification_attempted=false 是 3.25 行为.
+
+### 这套约束防什么
+
+| 幻觉模式 | 被哪一道防线挡住 |
+|---|---|
+| 凭空给结论 | write_artifact 引用 H<id> 强校验 |
+| 引用不存在的证据 | tool_call_id 范围校验 |
+| confidence=high 但证据不足 | conclude gate 数量校验 |
+| 跳过反驳直接 conclude high | falsification_attempted 校验 |
+| 下游错误传播 | abandon 时自动 surface 依赖者 |
+| 隐式断言 (写报告不引用 H<id>) | write_artifact 检测到 ledger 有 concluded 但 0 引用 → 拒收 |
+
+**底层逻辑**: ledger 不让 AI 更聪明, 让 AI 不能瞎说. 它把推理从"AI 自说自话"变成"AI 必须显式构建可证伪 + 可审计的论证链".
+
+---
+
 ## Stage 1: 对抗 Hardened Binary 的多信号联合判定
 
 constscan + cryptoinstr 都缺信号时（**两者都 0 命中或全 `alu_only`**），**不要直接下"hardened"结论**。`constscan miss` 只能说明"literal fingerprint missing"，可能性是一个集合，不是单一答案。同样 `cryptoinstr hit` 也只是极强证据，不是绝对实锤——必须 **multi-signal correlation** 才能定论。
