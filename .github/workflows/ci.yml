@@ -68,7 +68,25 @@ jobs:
             '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
             '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
             | python3 server/algokiller_mcp.py > /tmp/mcp_smoke.json
-          # Must respond to both initialize and tools/list.
-          test "$(grep -c '"id":1' /tmp/mcp_smoke.json)" -ge 1
-          test "$(grep -c '"id":2' /tmp/mcp_smoke.json)" -ge 1
-          echo "MCP smoke test ok"
+          # Parse responses with Python rather than grep — `json.dumps`
+          # emits `"id": 1` with a space by default, which the previous
+          # `grep -c '"id":1'` missed. Also locks the advertised tool
+          # count so a future schema-drift fails the gate.
+          python3 - <<'PY'
+          import json
+          got = {}
+          with open('/tmp/mcp_smoke.json') as f:
+              for line in f:
+                  line = line.strip()
+                  if not line:
+                      continue
+                  d = json.loads(line)
+                  if 'id' in d:
+                      got[d['id']] = d
+          assert 1 in got, f'no response to initialize; got ids={sorted(got)}'
+          assert 2 in got, f'no response to tools/list; got ids={sorted(got)}'
+          tools = got[2]['result']['tools']
+          assert len(tools) == 23, f'expected 23 tools, got {len(tools)}'
+          pv = got[1]['result']['protocolVersion']
+          print(f'MCP smoke ok: protocolVersion={pv}, tools={len(tools)}')
+          PY
