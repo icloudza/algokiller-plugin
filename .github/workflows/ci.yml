@@ -86,7 +86,13 @@ jobs:
           assert 1 in got, f'no response to initialize; got ids={sorted(got)}'
           assert 2 in got, f'no response to tools/list; got ids={sorted(got)}'
           tools = got[2]['result']['tools']
-          assert len(tools) == 25, f'expected 25 tools (v0.9.1: +mark_hypothesis_reviewed +hypothesis_archive), got {len(tools)}'
+          assert len(tools) == 26, f'expected 26 tools (incl. pick_output_dir), got {len(tools)}'
+          # Spot-check a few must-be-present names so a silent rename of any
+          # critical tool fails the gate even if the total count is right.
+          names = {t['name'] for t in tools}
+          for required in ('bind_trace', 'pick_output_dir', 'trace_constscan',
+                           'trace_cryptoinstr', 'write_artifact'):
+              assert required in names, f'missing required tool: {required}'
           pv = got[1]['result']['protocolVersion']
           print(f'MCP smoke ok: protocolVersion={pv}, tools={len(tools)}')
           PY
