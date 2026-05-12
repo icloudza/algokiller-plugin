@@ -4,7 +4,7 @@ Thanks for taking the time to look. Quick rules first, rationale below.
 
 ## TL;DR — what gates a PR
 
-1. `tools/search/tests/run_tests.sh` — **132 PASS / 0 FAIL** on the
+1. `tools/search/tests/run_tests.sh` — **146 PASS / 0 FAIL** on the
    native C engine harness. Required.
 2. `python3 -m unittest discover -s tests/python -v` — Python unit
    tests for the MCP server (Hypothesis Ledger gates, artifact path
@@ -33,7 +33,7 @@ algokiller-plugin/
 │   └── static_tools.py
 ├── tools/search/                # Native C engine (mmap + BMH + line index)
 │   ├── search.c / Makefile
-│   └── tests/                   # POSIX-sh harness, 132 assertions
+│   └── tests/                   # POSIX-sh harness, 146 assertions
 ├── skills/                      # Claude skills (model + slash entries)
 └── tests/python/                # Python unit tests for the MCP server
 ```

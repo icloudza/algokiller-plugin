@@ -6,6 +6,18 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+- Cursor/Codex MCP client setup docs in `docs/mcp-clients.md`.
+- Project-scoped Cursor MCP config at `.cursor/mcp.json`.
+- Codex MCP config example at `examples/mcp/codex.config.toml`.
+
+### Changed
+
+- Aligned marketplace metadata with v0.9.5: 25 MCP tools, 95 crypto
+  fingerprints, and 14 native `ak_search` subcommands.
+- Updated stale native test-count references from 132 to 146.
+
 ## [0.9.5] — Full VM reversal methodology in ciphertext-recovery SKILL
 
 `skills/ciphertext-recovery/SKILL.md` previously had a one-paragraph
