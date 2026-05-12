@@ -4,7 +4,18 @@ All notable changes to **algokiller-plugin** are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.9.5.2] — Project-aware artifact routing + native folder picker + drop `.notes.md`
+## [0.9.6] — Project-aware artifact routing + native folder picker + drop `.notes.md`
+
+Versioning note: this batch genuinely warrants a MINOR bump (not a
+0.9.5.x patch) because it adds a new MCP tool (`pick_output_dir`,
+25 → 26), removes a previously-accepted `write_artifact` parameter
+(breaking change: `notes` is no longer accepted), and introduces two
+new configuration surfaces (`.algokiller.toml` project config + the
+`ALGOKILLER_OUTPUT_DIR` environment variable). The earlier 0.9.5.2
+tag in git history was the same content under a more conservative
+label — it never reached a public install (marketplace catalog
+re-fetched before any user installed it), so we relabel rather than
+ship two versions for the same diff.
 
 ### Added
 

@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "algokiller",
-  "version": "0.9.5.2",
+  "version": "0.9.6",
   "description": "ARM64 trace evidence analysis & cipher algorithm recovery. Bundles the AlgoKiller methodology as skills + a local MCP server that drives the native ak_search engine over GB-scale trace files.",
   "author": {
     "name": "cloudza"

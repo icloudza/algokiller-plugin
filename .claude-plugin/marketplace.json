@@ -9,7 +9,7 @@
         {
             "name": "algokiller",
             "description": "ARM64 trace evidence analysis & cipher algorithm recovery. 26 MCP tools (trace / artifact / static-tool / hypothesis-ledger / native folder picker), 4 skills (ciphertext-recovery / general / trace-analysis / ciphertext), evidence-classified verdict engine (real / real_simd / weak / alu_only), 97-fingerprint crypto-constant scanner with NEON SIMD broadcast detection, data-parallel scan workers, and project-aware artifact directory routing.",
-            "version": "0.9.5.2",
+            "version": "0.9.6",
             "source": "./",
             "author": {
                 "name": "cloudza",
