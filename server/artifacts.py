@@ -1,11 +1,15 @@
 """Artifact store: write deliverables (recovered Python source, markdown
 analysis reports) into the session artifacts directory and read them back.
 
-Directory layout:
-    ~/AlgoKiller/artifacts/<trace_basename>/<session_timestamp>/...
+The directory layout is dictated by `server.output_dir.resolve_output_dir`:
+explicit > env > project-config > project-marker > Documents fallback.
 
 Filenames are auto-stamped with mode + timestamp + de-dup index so the
 agent never overwrites a previous deliverable inside the same session.
+
+The `notes` sidecar (`.notes.md`) was removed — analysis reports
+themselves carry all the context they need; the sidecar was 100 %
+redundant token spend.
 """
 
 from __future__ import annotations
@@ -27,7 +31,7 @@ class ArtifactStore:
     def _stamp(self) -> str:
         return f"{self.mode}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
-    def write(self, rel_path: str, content: str, notes: str | None = None) -> dict:
+    def write(self, rel_path: str, content: str) -> dict:
         if not rel_path:
             return {"status": "error", "error": "path must not be empty"}
         path = Path(rel_path)
@@ -51,15 +55,9 @@ class ArtifactStore:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
 
-        notes_path: Path | None = None
-        if notes:
-            notes_path = target.with_suffix(".notes.md")
-            notes_path.write_text(str(notes), encoding="utf-8")
-
         return {
             "status": "ok",
             "path": str(target),
-            "notes_path": str(notes_path) if notes_path else None,
         }
 
     def list_all(self) -> list[dict]:

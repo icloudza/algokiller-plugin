@@ -153,14 +153,14 @@ class TestL1Plumbing(unittest.TestCase):
         if hasattr(cls, "client"):
             cls.client.close()
 
-    def test_01_tools_list_returns_25(self):
+    def test_01_tools_list_returns_26(self):
         resp = self.client.request("tools/list")
         tools = resp["result"]["tools"]
-        # v0.9.1: added mark_hypothesis_reviewed (FIX #6) and hypothesis_archive (FIX #7)
-        self.assertEqual(len(tools), 25)
+        self.assertEqual(len(tools), 26)
         names = {t["name"] for t in tools}
         # Sanity-check a few across categories.
-        for required in ("bind_trace", "trace_lint", "trace_constscan",
+        for required in ("bind_trace", "pick_output_dir",
+                         "trace_lint", "trace_constscan",
                          "trace_callgraph", "trace_hexblock",
                          "hypothesis_add", "write_artifact",
                          "mark_hypothesis_reviewed", "hypothesis_archive"):

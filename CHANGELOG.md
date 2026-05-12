@@ -4,6 +4,76 @@ All notable changes to **algokiller-plugin** are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.5.2] — Project-aware artifact routing + native folder picker + drop `.notes.md`
+
+### Added
+
+- **FIX F-19 (project-aware artifact directory routing).** `bind_trace`
+  now resolves the output base directory via a five-priority chain
+  instead of always dumping reports under `~/AlgoKiller/artifacts/`:
+  1. explicit `output_dir` argument
+  2. `ALGOKILLER_OUTPUT_DIR` environment variable (CI / global override)
+  3. `[output] dir` inside `<project>/.algokiller.toml`
+  4. walk up to 4 levels from the trace's parent for project markers
+     (`.git`, `.hg`, `.svn`, `pyproject.toml`, `setup.py`, `Pipfile`,
+     `Cargo.toml`, `go.mod`, `package.json`, `pnpm-workspace.yaml`,
+     `pom.xml`, `build.gradle`, `composer.json`, `Gemfile`,
+     `CMakeLists.txt`, `Makefile`, `.algokiller.toml`) →
+     `<project>/.algokiller/<trace_basename>/<timestamp>/`
+  5. fallback: `<Documents>/AlgoKiller-Reports/<trace_basename>/<timestamp>/`
+     — Linux honours `XDG_DOCUMENTS_DIR`; macOS / Windows use
+     `~/Documents`; no Documents directory falls to `~/`.
+  The response surfaces the chosen path in `output_dir_resolved` and
+  the rule that fired in `output_dir_source` (∈ `explicit` / `env` /
+  `project_config` / `project_marker` / `documents`); the skill
+  contract requires the agent to relay this to the user before the
+  first `write_artifact`. Each new bind creates a fresh
+  `<timestamp>/` so multiple analyses of the same trace stay
+  side-by-side for comparison. The legacy `~/AlgoKiller/artifacts/`
+  path is not migrated or read — old artifacts stay where they are.
+- **FIX F-19a (`pick_output_dir` MCP tool).** New tool that pops the
+  host's native folder picker so the user can choose interactively
+  rather than typing a path. macOS uses osascript `choose folder`,
+  Windows uses System.Windows.Forms.FolderBrowserDialog via
+  PowerShell, Linux tries zenity then falls back to kdialog. Headless
+  / web / unrecognised platforms return `{status:"unsupported"}` with
+  a hint pointing back at `bind_trace(output_dir=...)`. Cancellation
+  and timeout (120 s) are normal statuses, not errors. The return
+  shape always includes a `next_step` field so the agent reacts
+  correctly without having to interpret status codes. Tool count
+  25 → 26.
+
+### Removed
+
+- **FIX F-20 (drop `.notes.md` sidecar).** `write_artifact` no longer
+  accepts the `notes` parameter and no longer writes a `*.notes.md`
+  sidecar next to each artifact. Analysis reports already carry their
+  own narrative / `[H<n>]` citations inline — the sidecar duplicated
+  that information and burned tokens for nothing. Calls passing
+  `notes` will be rejected by the JSON-RPC layer at schema-validation
+  time, which is the intended forcing function: put your context in
+  the main `report.md` where it belongs.
+
+### Changed
+
+- E2E tool-count assertion bumped 25 → 26.
+- 20 new unit tests:
+  - `test_output_dir.py` — 13 tests covering every priority branch
+    plus walk-limit, malformed-TOML fallthrough, and Documents-not-found
+    fallback to home.
+  - `test_picker.py` — 5 tests covering platform dispatch, Linux
+    no-picker-installed case, macOS user-cancel parsing, and Windows
+    happy path (all with subprocess mocked).
+  - `test_artifacts.py` — replaced the old `notes` sidecar test with
+    a regression that the sidecar is **not** written.
+- README (zh + en) rewritten:
+  - 25 → 26 tools, new `pick_output_dir` listed under "binding / artifacts"
+  - The "交付物 / Artifact storage" section now documents the
+    five-priority resolution chain with an `.algokiller.toml` example
+  - Smoke-test expected output count adjusted
+
+---
+
 ## [0.9.5.1] — Audit-driven patch: ARC tagging, SIMD detection, multithreaded scan, skill hygiene
 
 Versioning note: this release uses the 4-segment `0.9.5.x` patch scheme.

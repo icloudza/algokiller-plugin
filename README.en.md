@@ -38,8 +38,8 @@ claude plugin update algokiller@algokiller-suite
 2. **Slash commands** (strong activation)
    - `/algokiller:ciphertext <trace> <task>`
    - `/algokiller:general <trace> <task>`
-3. **25 MCP tools** (18 trace/artifact/static + 7 hypothesis-ledger)
-   - Binding / artifacts: `bind_trace` / `write_artifact` / `list_artifacts` / `read_artifact`
+3. **26 MCP tools** (19 trace/artifact/static + 7 hypothesis-ledger)
+   - Binding / artifacts: `bind_trace` / `pick_output_dir` (native folder picker) / `write_artifact` / `list_artifacts` / `read_artifact`
    - Core search: `trace_search` / `trace_context`
    - Data flow: `trace_regflow` (register-value evolution) / `trace_producer` (nearest writer of a value) / `trace_semop` (11-class instruction classifier)
    - Health & volume: `trace_lint` (one-pass JSON summary) / `trace_fold` (block-aware folding, 115 MB → 1.1 MB)
@@ -143,13 +143,33 @@ Slash form is more deterministic; free-form is more natural.
 
 ## Deliverables
 
-Each `bind_trace` creates a session directory:
+Each `bind_trace` resolves the output base directory via a **5-priority chain** and reports the result back in `output_dir_resolved` + `output_dir_source`; the agent surfaces this to the user before the first `write_artifact`.
 
 ```
-~/AlgoKiller/artifacts/<trace_basename>/<YYYYMMDD_HHMMSS>/
+① bind_trace(output_dir=...)              ← explicit argument
+② $ALGOKILLER_OUTPUT_DIR                  ← env global override (CI / power users)
+③ <project>/.algokiller.toml [output] dir ← project-level config
+④ <project>/.algokiller/<trace>/<ts>/     ← walk up to 4 levels from the trace's
+                                            parent for project markers (.git /
+                                            pyproject.toml / Cargo.toml /
+                                            package.json / go.mod / Makefile …)
+⑤ <Documents>/AlgoKiller-Reports/<trace>/<ts>/   ← fallback
+   (Linux honours XDG_DOCUMENTS_DIR; macOS / Windows use ~/Documents)
 ```
 
-`write_artifact("recovered.py", source)` writes `recovered_CIPHERTEXT_<ts>.py`; notes are saved alongside as `*.notes.md`.
+Each new bind creates a fresh `<timestamp>/` so multiple analyses of the same trace stay side by side for comparison.
+
+**`pick_output_dir`** pops the host's native folder picker — macOS Finder `choose folder`, Windows `FolderBrowserDialog`, Linux `zenity` / `kdialog`; headless / web clients return `unsupported` and the agent falls back to asking for the path in chat.
+
+**`.algokiller.toml` example** (drop this in your project root):
+
+```toml
+[output]
+dir = "build/algokiller-reports"   # relative resolves against the project root;
+                                   # absolute paths are also accepted
+```
+
+`write_artifact("recovered.py", source)` writes `recovered_CIPHERTEXT_<ts>.py`. The `.notes.md` sidecar is no longer written — analysis reports carry their narrative inline, so the sidecar was 100 % redundant token spend.
 
 ---
 
@@ -185,7 +205,7 @@ printf '%s\n' \
   | python3 server/algokiller_mcp.py
 ```
 
-Expect: `initialize` response + `tools/list` advertising 25 tools (18 trace/artifact/static tools + 7 hypothesis-ledger tools, including `mark_hypothesis_reviewed` and `hypothesis_archive`).
+Expect: `initialize` response + `tools/list` advertising 26 tools (19 trace/artifact/static tools + 7 hypothesis-ledger tools, including `pick_output_dir` / `mark_hypothesis_reviewed` / `hypothesis_archive`).
 
 ---
 

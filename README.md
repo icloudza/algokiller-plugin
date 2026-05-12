@@ -38,8 +38,8 @@ claude plugin update algokiller@algokiller-suite
 2. **Slash commands**（强激活）
    - `/algokiller:ciphertext <trace> <task>`
    - `/algokiller:general <trace> <task>`
-3. **25 个 MCP 工具**(18 trace/artifact/static + 7 hypothesis-ledger)
-   - 绑定 / 制品：`bind_trace` / `write_artifact` / `list_artifacts` / `read_artifact`
+3. **26 个 MCP 工具**(19 trace/artifact/static + 7 hypothesis-ledger)
+   - 绑定 / 制品：`bind_trace` / `pick_output_dir`（弹原生目录选择器）/ `write_artifact` / `list_artifacts` / `read_artifact`
    - 基础检索：`trace_search` / `trace_context`
    - 数据流：`trace_regflow`（寄存器演化）/ `trace_producer`（找值的最近写入者）/ `trace_semop`（指令语义分类，11 类）
    - 体检与降噪：`trace_lint`（一遍 JSON 体检）/ `trace_fold`（block-aware 折叠，115 MB → 1.1 MB）
@@ -141,15 +141,33 @@ Slash command 形式更确定，自由输入更自然。
 
 ---
 
-## 交付物
+## 交付物存放路径
 
-每次 `bind_trace` 创建新会话目录：
+每次 `bind_trace` 自动按 **5 段优先级** 解析输出目录，并把结果通过 response 的 `output_dir_resolved` + `output_dir_source` 两个字段告诉 agent；agent 必须在首次 `write_artifact` 之前把位置告诉用户。
 
 ```
-~/AlgoKiller/artifacts/<trace_basename>/<YYYYMMDD_HHMMSS>/
+① bind_trace(output_dir=...)              ← 显式参数
+② $ALGOKILLER_OUTPUT_DIR                  ← env 全局覆盖（CI / 高级用户）
+③ <project>/.algokiller.toml [output] dir ← 项目级配置
+④ <project>/.algokiller/<trace>/<ts>/     ← trace 路径上溯 4 层找项目标记
+                                            (.git / pyproject.toml / Cargo.toml /
+                                             package.json / go.mod / Makefile 等)
+⑤ <Documents>/AlgoKiller-Reports/<trace>/<ts>/   ← 兜底
+   (Linux 优先 XDG_DOCUMENTS_DIR；macOS/Windows 用 ~/Documents)
 ```
 
-`write_artifact("recovered.py", source)` 写 `recovered_CIPHERTEXT_<ts>.py`；带 notes 时同时写 `*.notes.md`。
+每次 bind 都新建 `<ts>/` 子目录，方便横向对照。
+
+**`pick_output_dir`**：用户想交互式选位置时，agent 调这个工具弹原生选择器——macOS Finder `choose folder`、Windows `FolderBrowserDialog`、Linux `zenity` / `kdialog`；headless / web 客户端返回 `unsupported`，agent 收到 hint 后改走"让用户在对话里说路径"。
+
+**`.algokiller.toml` 项目配置示例**（放在项目根）：
+
+```toml
+[output]
+dir = "build/algokiller-reports"   # 相对路径相对于项目根；也支持绝对路径
+```
+
+`write_artifact("recovered.py", source)` 写 `recovered_CIPHERTEXT_<ts>.py`。不再写 `.notes.md` sidecar——报告本身就承载所有上下文，sidecar 是冗余的 token 开销。
 
 ---
 
@@ -185,7 +203,7 @@ printf '%s\n' \
   | python3 server/algokiller_mcp.py
 ```
 
-期望：`initialize` 响应 + `tools/list` 返回 25 个工具（18 个 trace/artifact/static 工具 + 7 个 hypothesis-ledger 工具，含 `mark_hypothesis_reviewed` 和 `hypothesis_archive`）。
+期望：`initialize` 响应 + `tools/list` 返回 26 个工具（19 个 trace/artifact/static 工具 + 7 个 hypothesis-ledger 工具，含 `pick_output_dir` / `mark_hypothesis_reviewed` / `hypothesis_archive`）。
 
 ---
 

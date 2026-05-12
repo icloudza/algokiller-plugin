@@ -34,6 +34,8 @@ from state import STATE, AK_SEARCH_BIN
 from daemon import AkSearchDaemon
 from artifacts import ArtifactStore
 from static_tools import run_static_tool
+from output_dir import resolve_output_dir
+from picker import pick_directory
 
 
 # ---------------------------------------------------------------------------
@@ -192,16 +194,27 @@ def _search_once(query: str, *, from_line: int = 0, before_line: int = 0, limit:
 def tool_bind_trace(args: dict[str, Any]) -> dict:
     path_arg = args.get("path")
     mode_arg = args.get("mode")
+    output_dir_arg = args.get("output_dir")
     if not path_arg or not isinstance(path_arg, str):
         return {"status": "error", "error": "path is required"}
     if mode_arg not in ("ciphertext", "general"):
         return {"status": "error", "error": "mode must be 'ciphertext' or 'general'"}
+    if output_dir_arg is not None and not isinstance(output_dir_arg, str):
+        return {"status": "error",
+                "error": "output_dir, when provided, must be a string"}
 
     trace_path = Path(path_arg).expanduser().resolve()
     if not trace_path.exists():
         return {"status": "error", "error": f"trace file not found: {trace_path}"}
     if not trace_path.is_file():
         return {"status": "error", "error": f"trace path is not a file: {trace_path}"}
+
+    # Resolve the output directory BEFORE touching the daemon — if the
+    # path is bad, fail fast without leaving a half-started session.
+    try:
+        resolved = resolve_output_dir(trace_path, explicit=output_dir_arg)
+    except ValueError as exc:
+        return {"status": "error", "error": str(exc)}
 
     if STATE.daemon is not None:
         STATE.daemon.close()
@@ -214,19 +227,78 @@ def tool_bind_trace(args: dict[str, Any]) -> dict:
         return {"status": "error", "error": f"failed to start ak_search daemon: {exc}"}
 
     STATE.daemon = daemon
-    STATE.bind(trace_path, mode_arg)
+    STATE.bind(
+        trace_path, mode_arg, resolved.path,
+        source=resolved.source,
+        reason=resolved.reason,
+        project_root=resolved.project_root,
+    )
 
-    return {
+    # Echo the resolved location prominently so the agent can — and per
+    # skill rules MUST — relay it to the user. `output_dir_source` lets
+    # the agent explain *why* this location was picked (so the user can
+    # immediately re-bind with output_dir=... if they disagree).
+    response: dict[str, Any] = {
         "status": "ok",
         "trace_file": str(trace_path),
         "mode": mode_arg,
         "artifacts_dir": str(STATE.artifacts_dir),
+        "output_dir_resolved": str(STATE.artifacts_dir),
+        "output_dir_source": resolved.source,
         "instruction": (
-            "Trace bound. Use trace_search / trace_context to gather evidence; "
-            "use write_artifact to deliver final source or analysis. "
-            "Tool returns include a 'discipline_reminder' field — read it before deciding the next call."
+            f"Trace bound. Reports will be written under {STATE.artifacts_dir}. "
+            f"(source={resolved.source}) Tell the user this destination before "
+            "writing the first artifact; if they want a different location, "
+            "either call pick_output_dir() for a native folder picker or re-"
+            "invoke bind_trace with an explicit output_dir=... value. "
+            "Use trace_search / trace_context to gather evidence; use "
+            "write_artifact to deliver final source or analysis."
         ),
     }
+    if resolved.reason:
+        response["output_dir_reason"] = resolved.reason
+    if resolved.project_root is not None:
+        response["project_root"] = str(resolved.project_root)
+    return response
+
+
+def tool_pick_output_dir(args: dict[str, Any]) -> dict:
+    """Pop the host's native folder picker so the user can choose an
+    output directory interactively. Returns the chosen path (caller
+    passes it to bind_trace as output_dir) or a status indicating
+    cancellation / unavailability — both are normal outcomes, not
+    errors. See server/picker.py for the platform dispatch.
+    """
+    initial = args.get("initial_dir")
+    initial_path: Path | None = None
+    if isinstance(initial, str) and initial:
+        candidate = Path(initial).expanduser()
+        if candidate.is_dir():
+            initial_path = candidate
+    result = pick_directory(initial_path)
+    # Normalise the response shape: always carry a status; surface a
+    # short `next_step` so the agent knows what to do without having to
+    # interpret each status code.
+    status = result.get("status")
+    if status == "ok":
+        result["next_step"] = (
+            "Call bind_trace(path=..., mode=..., "
+            f"output_dir={result.get('path')!r}) to use this directory."
+        )
+    elif status == "cancelled":
+        result["next_step"] = (
+            "User cancelled. Ask them whether to retry pick_output_dir() "
+            "or supply the path conversationally, then call bind_trace."
+        )
+    elif status in ("unsupported", "timeout", "error"):
+        result["next_step"] = (
+            "Native picker unavailable here. Ask the user for the desired "
+            "directory in chat and call bind_trace(output_dir=...) "
+            "directly, OR bind_trace without output_dir to use the default "
+            "resolution (project-marker / Documents fallback)."
+        )
+    result["status"] = status or "error"
+    return result
 
 
 def tool_trace_search(args: dict[str, Any]) -> dict:
@@ -392,7 +464,6 @@ def tool_write_artifact(args: dict[str, Any]) -> dict:
     return store.write(
         rel_path=str(args.get("path", "")),
         content=content,
-        notes=args.get("notes"),
     )
 
 
@@ -1687,6 +1758,7 @@ def tool_trace_fold(args: dict[str, Any]) -> dict:
 
 HANDLERS = {
     "bind_trace": tool_bind_trace,
+    "pick_output_dir": tool_pick_output_dir,
     "trace_search": tool_trace_search,
     "trace_context": tool_trace_context,
     "trace_regflow": tool_trace_regflow,

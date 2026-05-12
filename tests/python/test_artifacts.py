@@ -1,5 +1,6 @@
 """Regression tests for ArtifactStore — path-escape guards + per-write
-timestamping + notes sidecar."""
+timestamping. The `.notes.md` sidecar was removed in 0.9.5.2; tests
+ensure no notes file is written even if callers somehow pass extra kwargs."""
 
 from __future__ import annotations
 
@@ -52,15 +53,19 @@ class TestArtifactStoreWrite(unittest.TestCase):
             self.assertTrue(out.name.startswith("recovered_CIPHERTEXT_"))
             self.assertTrue(out.name.endswith(".py"))
 
-    def test_notes_writes_sidecar(self):
+    def test_notes_sidecar_no_longer_written(self):
+        """FIX F-20: the `.notes.md` sidecar was removed — analysis
+        reports already carry their own context inline, so the sidecar
+        was 100% redundant token spend. Response no longer carries a
+        `notes_path` key, and no `.notes.md` files appear on disk."""
         with tempfile.TemporaryDirectory() as td:
             store = ArtifactStore(Path(td), mode="general")
-            r = store.write("report.md", "# Findings\n",
-                            notes="evidence: H1, H2, H3")
+            r = store.write("report.md", "# Findings\n")
             self.assertEqual(r["status"], "ok", r)
-            self.assertIsNotNone(r["notes_path"])
-            notes = Path(r["notes_path"]).read_text(encoding="utf-8")
-            self.assertEqual(notes, "evidence: H1, H2, H3")
+            self.assertNotIn("notes_path", r)
+            sidecar = Path(r["path"]).with_suffix(".notes.md")
+            self.assertFalse(sidecar.exists(),
+                             f"unexpected .notes.md sidecar: {sidecar}")
 
     def test_repeated_write_deduplicates(self):
         with tempfile.TemporaryDirectory() as td:
@@ -88,7 +93,7 @@ class TestArtifactStoreList(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             store = ArtifactStore(Path(td), mode="ciphertext")
             store.write("one.py", "x")
-            store.write("two.md", "y", notes="note")
+            store.write("two.md", "y")
             items = store.list_all()
             self.assertGreaterEqual(len(items), 2)
             for it in items:

@@ -44,6 +44,13 @@ traces/
 artifacts/
 *.trace.log
 
+# AlgoKiller analysis outputs — bind_trace's project-marker walk-up writes
+# reports into <project>/.algokiller/ by default (5-priority resolution).
+# Test fixtures live under tools/search/tests/fixtures/, so running the
+# e2e suite from this repo can land artifacts at tools/search/.algokiller/.
+# These are per-run / per-developer outputs and should never be committed.
+.algokiller/
+
 # Local Python tooling state
 .python-version
 *.egg

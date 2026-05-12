@@ -22,7 +22,22 @@ TOOLS: list[dict[str, Any]] = [
         "description": (
             "Bind the current session to an ARM64 trace log file and analysis mode. "
             "Must be called once before any trace_search or trace_context. "
-            "Subsequent calls re-bind (the previous ak_search daemon is closed and a new one is started)."
+            "Subsequent calls re-bind (the previous ak_search daemon is closed and a new one is started).\n\n"
+            "Output directory resolution (highest priority wins):\n"
+            "  1. `output_dir` argument to this call (absolute path)\n"
+            "  2. `ALGOKILLER_OUTPUT_DIR` environment variable (CI / global override)\n"
+            "  3. `[output] dir = \"...\"` inside `.algokiller.toml` at the trace's project root\n"
+            "  4. Project marker walk-up (.git / pyproject.toml / Cargo.toml / package.json / "
+            "go.mod / Makefile etc., up to 4 levels) → "
+            "<project_root>/.algokiller/<trace_basename>/<timestamp>/\n"
+            "  5. Fallback → <Documents>/AlgoKiller-Reports/<trace_basename>/<timestamp>/\n"
+            "     (Linux honours XDG_DOCUMENTS_DIR; macOS/Windows use ~/Documents)\n\n"
+            "The response carries `output_dir_resolved` and `output_dir_source` "
+            "(`explicit` / `env` / `project_config` / `project_marker` / `documents`). "
+            "Agent MUST relay this location to the user before writing the first "
+            "artifact — if they want a different destination they can call "
+            "`pick_output_dir` for a native folder picker (macOS / Windows / Linux GUI) "
+            "or re-invoke `bind_trace` with `output_dir=...`."
         ),
         "inputSchema": {
             "type": "object",
@@ -33,8 +48,51 @@ TOOLS: list[dict[str, Any]] = [
                     "enum": ["ciphertext", "general"],
                     "description": "Analysis mode: 'ciphertext' for cipher / algorithm recovery, 'general' for open trace analysis.",
                 },
+                "output_dir": {
+                    "type": "string",
+                    "description": (
+                        "Absolute base directory under which the session's reports "
+                        "are written. The session subdirectory `<trace_basename>/"
+                        "<timestamp>/` is created beneath it. Skip to use the "
+                        "5-priority auto-resolution described above."
+                    ),
+                },
             },
             "required": ["path", "mode"],
+        },
+    },
+    {
+        "name": "pick_output_dir",
+        "description": (
+            "Pop the host's native directory picker so the user can choose where "
+            "analysis reports get written. macOS uses Finder's `choose folder` via "
+            "osascript; Windows uses System.Windows.Forms.FolderBrowserDialog via "
+            "PowerShell; Linux tries zenity then kdialog. Headless / web / "
+            "unrecognised platforms return `{\"status\":\"unsupported\"}` — fall "
+            "back to asking the user for the path in chat and invoke `bind_trace` "
+            "with `output_dir=...` directly.\n\n"
+            "Return shape (always carries a `status` and a `next_step` hint):\n"
+            "  `{status: \"ok\", path: \"/abs/dir\", next_step: ...}`\n"
+            "  `{status: \"cancelled\", reason, next_step}`  — user clicked Cancel\n"
+            "  `{status: \"timeout\", reason, next_step}`    — no selection in 120s\n"
+            "  `{status: \"unsupported\", reason, next_step}` — no picker on this host\n"
+            "  `{status: \"error\", reason, next_step}`     — picker crashed\n\n"
+            "Cancellation / timeout / unsupported are normal outcomes, NOT errors — "
+            "do not treat them as failures, just react per `next_step`."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "initial_dir": {
+                    "type": "string",
+                    "description": (
+                        "Absolute directory the picker should open at. Defaults "
+                        "to the host's home directory if omitted or invalid. "
+                        "Typical caller pattern: pass the trace file's parent "
+                        "directory so the picker starts near the source data."
+                    ),
+                },
+            },
         },
     },
     {
@@ -83,14 +141,15 @@ TOOLS: list[dict[str, Any]] = [
         "name": "write_artifact",
         "description": (
             "Write a final deliverable (recovered Python source, or markdown analysis report) "
-            "into the session artifacts directory. Path is relative; the server appends mode + timestamp."
+            "into the session artifacts directory. Path is relative; the server appends mode "
+            "+ timestamp. The destination directory is the `output_dir_resolved` returned by "
+            "`bind_trace`; surface that path to the user once before writing the first artifact."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "Relative filename, e.g. 'recovered.py' or 'report.md'."},
-                "content": {"type": "string", "description": "Full file content."},
-                "notes": {"type": "string", "description": "Optional short evidence / confidence note saved alongside."},
+                "content": {"type": "string", "description": "Full file content. Put any narrative / confidence notes inline in the report itself — no separate sidecar file is written."},
             },
             "required": ["path", "content"],
         },
