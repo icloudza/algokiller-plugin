@@ -1,8 +1,8 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "ak",
-  "version": "1.0.0",
-  "description": "AlgoKiller — ARM64 trace evidence analysis & cipher algorithm recovery. Bundles the AlgoKiller methodology as skills + a local MCP server (26 tools) that drives the native ak_search engine over GB-scale trace files. v1.0.0 adds PreCompact / SessionStart / Stop / SubagentStop hooks for compact-aware ledger preservation, three new read-only subagents (trace-hexdump-extractor / binary-static-inspector / ledger-curator), and three slash commands (/ak:status, /ak:rebind, /ak:fold).",
+  "version": "1.1.0",
+  "description": "AlgoKiller — ARM64 trace evidence analysis & cipher algorithm recovery. Bundles the AlgoKiller methodology as skills + a local MCP server (26 tools) that drives the native ak_search engine over GB-scale trace files. v1.1.0 promotes anti-hallucination hard rules to a single source of truth (context/critical-rules.md) injected via SessionStart as the plugin's equivalent of --append-system-prompt, and upgrades PreCompact dump to schema v2 — active hypotheses, rejected paths, tool-call ledger, structured markdown — so post-compact rehydration rebuilds the runtime *work semantics* per the Harness Engineering playbook, not just the interpretation layer.",
   "author": {
     "name": "cloudza",
     "url": "https://github.com/icloudza"

@@ -1,6 +1,18 @@
 ## Post-compact context restoration
 
-The previous session was just compacted. Re-read these rules before continuing — they are NOT covered by the conversation summary the compactor produced:
+The previous session was just compacted. Re-read these rules before continuing — they are NOT covered by the conversation summary the compactor produced.
+
+### Critical rules still apply (do not relax post-compact)
+
+The full anti-hallucination ruleset lives in `context/critical-rules.md` and was injected at session start. After compact, these rules in particular are the ones models historically forget first — re-anchor on them before resuming:
+
+- **R2** SIMD broadcast (`movi v*.16b, #imm`) ≠ AES Tbox. Don't promote it back to AES on second pass.
+- **R3** `call_kind = "arc_bookkeeping"` hexdumps are receiver side-effects, not algo inputs.
+- **R4** `block_count_estimate` IS the block count. Do not divide.
+- **R6** Every "高置信推断 / high-confidence inference" tier claim requires `[H<n>]` ledger citation.
+- **C1** **First tool call after compact MUST be `hypothesis_list`** — verify ledger state matches the conversation summary before doing anything else.
+
+### Compact-specific rules
 
 ### Hypothesis ledger references survive compact
 

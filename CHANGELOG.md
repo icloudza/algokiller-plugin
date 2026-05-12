@@ -4,6 +4,80 @@ All notable changes to **algokiller-plugin** are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] — Anti-hallucination SSOT + compact work-semantics rebuild
+
+Harness Engineering audit pass against the
+[harness-books book 1](https://github.com/wquguru/harness-books/blob/main/book1-claude-code/README.md)
+("Prompt is the control plane" Ch 2, "Context governance" Ch 5,
+"Errors and recovery" Ch 6). Focused on the two highest-ROI gaps for
+the reverse-engineering domain, where AI subjective behaviour
+decides everything and a hallucinated cipher constant can poison a
+whole `recovered.py`.
+
+### Added
+
+- **`context/critical-rules.md` — anti-hallucination single source of
+  truth.** 96 lines / 8 KB, 5 sections: Identity / Anti-hallucination
+  hard rules (R1–R8) / Behaviour boundaries (B1–B5) / Output discipline
+  (O1–O4) / Compact discipline (C1–C3). R2 codifies "SIMD broadcast ≠
+  AES Tbox", R3 ARC bookkeeping hexdumps, R4 `block_count_estimate` is
+  the block count (do not divide) — the three drift modes most
+  responsible for false algorithm IDs in the trace-analysis history.
+  If a SKILL.md or agent.md contradicts a rule here, this file wins.
+
+- **`SessionStart(startup|resume)` now streams `critical-rules.md` to
+  stdout.** Claude Desktop treats SessionStart hook stdout as
+  additional system context — this is the plugin's equivalent of
+  `claude --append-system-prompt`. Hard rules are now loaded on every
+  fresh / resumed session regardless of whether the user later
+  triggers any specific SKILL. ~8 KB budget impact per session.
+
+- **PreCompact dump schema v2.** `hooks/dump-session-state.py` now
+  preserves the full **work-semantics layer**, not just concluded
+  hypotheses. New fields:
+  - `active_hypotheses` with `latest_evidence` anchor — tells the
+    model what it was mid-verifying.
+  - `rejected_hypotheses` (abandoned + archived) — explicit "do not
+    walk back into" list.
+  - `recent_tool_calls` (last 8) with tool name, short args, and a
+    cheap substring-extracted `hits` signal — answers "did I already
+    run this and get 0 hits?" without re-running.
+  - Atomic writes (tmp + rename) so a SIGINT mid-dump can't leave a
+    half-file on disk.
+
+- **`_compact_state.md` is now produced alongside `_compact_state.json`.**
+  `SessionStart(compact)` cat-injects the markdown form. Section
+  headers (`### Active Hypotheses` / `### Rejected Paths` /
+  `### Tool Call Ledger`) survive model attention better than
+  JSON-in-code-fence, which historically got scanned past as raw
+  data. JSON kept for programmatic readers (`verify_hypothesis`,
+  `ak:status`).
+
+- **`context/post-compact-rules.md` now anchors the 5 most-forgotten
+  hard rules at the top** (R2 SIMD / R3 ARC / R4 block-count / R6
+  `[H<n>]` citation / C1 first-tool-call-must-be-`hypothesis_list`),
+  cross-linking the SSOT.
+
+### Tests
+
+- 3 new unit tests in `tests/python/test_hooks.py`:
+  - `test_summarise_includes_active_and_rejected`
+  - `test_summarise_reads_recent_tool_calls`
+  - `test_main_writes_both_json_and_md`
+- Full Python suite: 128 / 128 pass (was 125).
+
+### Design notes
+
+The two changes implement the book's `--append-system-prompt`-as-
+control-plane (Ch 2.6) and compact-rebuilds-work-semantics (Ch 5.6)
+patterns. We deliberately did **not** consolidate the 4 SKILL.md /
+4 agent.md scattered rule copies — the book's test for whether a
+rule is real control plane (Ch 2.3) is "does removing it change
+model behaviour?", and that has to wait for real-trace empirical
+data, not preemptive refactor.
+
+---
+
 ## [1.0.0] — Hooks + subagents + commands + slash-namespace rename
 
 First stable release. The plugin's behavioural surface is now declared
