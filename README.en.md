@@ -44,12 +44,14 @@ claude plugin update algokiller@algokiller-suite
    - Data flow: `trace_regflow` (register-value evolution) / `trace_producer` (nearest writer of a value) / `trace_semop` (11-class instruction classifier)
    - Health & volume: `trace_lint` (one-pass JSON summary) / `trace_fold` (block-aware folding, 115 MB → 1.1 MB)
    - Call graph: `trace_callgraph` (Top-K / xref) / `trace_modgraph` (cross-module matrix) / `trace_hexblock` (structured call+args+hexdump+ret)
-   - Crypto fingerprints: `trace_constscan` (**95** hash / cipher / ecc / crc / mac constants — v0.9.2 added MD5 T-table / SHA-256 K-table / SM3 round constants / HMAC ipad-opad / DES SP-box; each hit carries a real/weak/alu_only verdict) / `trace_cryptoinstr` (ARM Crypto Extensions hardware instructions: AES / SHA-1 / SHA-256 / SHA-512 / SHA-3 / SM3 / SM4 / GHASH) / `trace_bytes` (hex literal + auto byte-reverse)
+   - Crypto fingerprints: `trace_constscan` (**97** hash / cipher / ecc / crc / mac constants — 95 scalar literals + 2 NEON SIMD broadcasts; covers MD5 init+T-table / SHA-256 init+K-table / SM3 init+T_j / SHA-3 / CRC32 / AES sbox+Te0 / SM4 / ChaCha20 / Poly1305 / SipHash / HMAC ipad-opad (scalar + SIMD) / P-256 / secp256k1 / Ed25519 / Curve25519; each hit carries a `verdict` ∈ `real` / `real_simd` / `weak` / `alu_only`; MD5.T[i] / SHA256.K[i] etc. also expose `block_count_estimate`) / `trace_cryptoinstr` (ARM Crypto Extensions hardware instructions: AES / SHA-1 / SHA-256 / SHA-512 / SHA-3 / SM3 / SM4 / GHASH) / `trace_bytes` (hex literal + auto byte-reverse variants)
    - Static analysis: `run_static_tool` — allow-listed system CLIs (radare2 / binutils / LLVM / jtool2 / class-dump / ripgrep / jq)
 4. **Anti-drift reinjection**
    - Every tool return carries `discipline_reminder`; every 20 calls also includes `discipline_full_reinjection`
-5. **Sub-agents** (v0.9.0+)
+5. **Sub-agents**
    - `hypothesis-reviewer` — Independent blue-team reviewer spawned via the `Agent` tool before any `hypothesis_conclude(final_confidence="high")` on a load-bearing hypothesis. Read-only access to the ledger and trace; recommends `confirm` / `refute` / `abandon`. See [docs/agents.md](docs/agents.md).
+6. **Multi-threaded scan for large traces**
+   - `trace_constscan` / `trace_cryptoinstr` auto-partition the trace line range across worker threads (default = host CPU, capped at 16; overridable via the `threads` parameter). On a 4.5 GB / 48 M-line trace `constscan` runs in ~19 s with 8 threads (vs 121 s single-threaded); output is byte-identical across thread counts.
 
 ---
 
@@ -80,11 +82,7 @@ git clone https://github.com/icloudza/algokiller-plugin
 
 After install you should see `algokiller` under **Plugins** and `/algokiller:ciphertext` + `/algokiller:general` under **Slash commands**.
 
-If you previously installed the plugin manually (e.g. `algokiller@local-desktop-app-uploads`), uninstall it after switching to the marketplace install to avoid double-registration:
-
-```bash
-claude plugin uninstall algokiller@local-desktop-app-uploads
-```
+> If you previously registered the plugin from a local directory under the same name, uninstall it via `claude plugin uninstall <name>@<old-source>` after switching to the marketplace install to avoid double-registration.
 
 ---
 
@@ -187,7 +185,7 @@ printf '%s\n' \
   | python3 server/algokiller_mcp.py
 ```
 
-Expect: `initialize` response + `tools/list` advertising 25 tools (18 trace/artifact/static tools + 7 hypothesis-ledger tools — v0.9.1 added `mark_hypothesis_reviewed` and `hypothesis_archive`).
+Expect: `initialize` response + `tools/list` advertising 25 tools (18 trace/artifact/static tools + 7 hypothesis-ledger tools, including `mark_hypothesis_reviewed` and `hypothesis_archive`).
 
 ---
 

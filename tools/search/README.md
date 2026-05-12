@@ -14,10 +14,10 @@ High-throughput trace-evidence engine for very large ARM64 trace files.
 
 Source of the native engine, vendored into the plugin repo so non-arm64-macOS users can build their own `ak_search` binary without cloning the upstream repo separately.
 
-- `./search.c`   — full source (single C11 translation unit, ~3 K lines after extension)
+- `./search.c`   — full source (single C11 translation unit, ~3.8 K lines)
 - `./Makefile`   — minimal builder
 - `./build.sh`   — thin wrapper around `make`
-- `./tests/`     — POSIX-sh harness, 146 assertions across all subcommands, hand-crafted fixtures
+- `./tests/`     — POSIX-sh harness, 173 assertions across all subcommands, hand-crafted fixtures
 
 The prebuilt runtime binary lives at [`../../server/bin/ak_search`](../../server/bin/ak_search) (arm64-macOS). The `tools/search/ak_search` produced by `make` here is a local build artifact and is git-ignored.
 
@@ -28,7 +28,7 @@ cd tools/search
 make                              # produces ./ak_search
 cp ak_search ../../server/bin/    # replace the prebuilt arm64 binary
 chmod +x ../../server/bin/ak_search
-./tests/run_tests.sh              # 146 PASS expected
+./tests/run_tests.sh              # 173 PASS expected
 ```
 
 The plugin auto-runs `chmod +x` + Gatekeeper xattr cleanup on `daemon.start()`. If you cross-compile or grab from CI, drop the binary at `server/bin/ak_search` and the plugin picks it up.
@@ -37,14 +37,16 @@ The plugin auto-runs `chmod +x` + Gatekeeper xattr cleanup on `daemon.start()`. 
 
 ```makefile
 CC      ?= cc
-CFLAGS  ?= -O3 -std=c11 -Wall -Wextra -Wpedantic
-LDFLAGS ?=
+CFLAGS  ?= -O3 -std=c11 -Wall -Wextra -Wpedantic -pthread
+LDFLAGS ?= -pthread
 ```
+
+`-pthread` is required for the data-parallel `constscan` / `cryptoinstr` workers (no-op on macOS where pthread is in libSystem; links libpthread on Linux).
 
 Override at command line:
 
 ```bash
-make CC=clang CFLAGS='-O3 -march=native -std=c11'
+make CC=clang CFLAGS='-O3 -march=native -std=c11 -pthread'
 make CC=aarch64-linux-gnu-gcc          # cross-compile for Linux arm64
 ```
 
@@ -71,8 +73,8 @@ ak_search fold      --in PATH --out PATH [--threshold N] [--block N]
 ak_search callgraph --file PATH (--to NAME | --top N) [--limit N]
 ak_search modgraph  --file PATH [--top N]
 ak_search hexblock  --file PATH --line N [--max-lines N]
-ak_search constscan   --file PATH [--samples N]
-ak_search cryptoinstr --file PATH [--samples N]
+ak_search constscan   --file PATH [--samples N] [--threads N]
+ak_search cryptoinstr --file PATH [--samples N] [--threads N]
 ak_search bytes       --file PATH --query 0xVAL [--limit N] [--with-text]
 ```
 
@@ -86,8 +88,8 @@ ak_search bytes       --file PATH --query 0xVAL [--limit N] [--with-text]
 | `callgraph` | `--top N` Top-K most-called `call func:` symbols; `--to NAME` lists every call site of NAME. | 0.4 s |
 | `modgraph`  | Cross-module transition matrix + per-module line counts + Top-K edges. | 0.45 s |
 | `hexblock`  | Parse a `call func: NAME(args)` block at `--line` into structured JSON: call, args, optional ObjC class, optional hexdumps with concatenated `bytes_hex`, terminating `ret`. | 0.15 s |
-| `constscan` | Scan for **95 curated cryptographic constants** across hash / cipher_sym / ecc / crc / mac (MD5 init+T-table / SHA-1 / SHA-256 init+K-table / SHA-512 / SM3 init+round-constants / SHA-3 / CRC32 / FNV-1a / AES sbox + Te0 / SM4 sbox + FK / ChaCha20 / TEA / DES SP-box / Whirlpool / Poly1305 / SipHash / HMAC ipad-opad / P-256 / secp256k1 / Ed25519 / Curve25519). **v0.9.2** added loop-body constants (MD5 T, SHA-256 K, SM3 T_j) — these are referenced 64× per block compression versus the IVs which appear once at init, so active-hash traces see them dominate the hit profile. Each hit carries a `verdict` (real / weak / alu_only) so ALU collisions are not mistaken for real load_imm/mem_r signals. | 11 s |
-| `cryptoinstr` | Scan for ARM Crypto Extensions hardware instructions: AES (aese/aesmc/aesd/aesimc), SHA-1 (sha1c/m/p/h/su0/su1), SHA-256 (sha256h/h2/su0/su1), SHA-512 (sha512h/h2/su0/su1), SHA-3 (eor3/rax1/xar/bcax), GHASH (pmull/pmull2), SM3 (sm3*), SM4 (sm4e/sm4ekey). Companion to `constscan` for hardware-accelerated crypto. | 0.3 s |
+| `constscan` | Scan for **97 curated cryptographic fingerprints** (95 scalar literals + 2 NEON SIMD broadcasts) across hash / cipher_sym / ecc / crc / mac: MD5 init+T-table, SHA-1, SHA-256 init+K-table, SHA-512, SM3 init+T_j round constants, SHA-3, CRC32, FNV-1a, AES sbox+Te0, SM4 sbox+FK+CK, ChaCha20, TEA, DES SP-box, Whirlpool, Poly1305, SipHash, **HMAC ipad/opad (scalar + `.16b, #0x36/0x5c` SIMD)**, P-256, secp256k1, Ed25519, Curve25519. Each scalar fingerprint (e.g. `MD5.T[1]`) fires **once per compression block** — `total_hits ≈ block count`; per-block fingerprints expose this directly via `block_count_estimate`. Each hit carries a `verdict` ∈ `real` / `real_simd` / `weak` / `alu_only` so ALU collisions are not mistaken for real signals. **Data-parallel**: line range is partitioned across worker threads (default = host CPU, max 16; override via `--threads N`); byte-identical output across thread counts. | ~11 s single-threaded → ~1.8 s with 8 threads on 684 MB / 7 M lines; scales to ~80 GB inputs within the 300 s MCP timeout |
+| `cryptoinstr` | Scan for ARM Crypto Extensions hardware instructions: AES (aese/aesmc/aesd/aesimc), SHA-1 (sha1c/m/p/h/su0/su1), SHA-256 (sha256h/h2/su0/su1), SHA-512 (sha512h/h2/su0/su1), SHA-3 (eor3/rax1/xar/bcax), GHASH (pmull/pmull2), SM3 (sm3*), SM4 (sm4e/sm4ekey). Companion to `constscan` for hardware-accelerated crypto. Same data-parallel `--threads N` support. | 0.3 s (8 threads) |
 | `bytes`     | Hex-literal search with automatic byte-reversed and leading-zero-stripped variants; default output is line + variant only (token-frugal). | 0.2 s |
 
 ## Output format

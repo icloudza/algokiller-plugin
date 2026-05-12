@@ -13,14 +13,14 @@ description: ARM64 trace 通用证据分析方法论。当用户给出一段 ARM
 
 你必须基于 trace 证据回答用户任务。不要编造指令、寄存器值、内存字节、函数边界、密钥、常量、字段语义、分支结果或调用关系。
 
-可用工具（均由 `algokiller` MCP server 提供, v0.6.0 共 17 个，按使用顺序分组）：
+可用工具（均由 `algokiller` MCP server 提供，按使用顺序分组）：
 
 **🔍 体检与总览（bind_trace 之后第一波必做）**
 - `algokiller.trace_lint`：单遍扫 trace 得 JSON 体检——行数 / 模块分布 / Top-K mnemonic / call_func 块数 / 寄存器观察率 / `format_ok` / `warnings`。先调一次确认 trace 格式可用 + 结构画像清晰；非 GumTrace 格式立即停止。
 - `algokiller.trace_callgraph --top N`：Top-K 最常被调的 `call func: NAME(args)` 符号 + 计数，一眼看见执行流热点（malloc / objc_msgSend / __memcpy / pthread_mutex_unlock / ...）。
-- `algokiller.trace_callgraph --to NAME`：查询哪些行调用了指定函数（substring 匹配）。比手动 `trace_search "call func: NAME"` 干净。
+- `algokiller.trace_callgraph --to NAME`：查询哪些行调用了指定函数（默认 exact 匹配，可选 prefix / substring）。比手动 `trace_search "call func: NAME"` 干净。
 - `algokiller.trace_modgraph --top N`：跨模块跳转矩阵——caller_mod → callee_mod 边权重 + 每模块行数。看模块边界跳转密度(如 app_main ↔ lib_net、target_sign ↔ libc++)。
-- `algokiller.trace_constscan`：扫 71 个密码学常数指纹。**必看 `verdict` 字段而不是 `total_hits`**：`real` = 真信号；`alu_only` = ALU 碰撞假阳必须忽略；`weak` = 间接信号。即使 general 模式，constscan 也能快速回答"代码里有没有 hash / 加密"。
+- `algokiller.trace_constscan`：扫密码学常数指纹（scalar literal 命中 + NEON SIMD 广播命中）。**必看 `verdict` 字段而不是 `total_hits`**：`real` = 真 scalar 信号；`real_simd` = NEON 广播证据（HMAC ipad/opad 等）；`alu_only` = ALU 碰撞假阳必须忽略；`weak` = 间接信号。即使 general 模式，constscan 也能快速回答"代码里有没有 hash / 加密"。
 - `algokiller.trace_cryptoinstr`：扫 ARM Crypto Extensions 硬件加密指令（aese/sha256h/sm4e/pmull/...）。constscan 看软件，cryptoinstr 看硬件——必须配对：constscan 0 + cryptoinstr 命中 = 硬件加密；constscan 命中 + cryptoinstr 0 = 软件加密；两者都 0 = 无加密 OR 白盒/混淆。
 
 **🔬 精准搜索与上下文**
@@ -47,66 +47,59 @@ description: ARM64 trace 通用证据分析方法论。当用户给出一段 ARM
 
 ---
 
-## Hypothesis Ledger 使用纪律 (v0.9.3+ 真 trace audit 后收紧)
+## Hypothesis Ledger 使用纪律
 
-**底层逻辑变更**:v0.9.2 一次真实大规模 trace audit(684 MB / 7.1M 行 ARM64
-trace)暴露了一个 general 模式盲点 —— 旧版 SKILL 写 "general 模式不强制走
-Hypothesis Ledger",导致 agent 在交付物里放 7+ 条"高置信推断"档结论但
-**零 `[H<n>]` 引用**,绕过了 v0.9.0/v0.9.1 反幻觉硬 gate。v0.9.3 起 general
-模式规则收紧:
+general 模式同样必须走 ledger。在交付物里直接写"高置信推断"档结论而没有 `[H<n>]` 引用是被 server 端硬 gate 直接拒的。
 
-### 三档 claim 分类(交付物撰写时必须严格遵守)
+### 三档 claim 分类（交付物撰写时必须严格遵守）
 
 | 档位 | 定义 | 是否要 [H<n>] 引用 | 示例 |
 |---|---|---|---|
-| **已确认** (wire boundary confirmed) | trace 直接观察到的事实 | 否(观察级,不算推断) | "line 8872 hexdump 4192 字节 = HTTP header" |
-| **高置信推断** (high-confidence inference) | 跨多条证据综合的算法/语义判断 | **是,必须 [H<n>]** | "binary 在做 SM3 主压缩循环",必须有 hypothesis_conclude(>=medium) |
-| **推断** / **猜测** (inference / hypothesis) | 单点 / 间接证据 | 推荐 [H<n>] | "AES 模式可能是 CBC"(open thread) |
+| **已确认** (wire boundary confirmed) | trace 直接观察到的事实 | 否（观察级，不算推断） | "line 8872 hexdump 4192 字节 = HTTP header" |
+| **高置信推断** (high-confidence inference) | 跨多条证据综合的算法/语义判断 | **是，必须 [H<n>]** | "binary 在做 SM3 主压缩循环"，必须有 hypothesis_conclude(>=medium) |
+| **推断** / **猜测** (inference / hypothesis) | 单点 / 间接证据 | 推荐 [H<n>] | "AES 模式可能是 CBC"（open thread） |
 
 ### 何时建 hypothesis
 
-凡是交付物里准备打"**高置信推断**"标签的结论,**写到 artifact 之前**必须:
+凡是交付物里准备打"**高置信推断**"标签的结论，**写到 artifact 之前**必须：
 
 1. `hypothesis_add(statement, confidence='low', falsification_plan, supporting=[...])`
    —— `supporting` 必须包含 ≥1 个 evidence(tool_call_id + verbatim excerpt)
-2. 继续收集证据到 supporting >= 2 且来自 ≥2 个不同 tool(FIX#3 diversity)
-3. 跑 falsification_plan,把 result 作为 `falsification_evidence` update 进去
-   (FIX#5)
+2. 继续收集证据到 supporting ≥ 2 且来自 ≥ 2 个不同 tool（diversity 强制）
+3. 跑 falsification_plan，把 result 作为 `falsification_evidence` update 进去
 4. `hypothesis_conclude(id, final_statement, final_confidence='medium')`
-5. artifact 里用 `[H<n>]` 引用(v0.9.1 起 bracket 格式;裸 H<n> 不再识别)
+5. artifact 里用 `[H<n>]` bracket 格式引用（裸 `H<n>` 不识别）
 
-### conclude(high) 必经蓝军 (沿用 v0.9.0)
+### conclude(high) 必经蓝军审查
 
-当任务**会驱动一个具体技术决策**(例如"这个 buffer 是被算法 X 加密的"会决定
-后续如何还原数据流)且需要 `conclude(high)` 时,**必须** spawn
-`hypothesis-reviewer` 做独立蓝军审查:
+当任务**会驱动一个具体技术决策**（例如"这个 buffer 是被算法 X 加密的"会决定
+后续如何还原数据流）且需要 `conclude(high)` 时，**必须** spawn
+`hypothesis-reviewer` 做独立蓝军审查：
 
 ```
 Agent(subagent_type="hypothesis-reviewer",
       prompt="Review H<N>. Statement: '<…>'. Bound trace: <path> (mode=general)")
 ```
 
-reviewer 自己会调 `mark_hypothesis_reviewed`,server 端 FIX#6 hard gate 检查
-verdict='confirm' 且 ≤30 tool 调用陈旧。详见 `algokiller:ciphertext-recovery`
-skill 的 "conclude(high) 必经蓝军审查" 章节。
+reviewer 自己会调 `mark_hypothesis_reviewed`。server 端 hard gate 要求
+`verdict='confirm'` 且记录与当前调用的距离 ≤ 30 次工具调用，否则 conclude(high) 直接被拒。
 
-### v0.9.3 write_artifact 新增 gate
+### write_artifact 高置信 marker gate
 
-如果交付物 content 含以下 **"高置信推断" tier marker**(中英任意),server 端
-扫一遍,**只要 marker 出现就要求 [H<n>] 引用至少一个 concluded 假设**:
+如果交付物 content 含以下 **"高置信推断" tier marker**（中英任意，大小写不敏感），server 端
+扫一遍，**只要 marker 出现就要求 [H<n>] 引用至少一个 concluded 假设**：
 
-中文: `高置信推断` `high-confidence inference` `high confidence` (大小写不敏感)
-英文: `high-confidence inference` `high-confidence` `high confidence`
+中文：`高置信推断`
+英文：`high-confidence inference` / `high-confidence` / `high confidence`
 
-**没引用 = 直接拒**,错误信息会告诉你具体哪段含 marker。**这是 v0.9.3 关闭真
-trace audit gap 1 的硬抓手**,不是建议,是 enforce。
+**没引用 = 直接拒**，错误信息会告诉你具体哪段含 marker。不是建议，是 enforce。
 
-### 例外:已确认 / 推断 tier 不受影响
+### 例外：已确认 / 推断 tier 不受影响
 
-只要你不打"高置信推断"档标签,可以自由叙述。例如 §4 hexdump 解 ASCII 后
-回写出 HTTP header 字段值是"已确认"档,不需要 [H<n>]。但**一旦你在叙事里
+只要你不打"高置信推断"档标签，可以自由叙述。例如 hexdump 解 ASCII 后
+回写出 HTTP header 字段值是"已确认"档，不需要 [H<n>]。但**一旦你在叙事里
 说"binary 在做 SM3" / "AES 用 CBC 模式" / "MD5 输入是 sentinel"这种跨证据
-综合判断,必须先走 ledger 闭环**。
+综合判断，必须先走 ledger 闭环**。
 
 ---
 
@@ -144,9 +137,12 @@ trace audit gap 1 的硬抓手**,不是建议,是 enforce。
 - 每次调用 `trace_search` 必须显式携带 `limit`，并且只能在 `from_line` 与 `before_line` 中选择一个：`from_line` 向后搜索，`before_line` 只搜索该行之前的内容并按最近命中优先返回；每次调用 `trace_context` 必须显式携带 `before` 和 `after`。所有条数参数最大值都是 100。
 - 先用 `trace_search` 定位证据，再用 `trace_context` 展开上下文。
 - 如果搜索命中的是 call/hexdump/ret 行，**优先用 `trace_hexblock --line N`** 一次拿结构化 call/args/hexdumps/ret，不要手拼 hexdump 行。仅当 hexblock 失败（非 call 行）时退回 `trace_context`。
+- **`trace_hexblock` 返回的 `call_kind` 字段必读**。值为 `"arc_bookkeeping"` 时表示这是 `objc_retain*` / `objc_autorelease*` / `objc_release` / `swift_retain` / `swift_release` / `swift_bridgeObject*` / `_Block_*` 系列引用计数调用，附带的 hexdump 是 Frida-stalker 对 receiver 对象的**副作用 dump**，不是任何算法的输入/输出。block 上的 `arc_warning` 字段把这条规则原文复述出来，必须读。值为 `"normal"` 才能把 hexdump 当算法证据使用。
+- **`trace_constscan` 返回里 `verdict="real_simd"` 的指纹是 NEON 广播证据**。`HMAC.ipad.simd_movi` / `HMAC.opad.simd_movi` 的 `total_hits` 是 HMAC 调用次数的可靠上界（一次 HMAC init = 一次 `movi v*.16b, #imm` 广播）。当 `real_simd` 命中存在时，同表里 scalar `HMAC.ipad` / `HMAC.opad` 的 `total_hits` 通常是 byte-juggling memcpy 噪声（从已填好的 pad 缓冲 reload 出来再 store），**不能再除以 16 估 HMAC 次数**；用 `evidence.mem_r >> evidence.load_imm` 可以二次确认这条噪声判定。
+- **`trace_constscan` 返回里带 `block_count_estimate` 字段的指纹**：`MD5.T[i]` / `SHA256.K[i]` / `SM3.T_j[*]`。这些常数**每个 fingerprint 在每个压缩 block 里恰好出现 1 次**（整张 T/K 表 64 entries 跨 64 轮，但单个 entry 单 block 命中 1 次），因此 `total_hits ≈ block 数`，**不要再除以 4 / 16 / 64**（这是 trace audit 反复出现的算术错误）。block 上附带的 `block_count_note` 把这条规则原文重述。
 - 每轮 `trace_search` 前先明确本轮搜索目的：定位实例、找最近来源、找后续消费者、验证字段边界、确认分支条件、寻找调用边界、验证算法/解析假设或排除冲突命中。不要把同一次搜索结果同时解释成多个角色。
 
-**用扩展工具替代手工 trace_search 循环（v0.6.0）**
+**用扩展工具替代手工 trace_search 循环**
 
 | 你想做 | 老姿势 | ✅ 新姿势 |
 |---|---|---|
@@ -157,8 +153,8 @@ trace audit gap 1 的硬抓手**,不是建议,是 enforce。
 | 看热点 callees | `trace_search "call func:"` 翻 | `trace_callgraph --top N` |
 | 看跨模块调用 | LLM 数 `[mod]` 行 | `trace_modgraph --top N` |
 | 找 hex 全命中 | trace_search 100 cap | `trace_bytes --query 0xVAL --limit 10000` |
-| 大 trace 跑不动 | 苦撑 | `trace_fold --out_path /tmp/fold.trace --block 4 --threshold 100` |
-- hex/字节按字节处理。`0x` 前缀查询由 server 自动 fallback（reversed / leading-zero-trim），命中变体时返回里 `fallback_query` 字段标明；其他 hex 形式（`08 d2 11` / `08d211`）需自己尝试原序 + 反序。
+| 大 trace 跑不动 | 苦撑 | `trace_fold --out_filename fold.trace --block 4 --threshold 100` |
+- **hex 字面量搜索：不要用 `trace_search` 期待自动反序**。`trace_search` 对 `0x...` 查询是字面 substring 匹配；零命中时它只返回一条 hint 指向 `trace_bytes`，不会自动 fallback 反序或剥前导零。要搜一个值在 trace 全局出现多少次，直接 `trace_bytes --query 0xVAL`，它会**显式**枚举原序 / byte-reversed / 剥前导零等变体，并在结果里给每个变体单独的命中数，避免把反序匹配误读成原值出现位置。
 - >4 字节查询：完整失败后用 2-4 个高辨识度 4 字节滑动窗口；命中冲突 / 低熵窗口才换 offset 或扩 5-8 字节。
 - 小步搜索、小范围上下文。询问用户的限制见下面"输入假设与询问限制"。
 
@@ -249,6 +245,32 @@ open thread: <发现描述>
 5. 不要把 hexdump 右侧 ASCII 当作字段边界。严格解析必须以左侧 hex bytes、address 和 length 为准；ASCII 只作为搜索和语义提示。
 6. 最早命中和最近命中都只是候选。必须结合上下文判断它是来源、构造、复制、解析、比较、检测、消费、日志、上报还是旧数据。
 7. 如果已获得足够证据回答当前问题，不要继续无界追踪。默认只对关键结论补一轮高质量交叉验证：另一个字段/相邻字节/调用参数/返回值/分支指令/消费者。
+
+### 证据陷阱清单（任何 hexdump 引用 / HMAC 次数估算 / hash 数据量估算之前先读完）
+
+**陷阱 1：ARC 副作用 hexdump ≠ 独立的算法输入**
+
+Frida-stalker 在 `objc_retain*` / `objc_autorelease*` / `objc_release` / `swift_retain` / `swift_release` / `swift_bridgeObject*` / `_Block_*` 上都会把 receiver 对象的内存 dump 一份作为副作用。一次 `dataWithJSONObject:` 返回的 NSData 会很自然地被三连 ARC（retainAutoreleasedReturnValue + autoreleaseReturnValue + retainAutoreleasedReturnValue）封装，trace 上看起来像"同一段 buffer 出现了 3 次 hexdump"——**这是 1 个 buffer，不是 3 个独立算法输入**。
+
+- 处置：`trace_hexblock` 返回的 `call_kind` 是 `"arc_bookkeeping"` 时直接放弃用作算法输入。沿 trace 向上找产生这个 buffer 的真正 call（通常是 `NSJSONSerialization dataWithJSONObject:` / `NSString getCStringMaxLength:` / `_objc_storeStrong` 之上的 `dataUsingEncoding:`），把那个 call 的 hexdump 当算法输入。
+- 反例：如果连续多个 hexdump 来自同一 receiver 但 address+length 不同，那是真的多输入，不是 ARC 噪声。
+
+**陷阱 2：scalar `0x36363636` / `0x5c5c5c5c` 命中数 ≠ HMAC 次数**
+
+现代 aarch64 编译（iOS Swift / Android NDK clang -O 等）的 HMAC 实现大量走 NEON 路径：`movi v0.16b, #0x36` 一条指令完成 ipad 的 16 字节广播；scalar `0x36363636` 出现的位置往往是后续 `ldur w11,[buf,#k]; rev w11; str w11,[dst]` 这种 **byte-juggling memcpy** 在重读已经填好的 ipad 缓冲——和 HMAC 次数脱钩。**不是说 scalar 路径已死**：runtime `ipad[i] = key[i] ^ 0x36` 实现、非 NEON 编译、ARMv7 / WASM 桥接等仍会出 scalar 真信号；scalar 与 SIMD 也可能在同一 binary 里同时出现（密钥 prep 走 scalar、内部循环走 NEON）。
+
+- 处置：`trace_constscan` 里看 `HMAC.ipad.simd_movi` / `HMAC.opad.simd_movi` 的 `total_hits`（verdict=`real_simd`），这是 HMAC 调用次数的**上界**（一次 HMAC = 一次 broadcast）。
+- 同表 scalar `HMAC.ipad` / `HMAC.opad`：先看 `evidence`，如果 `mem_r >> load_imm` 判定为 memcpy reload 噪声、丢弃；如果 `load_imm > 0` 且 SIMD 行不存在或为 0，scalar `load_imm / 16` 才是 HMAC 次数估计。
+- 不要把 SIMD 与 scalar 两边数字简单相加——它们大概率描述同一段 HMAC，相加是重复计数。
+
+**陷阱 3：`MD5.T[i]` / `SHA256.K[i]` / `SM3.T_j[*]` 命中数 = block 数（不要除）**
+
+注意区分两个概念：**整张 T / K 表**和**单个 T[i] / K[i] fingerprint**。MD5 一次压缩走 64 轮、每轮用 T[1..64] 各 1 个，所以整张表跨 64 轮总共被读 64 次；但 constscan 是按 fingerprint 单独计数的，**单个 T[i] 在每 block 出现恰好 1 次**。因此 `MD5.T[1]=114` 意味着 **114 个 MD5 block 压缩**（≈ 7 KB 输入数据），**不是 114÷64=1.8 块、也不是 114÷4=28 块**。SHA256.K[i] / SM3.T_j 同理。
+
+- 处置：`trace_constscan` 返回的 `block_count_estimate` 字段直接是 block 数，照抄即可。需要 KB 数就乘 64（MD5/SHA-256 block size）；SHA-512 / SHA-3 是 128 / r=1088 bit 不一样，按算法 block size 折算。
+- 交叉校验：如果同算法的多个 fingerprint（MD5.T[1..4]）命中数差异 > 5%，说明 trace 中有部分 block 命中被 fold 折叠或者中间 trace 截断，取**最小值**作为保守 block 数估计。
+
+---
 
 ### 字段含义分析方法
 

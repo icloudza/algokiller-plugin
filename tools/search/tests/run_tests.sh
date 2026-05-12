@@ -410,6 +410,116 @@ count=$(printf '%s\n' "$out_noise" | python3 -c "import json,sys; print(len(json
 assert_eq "cryptoinstr on mini.trace returns 0 hits" "0" "$count"
 
 # -----------------------------------------------------------------------------
+echo "[test] FIX F-16: hexblock call_kind + arc_warning (v0.9.6)"
+ARC_FIXTURE=tests/fixtures/v096-arc-and-simd.trace
+
+# ARC bookkeeping line (objc_retainAutoreleasedReturnValue at line ~21 in fixture)
+arc_line=$(grep -n 'call func: objc_retainAutoreleasedReturnValue' "$ARC_FIXTURE" | head -1 | cut -d: -f1)
+out_arc=$($BIN hexblock --file "$ARC_FIXTURE" --line "$arc_line")
+assert_contains "ARC call tagged call_kind=arc_bookkeeping" '"call_kind":"arc_bookkeeping"' "$out_arc"
+assert_contains "ARC block carries arc_warning" '"arc_warning":"call_kind=' "$out_arc"
+assert_contains "arc_warning explains Frida-stalker side-effect" 'Frida-stalker side-effect' "$out_arc"
+
+# Normal call (memcpy at the end of the fixture)
+mc_line=$(grep -n 'call func: __memcpy_aarch64_simd' "$ARC_FIXTURE" | head -1 | cut -d: -f1)
+out_mc=$($BIN hexblock --file "$ARC_FIXTURE" --line "$mc_line")
+assert_contains "memcpy stays call_kind=normal" '"call_kind":"normal"' "$out_mc"
+# Make sure arc_warning is NOT emitted on normal calls
+warning_count=$(printf '%s' "$out_mc" | grep -c 'arc_warning')
+assert_eq "memcpy has no arc_warning" "0" "$warning_count"
+
+# -----------------------------------------------------------------------------
+echo "[test] FIX F-17: constscan SIMD broadcast + per-block hint (v0.9.6)"
+out_sc=$($BIN constscan --file "$ARC_FIXTURE")
+
+# SIMD movi patterns appended as synthetic fingerprints
+assert_contains "HMAC.ipad.simd_movi appended" '"fingerprint":"HMAC.ipad.simd_movi"' "$out_sc"
+assert_contains "HMAC.opad.simd_movi appended" '"fingerprint":"HMAC.opad.simd_movi"' "$out_sc"
+assert_contains "SIMD verdict labelled real_simd" '"verdict":"real_simd"' "$out_sc"
+assert_contains "ipad match_pattern emitted" '"match_pattern":".16b, #0x36"' "$out_sc"
+assert_contains "opad match_pattern emitted" '"match_pattern":".16b, #0x5c"' "$out_sc"
+
+# Per-block hint attached to MD5.T[1] and SHA256.K[0]
+md5t1=$(printf '%s' "$out_sc" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+for h in d['hits']:
+    if h['fingerprint']=='MD5.T[1]':
+        print(json.dumps(h, separators=(',',':')));break
+")
+assert_contains "MD5.T[1] has block_count_estimate" '"block_count_estimate":1' "$md5t1"
+assert_contains "MD5.T[1] primitive_for_blocks=MD5" '"primitive_for_blocks":"MD5"' "$md5t1"
+assert_contains "MD5.T[1] block_count_note present" 'Do NOT divide by 4/16/64' "$md5t1"
+
+sha256k0=$(printf '%s' "$out_sc" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+for h in d['hits']:
+    if h['fingerprint']=='SHA256.K[0]':
+        print(json.dumps(h, separators=(',',':')));break
+")
+assert_contains "SHA256.K[0] has block_count_estimate" '"block_count_estimate":1' "$sha256k0"
+assert_contains "SHA256.K[0] primitive=SHA-256" '"primitive_for_blocks":"SHA-256"' "$sha256k0"
+
+# MD5.A (IV, not per-block) should NOT have block_count_estimate
+md5a=$(printf '%s' "$out_sc" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+for h in d['hits']:
+    if h['fingerprint']=='MD5.A':
+        print(json.dumps(h, separators=(',',':')));break
+")
+assert_eq "MD5.A (IV) has no block_count_estimate" "0" "$(printf '%s' "$md5a" | grep -c 'block_count_estimate')"
+
+# Boundary check: .16b, #0x361 should NOT match HMAC.ipad.simd_movi
+# (the fixture doesn't have such a line; confirm count is exactly 2 ipad hits)
+ipad_total=$(printf '%s' "$out_sc" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+for h in d['hits']:
+    if h['fingerprint']=='HMAC.ipad.simd_movi':
+        print(h['total_hits']);break
+")
+assert_eq "ipad total_hits exact (2 in fixture)" "2" "$ipad_total"
+
+# -----------------------------------------------------------------------------
+echo "[test] FIX F-18: parallel scan determinism (constscan / cryptoinstr)"
+# --threads 1 vs --threads 4 must produce byte-identical JSON. Locks in the
+# determinism invariant of the data-parallel constscan / cryptoinstr workers.
+# If this ever fails, the merge step lost ordering (likely sample_lines).
+PAR_FIXTURES="tests/fixtures/sprint34.trace tests/fixtures/v092-constscan.trace tests/fixtures/sprint5-constscan.trace tests/fixtures/v096-arc-and-simd.trace"
+for F in $PAR_FIXTURES; do
+    for SUB in constscan cryptoinstr; do
+        s1=$($BIN $SUB --file "$F" --threads 1 2>/dev/null)
+        s4=$($BIN $SUB --file "$F" --threads 4 2>/dev/null)
+        if [ "$s1" = "$s4" ]; then
+            echo "  PASS  $SUB $(basename $F): --threads 1 == --threads 4"
+            PASS=$((PASS+1))
+        else
+            echo "  FAIL  $SUB $(basename $F): --threads 1 != --threads 4"
+            echo "        single: $s1" | head -c 400
+            echo "        eight : $s4" | head -c 400
+            FAIL=$((FAIL+1))
+        fi
+    done
+done
+
+# Bad --threads values must be rejected.
+out_bad=$($BIN constscan --file tests/fixtures/sprint34.trace --threads 0 2>&1)
+rc=$?
+if [ $rc -ne 0 ] && echo "$out_bad" | grep -q "invalid --threads"; then
+    echo "  PASS  --threads 0 rejected"; PASS=$((PASS+1))
+else
+    echo "  FAIL  --threads 0 should be rejected (rc=$rc)"; FAIL=$((FAIL+1))
+fi
+out_bad=$($BIN cryptoinstr --file tests/fixtures/sprint34.trace --threads 100 2>&1)
+rc=$?
+if [ $rc -ne 0 ] && echo "$out_bad" | grep -q "invalid --threads"; then
+    echo "  PASS  --threads 100 rejected (cap=64)"; PASS=$((PASS+1))
+else
+    echo "  FAIL  --threads 100 should be rejected (rc=$rc)"; FAIL=$((FAIL+1))
+fi
+
 echo ""
 echo "==================================================="
 echo "  PASS=$PASS  FAIL=$FAIL"

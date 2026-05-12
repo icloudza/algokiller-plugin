@@ -1,6 +1,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -14,6 +15,74 @@
 #ifndef MAP_ANONYMOUS
 #define MAP_ANONYMOUS MAP_ANON
 #endif
+
+/* ===========================================================================
+ * Threading infrastructure (v0.9.7+).
+ *
+ * Scan-heavy subcommands (constscan, cryptoinstr) iterate the full line index
+ * once per fingerprint table. On tens-of-GB traces (~300M lines × 97
+ * fingerprints) this is the dominant cost — minutes per scan single-threaded,
+ * easily exceeding the MCP wrapper's 300s timeout and producing truncated
+ * results that look like "no crypto detected" to the agent. The accuracy hit
+ * is the real motivation: completeness within time budget.
+ *
+ * Strategy: data-parallel line-range partitioning. Each thread gets a
+ * contiguous [line_from, line_to] slice, accumulates into a thread-local
+ * result struct, then the main thread merges. The mmap'd buffer and the
+ * line index are shared read-only — no locking, no atomics on the hot path.
+ *
+ * Determinism: with N threads we produce byte-identical output to N=1 by:
+ *   - summing counters (commutative)
+ *   - merging sample_lines as a sorted multiset, then taking the first K
+ *     in line-order (matches single-threaded "first K in scan order")
+ * Native tests exercise both N=1 and N=4 against the same fixture to lock
+ * this property in.
+ * ===========================================================================
+ */
+
+static int detect_default_threads(void) {
+    long n = -1;
+#ifdef _SC_NPROCESSORS_ONLN
+    n = sysconf(_SC_NPROCESSORS_ONLN);
+#endif
+    if (n < 1) n = 1;
+    /* Cap. Beyond 16 the marginal speedup is dwarfed by memory-bandwidth
+     * saturation and merge cost; the cap also protects shared CI runners. */
+    if (n > 16) n = 16;
+    return (int)n;
+}
+
+/* CLI parses --threads into this; 0 means "use detect_default_threads()". */
+static int g_thread_count = 0;
+
+static int get_thread_count(void) {
+    if (g_thread_count <= 0) return detect_default_threads();
+    return g_thread_count;
+}
+
+/* Compute [line_from, line_to] (1-based inclusive) for worker index t of N. */
+static void partition_line_range(uint64_t total, int t, int nthreads,
+                                 uint64_t *line_from, uint64_t *line_to) {
+    if (nthreads <= 1 || total == 0) {
+        *line_from = 1; *line_to = total; return;
+    }
+    uint64_t per = total / (uint64_t)nthreads;
+    uint64_t rem = total % (uint64_t)nthreads;
+    uint64_t start = 0, end;
+    for (int i = 0; i <= t; i++) {
+        uint64_t chunk = per + (((uint64_t)i < rem) ? 1 : 0);
+        end = start + chunk;
+        if (i == t) { *line_from = start + 1; *line_to = end; return; }
+        start = end;
+    }
+    *line_from = 1; *line_to = total;  /* unreachable */
+}
+
+/* Comparator for uint64_t sample-line merge. */
+static int u64_cmp_asc(const void *a, const void *b) {
+    uint64_t va = *(const uint64_t *)a, vb = *(const uint64_t *)b;
+    if (va < vb) return -1; if (va > vb) return 1; return 0;
+}
 
 typedef struct {
     int fd;
@@ -2031,6 +2100,51 @@ static bool parse_hex_body(LineView line, char *hex_out, size_t hex_sz,
     return true;
 }
 
+/* FIX F-16 (v0.9.6): classify a `call func: NAME(...)` symbol as ObjC ARC /
+ * Swift refcount bookkeeping vs a normal helper. Real-world repro: XHS iOS
+ * register-di trace — Frida-stalker emits a hexdump of the receiver as a
+ * side effect on retain/autorelease/release, and an agent reading three
+ * consecutive same-address-same-length hexdumps from an ARC triplet
+ * (retainAutoreleasedReturnValue + autoreleaseReturnValue +
+ * retainAutoreleasedReturnValue around `dataWithJSONObject:`) concluded
+ * the payload was fed into three HMAC contexts. It wasn't.
+ *
+ * We accept both bare (`objc_release`) and decorated (`objc_retain_x0`,
+ * `objc_retainAutoreleasedReturnValue`, `swift_bridgeObjectRetain`) forms.
+ * The decorator must be either '_<...>' or 'CamelCase' suffix — bare alphas
+ * would mean a different family entirely.
+ */
+static const char *const ARC_BOOKKEEPING_PREFIXES[] = {
+    "objc_retain",
+    "objc_autorelease",
+    "objc_release",
+    "swift_retain",
+    "swift_release",
+    "swift_bridgeObjectRetain",
+    "swift_bridgeObjectRelease",
+    "_Block_copy",
+    "_Block_release",
+    NULL,
+};
+
+static bool is_arc_bookkeeping_name(const unsigned char *name, size_t name_len) {
+    for (size_t i = 0; ARC_BOOKKEEPING_PREFIXES[i] != NULL; i++) {
+        const char *prefix = ARC_BOOKKEEPING_PREFIXES[i];
+        size_t plen = strlen(prefix);
+        if (name_len < plen) continue;
+        if (memcmp(name, prefix, plen) != 0) continue;
+        if (name_len == plen) return true;
+        unsigned char tail = name[plen];
+        /* '(' = exact match followed by args; '_' = decoration like
+         * objc_retain_x0; uppercase letter = CamelCase decoration
+         * like objc_retainAutoreleasedReturnValue. */
+        if (tail == '(' || tail == '_' || (tail >= 'A' && tail <= 'Z')) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static int run_hexblock(const IndexedFile *indexed, uint64_t target_line, uint64_t max_lines) {
     if (target_line == 0 || target_line > indexed->index.count) {
         fprintf(stderr, "hexblock: --line out of range\n");
@@ -2043,11 +2157,14 @@ static int run_hexblock(const IndexedFile *indexed, uint64_t target_line, uint64
         fprintf(stderr, "hexblock: line %" PRIu64 " is not a 'call func:' line\n", target_line);
         return 1;
     }
+    bool arc_bookkeeping = is_arc_bookkeeping_name(name, name_len);
 
     fputs("{\"type\":\"hexblock\",\"line\":", stdout);
     printf("%" PRIu64, target_line);
     fputs(",\"call\":", stdout);
     json_write_string(name, name_len);
+    fputs(",\"call_kind\":", stdout);
+    fputs(arc_bookkeeping ? "\"arc_bookkeeping\"" : "\"normal\"", stdout);
 
     /* extract args: substring between first '(' and final ')' on call_line */
     const unsigned char *call_end = call_line.start + call_line.len;
@@ -2149,6 +2266,24 @@ static int run_hexblock(const IndexedFile *indexed, uint64_t target_line, uint64
     if (ret_buf[0] != '\0') {
         fputs(",\"ret\":", stdout);
         json_write_cstr(ret_buf);
+    }
+    /* FIX F-16: surface the ARC pitfall as an explicit warning whenever a
+     * refcount helper carries hexdumps. The wording is intentionally
+     * deterministic so agents can match on it programmatically. */
+    if (arc_bookkeeping && first_dump_emitted) {
+        fputs(",\"arc_warning\":\"", stdout);
+        fputs("call_kind='arc_bookkeeping': this is an ObjC/Swift "
+              "reference-count call, not an algorithmic helper. The "
+              "hexdump(s) shown are Frida-stalker side-effect dumps of "
+              "the receiver object — NOT inputs/outputs of any cipher/"
+              "hash/HMAC operation. Two or more consecutive ARC blocks "
+              "dumping the same address+length represent ONE buffer "
+              "being retained/autoreleased multiple times, not N "
+              "independent algorithm invocations. Anchor evidence to "
+              "the upstream call that PRODUCED the buffer (e.g. "
+              "NSJSONSerialization dataWithJSONObject:), not these "
+              "ARC bookkeeping dumps.", stdout);
+        fputc('"', stdout);
     }
     printf(",\"lines_scanned\":%" PRIu64, scanned);
     fputs("}\n", stdout);
@@ -2424,6 +2559,54 @@ static const Fingerprint FINGERPRINTS[] = {
     {NULL, NULL, FP_WEAK, NULL},
 };
 
+/* FIX F-17 (v0.9.6): InstructionPattern table — substring matches against
+ * the disassembly text of the line, not against `-> reg=MAGIC` outputs.
+ * Needed because production iOS Swift / Android NDK builds compile
+ * HMAC pad init to NEON broadcasts (`movi v*.16b, #0x36`) which the
+ * scalar 32-/64-bit Fingerprint table cannot see.
+ *
+ * Adding a pattern here costs one extra BMH pass over the trace per
+ * pattern (same cost as adding a Fingerprint). Keep the list tight.
+ */
+typedef struct {
+    const char *name;
+    const char *category;
+    Confidence  conf;
+    const char *match_text;     /* substring of the disasm line */
+    const char *primitive;      /* logical primitive this points to */
+    const char *interpretation; /* short human-readable explanation */
+} InstructionPattern;
+
+static const InstructionPattern INSTR_PATTERNS[] = {
+    {"HMAC.ipad.simd_movi", "mac", FP_STRONG,
+     ".16b, #0x36", "HMAC.ipad",
+     "NEON broadcast of 0x36 across 16 bytes — canonical HMAC-* ipad "
+     "initialisation. Each hit corresponds to ONE HMAC inner-pad setup. "
+     "Use this as the upper bound on HMAC operation count."},
+    {"HMAC.opad.simd_movi", "mac", FP_STRONG,
+     ".16b, #0x5c", "HMAC.opad",
+     "NEON broadcast of 0x5c across 16 bytes — canonical HMAC-* opad "
+     "initialisation. Pair with ipad.simd_movi to confirm full HMAC pad "
+     "construction."},
+    {NULL, NULL, FP_WEAK, NULL, NULL, NULL},
+};
+
+/* For per-block constants (table-driven hash compression), each magic
+ * fires exactly once per block compression. Agents have repeatedly
+ * miscalculated this as total_hits / (4 | 16 | 64) — a 4× to 16× under-
+ * count of actual data processed. This helper returns a human-readable
+ * primitive label when the fingerprint's name matches a known per-block
+ * pattern; the constscan emitter attaches it as `block_count_estimate`.
+ */
+static const char *per_block_primitive_for(const char *fp_name) {
+    if (fp_name == NULL) return NULL;
+    if (strncmp(fp_name, "MD5.T[", 6) == 0) return "MD5";
+    if (strncmp(fp_name, "SHA256.K[", 9) == 0) return "SHA-256";
+    if (strcmp(fp_name, "SM3.T_j[0..15]") == 0) return "SM3 (×16 rounds/block)";
+    if (strcmp(fp_name, "SM3.T_j[16..63]") == 0) return "SM3 (×48 rounds/block)";
+    return NULL;
+}
+
 /* Evidence classification for a constscan hit line. The same magic may
  * appear in a line as: a movz/movk-built immediate (LOAD_IMM = real signal),
  * an ldr/ldp memory read producing the value (MEM_R = real signal, e.g. a
@@ -2542,28 +2725,56 @@ static const char *evidence_verdict(const EvidenceCounts *e) {
     return "other";
 }
 
-static int run_constscan(const IndexedFile *indexed, uint64_t limit_per_fp) {
-    size_t fp_count = 0;
-    while (FINGERPRINTS[fp_count].name != NULL) fp_count++;
+/* Per-(fingerprint × thread) accumulator. */
+#define CONSTSCAN_MAX_SAMPLES_PER_THREAD 16
 
-    fputs("{\"type\":\"constscan\",\"hits\":[", stdout);
-    bool emitted_any = false;
+typedef struct {
+    uint64_t total_hits;
+    EvidenceCounts ev;
+    uint64_t sample_lines[CONSTSCAN_MAX_SAMPLES_PER_THREAD];
+    size_t sample_n;
+} FpResult;
 
-    for (size_t f = 0; f < fp_count; f++) {
-        const Fingerprint *fp = &FINGERPRINTS[f];
-        BmhSearcher s;
-        if (bmh_init(&s, fp->magic_hex) != 0) return 1;
-        size_t mlen = strlen(fp->magic_hex);
+/* Instruction-pattern accumulator (no evidence breakdown — SIMD broadcasts
+ * are unambiguous by construction, just count + sample). */
+typedef struct {
+    uint64_t total_hits;
+    uint64_t sample_lines[CONSTSCAN_MAX_SAMPLES_PER_THREAD];
+    size_t sample_n;
+} IpResult;
 
-        uint64_t total_hits = 0;
-        EvidenceCounts ev = {0};
-        uint64_t sample_lines[16];
-        size_t sample_n = 0;
+typedef struct {
+    const IndexedFile *indexed;
+    uint64_t line_from, line_to;        /* 1-based inclusive */
+    /* Scalar fingerprint table (FINGERPRINTS) */
+    size_t fp_count;
+    const Fingerprint *fps;              /* shared, read-only */
+    const BmhSearcher *fp_searchers;     /* shared, read-only — bmh_find is const */
+    const size_t *fp_mlens;              /* shared, read-only */
+    FpResult *fp_results;                /* thread-local, size fp_count */
+    /* Instruction-pattern table (INSTR_PATTERNS) — SIMD broadcasts etc. */
+    size_t ip_count;
+    const InstructionPattern *ips;
+    const BmhSearcher *ip_searchers;
+    const size_t *ip_mlens;
+    IpResult *ip_results;                /* thread-local, size ip_count */
+    uint64_t limit_per_fp;
+} ConstscanWork;
 
-        for (uint64_t line_no = 1; line_no <= indexed->index.count; line_no++) {
-            size_t off = indexed->index.offsets[line_no - 1];
-            LineView line = line_at_offset(indexed->mapped.data, indexed->mapped.size, off);
-            const unsigned char *hit = bmh_find(&s, line.start, line.len);
+static void *constscan_worker(void *arg) {
+    ConstscanWork *w = (ConstscanWork *)arg;
+    const IndexedFile *indexed = w->indexed;
+    uint64_t cap = w->limit_per_fp;
+    if (cap > CONSTSCAN_MAX_SAMPLES_PER_THREAD) cap = CONSTSCAN_MAX_SAMPLES_PER_THREAD;
+    for (uint64_t line_no = w->line_from; line_no <= w->line_to; line_no++) {
+        size_t off = indexed->index.offsets[line_no - 1];
+        LineView line = line_at_offset(indexed->mapped.data, indexed->mapped.size, off);
+
+        /* Scalar fingerprint pass */
+        for (size_t f = 0; f < w->fp_count; f++) {
+            const Fingerprint *fp = &w->fps[f];
+            size_t mlen = w->fp_mlens[f];
+            const unsigned char *hit = bmh_find(&w->fp_searchers[f], line.start, line.len);
             if (hit == NULL) continue;
             /* boundary check — not a prefix of a longer hex run */
             const unsigned char *after = hit + mlen;
@@ -2574,23 +2785,179 @@ static int run_constscan(const IndexedFile *indexed, uint64_t limit_per_fp) {
                     continue;
                 }
             }
-            total_hits++;
+            FpResult *r = &w->fp_results[f];
+            r->total_hits++;
             EvidenceKind k = classify_evidence(line, fp->magic_hex, mlen);
             switch (k) {
-                case EV_LOAD_IMM:    ev.load_imm++;    break;
-                case EV_MEM_R:       ev.mem_r++;       break;
-                case EV_MEM_R_ADDR:  ev.mem_r_addr++;  break;
-                case EV_MEM_W:       ev.mem_w++;       break;
-                case EV_ALU:         ev.alu++;         break;
-                case EV_OTHER:       ev.other++;       break;
+                case EV_LOAD_IMM:    r->ev.load_imm++;    break;
+                case EV_MEM_R:       r->ev.mem_r++;       break;
+                case EV_MEM_R_ADDR:  r->ev.mem_r_addr++;  break;
+                case EV_MEM_W:       r->ev.mem_w++;       break;
+                case EV_ALU:         r->ev.alu++;         break;
+                case EV_OTHER:       r->ev.other++;       break;
             }
-            if (sample_n < limit_per_fp && sample_n < (sizeof(sample_lines)/sizeof(sample_lines[0]))) {
-                sample_lines[sample_n++] = line_no;
+            if (r->sample_n < cap) {
+                r->sample_lines[r->sample_n++] = line_no;
             }
         }
 
-        bmh_destroy(&s);
+        /* Instruction-pattern pass — same line, no extra cache miss. */
+        for (size_t f = 0; f < w->ip_count; f++) {
+            size_t mlen = w->ip_mlens[f];
+            const unsigned char *hit = bmh_find(&w->ip_searchers[f], line.start, line.len);
+            if (hit == NULL) continue;
+            /* Boundary check: substring must be followed by non-hex/non-alnum
+             * (so `.16b, #0x36` doesn't fire on `.16b, #0x361`). */
+            const unsigned char *after = hit + mlen;
+            if (after < line.start + line.len) {
+                unsigned char c = *after;
+                if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+                    (c >= 'A' && c <= 'F')) {
+                    continue;
+                }
+            }
+            IpResult *r = &w->ip_results[f];
+            r->total_hits++;
+            if (r->sample_n < cap) {
+                r->sample_lines[r->sample_n++] = line_no;
+            }
+        }
+    }
+    return NULL;
+}
+
+static int run_constscan(const IndexedFile *indexed, uint64_t limit_per_fp) {
+    size_t fp_count = 0;
+    while (FINGERPRINTS[fp_count].name != NULL) fp_count++;
+    size_t ip_count = 0;
+    while (INSTR_PATTERNS[ip_count].name != NULL) ip_count++;
+    if (limit_per_fp > 16) limit_per_fp = 16;
+
+    /* Pre-build BMH searchers once and share read-only across workers. */
+    BmhSearcher *fp_searchers = calloc(fp_count, sizeof(BmhSearcher));
+    size_t *fp_mlens = calloc(fp_count, sizeof(size_t));
+    BmhSearcher *ip_searchers = calloc(ip_count, sizeof(BmhSearcher));
+    size_t *ip_mlens = calloc(ip_count, sizeof(size_t));
+    if (!fp_searchers || !fp_mlens || !ip_searchers || !ip_mlens) {
+        free(fp_searchers); free(fp_mlens); free(ip_searchers); free(ip_mlens);
+        fprintf(stderr, "constscan: out of memory\n"); return 1;
+    }
+    for (size_t f = 0; f < fp_count; f++) {
+        if (bmh_init(&fp_searchers[f], FINGERPRINTS[f].magic_hex) != 0) {
+            for (size_t g = 0; g < f; g++) bmh_destroy(&fp_searchers[g]);
+            free(fp_searchers); free(fp_mlens); free(ip_searchers); free(ip_mlens);
+            return 1;
+        }
+        fp_mlens[f] = strlen(FINGERPRINTS[f].magic_hex);
+    }
+    for (size_t f = 0; f < ip_count; f++) {
+        if (bmh_init(&ip_searchers[f], INSTR_PATTERNS[f].match_text) != 0) {
+            for (size_t g = 0; g < fp_count; g++) bmh_destroy(&fp_searchers[g]);
+            for (size_t g = 0; g < f; g++) bmh_destroy(&ip_searchers[g]);
+            free(fp_searchers); free(fp_mlens); free(ip_searchers); free(ip_mlens);
+            return 1;
+        }
+        ip_mlens[f] = strlen(INSTR_PATTERNS[f].match_text);
+    }
+
+    int nthreads = get_thread_count();
+    /* On tiny traces (<32k lines), threading overhead dominates. Fall back
+     * to single-threaded — the determinism path is the same. */
+    if (indexed->index.count < 32768) nthreads = 1;
+    if ((uint64_t)nthreads > indexed->index.count) nthreads = (int)indexed->index.count;
+    if (nthreads < 1) nthreads = 1;
+
+    ConstscanWork *works = calloc((size_t)nthreads, sizeof(ConstscanWork));
+    pthread_t *threads = calloc((size_t)nthreads, sizeof(pthread_t));
+    FpResult *fp_per_thread = calloc((size_t)nthreads * fp_count, sizeof(FpResult));
+    IpResult *ip_per_thread = ip_count ? calloc((size_t)nthreads * ip_count, sizeof(IpResult)) : NULL;
+    if (!works || !threads || !fp_per_thread || (ip_count && !ip_per_thread)) {
+        free(works); free(threads); free(fp_per_thread); free(ip_per_thread);
+        for (size_t f = 0; f < fp_count; f++) bmh_destroy(&fp_searchers[f]);
+        for (size_t f = 0; f < ip_count; f++) bmh_destroy(&ip_searchers[f]);
+        free(fp_searchers); free(fp_mlens); free(ip_searchers); free(ip_mlens);
+        fprintf(stderr, "constscan: out of memory\n"); return 1;
+    }
+
+    for (int t = 0; t < nthreads; t++) {
+        ConstscanWork *w = &works[t];
+        w->indexed = indexed;
+        partition_line_range(indexed->index.count, t, nthreads,
+                             &w->line_from, &w->line_to);
+        w->fp_count = fp_count;
+        w->fps = FINGERPRINTS;
+        w->fp_searchers = fp_searchers;
+        w->fp_mlens = fp_mlens;
+        w->fp_results = &fp_per_thread[(size_t)t * fp_count];
+        w->ip_count = ip_count;
+        w->ips = INSTR_PATTERNS;
+        w->ip_searchers = ip_searchers;
+        w->ip_mlens = ip_mlens;
+        w->ip_results = ip_per_thread ? &ip_per_thread[(size_t)t * ip_count] : NULL;
+        w->limit_per_fp = limit_per_fp;
+    }
+
+    if (nthreads == 1) {
+        /* Skip pthread overhead on N=1; identical observable behaviour. */
+        constscan_worker(&works[0]);
+    } else {
+        for (int t = 0; t < nthreads; t++) {
+            int rc = pthread_create(&threads[t], NULL, constscan_worker, &works[t]);
+            if (rc != 0) {
+                fprintf(stderr, "constscan: pthread_create failed (rc=%d)\n", rc);
+                /* Best effort: join the ones we've launched, then bail. */
+                for (int j = 0; j < t; j++) pthread_join(threads[j], NULL);
+                free(works); free(threads); free(fp_per_thread); free(ip_per_thread);
+                for (size_t f = 0; f < fp_count; f++) bmh_destroy(&fp_searchers[f]);
+                for (size_t f = 0; f < ip_count; f++) bmh_destroy(&ip_searchers[f]);
+                free(fp_searchers); free(fp_mlens); free(ip_searchers); free(ip_mlens);
+                return 1;
+            }
+        }
+        for (int t = 0; t < nthreads; t++) pthread_join(threads[t], NULL);
+    }
+
+    /* Merge per-thread results into global per-fingerprint result. The
+     * sample_lines merge is the only non-trivial step: gather all samples
+     * from every thread (each thread's are line-ordered within its slice
+     * but slices have global non-overlapping ranges), then take the first
+     * limit_per_fp samples in global line order. Because threads partition
+     * the line range contiguously, concatenating thread 0..N-1 already
+     * yields a sorted multiset — but we sort anyway to stay robust against
+     * partitioning changes. */
+    fputs("{\"type\":\"constscan\",\"hits\":[", stdout);
+    bool emitted_any = false;
+    /* Scratch buffer for merge: max nthreads × CONSTSCAN_MAX_SAMPLES_PER_THREAD. */
+    uint64_t *scratch = malloc((size_t)nthreads * CONSTSCAN_MAX_SAMPLES_PER_THREAD * sizeof(uint64_t));
+    if (!scratch) {
+        for (size_t f = 0; f < fp_count; f++) bmh_destroy(&fp_searchers[f]);
+        for (size_t f = 0; f < ip_count; f++) bmh_destroy(&ip_searchers[f]);
+        free(fp_searchers); free(fp_mlens); free(ip_searchers); free(ip_mlens);
+        free(works); free(threads); free(fp_per_thread); free(ip_per_thread);
+        fprintf(stderr, "constscan: out of memory in merge\n"); return 1;
+    }
+
+    for (size_t f = 0; f < fp_count; f++) {
+        const Fingerprint *fp = &FINGERPRINTS[f];
+        uint64_t total_hits = 0;
+        EvidenceCounts ev = {0};
+        size_t scratch_n = 0;
+        for (int t = 0; t < nthreads; t++) {
+            FpResult *r = &fp_per_thread[(size_t)t * fp_count + f];
+            total_hits += r->total_hits;
+            ev.load_imm   += r->ev.load_imm;
+            ev.mem_r      += r->ev.mem_r;
+            ev.mem_r_addr += r->ev.mem_r_addr;
+            ev.mem_w      += r->ev.mem_w;
+            ev.alu        += r->ev.alu;
+            ev.other      += r->ev.other;
+            for (size_t k = 0; k < r->sample_n; k++) {
+                scratch[scratch_n++] = r->sample_lines[k];
+            }
+        }
         if (total_hits == 0) continue;
+        if (scratch_n > 1) qsort(scratch, scratch_n, sizeof(uint64_t), u64_cmp_asc);
+        size_t emit_samples = scratch_n < limit_per_fp ? scratch_n : limit_per_fp;
 
         if (emitted_any) putchar(',');
         emitted_any = true;
@@ -2613,13 +2980,85 @@ static int run_constscan(const IndexedFile *indexed, uint64_t limit_per_fp) {
         fputs(",\"verdict\":", stdout);
         json_write_cstr(evidence_verdict(&ev));
         fputs(",\"sample_lines\":[", stdout);
-        for (size_t i = 0; i < sample_n; i++) {
+        for (size_t i = 0; i < emit_samples; i++) {
             if (i > 0) putchar(',');
-            printf("%" PRIu64, sample_lines[i]);
+            printf("%" PRIu64, scratch[i]);
+        }
+        fputs("]", stdout);
+        /* FIX F-17: per-block constant hint. For MD5.T[i] / SHA256.K[i] /
+         * SM3.T_j the magic fires once per compression block, so
+         * total_hits ≈ block count. Surface this so agents stop dividing
+         * by /4 /16 /64. */
+        const char *block_prim = per_block_primitive_for(fp->name);
+        if (block_prim != NULL) {
+            fputs(",\"block_count_estimate\":", stdout);
+            printf("%" PRIu64, total_hits);
+            fputs(",\"primitive_for_blocks\":", stdout);
+            json_write_cstr(block_prim);
+            fputs(",\"block_count_note\":\"This constant fires once per "
+                  "compression block. total_hits IS the block count. "
+                  "Do NOT divide by 4/16/64. Each fingerprint (e.g. "
+                  "MD5.T[1]) appears exactly once per block compression; "
+                  "the whole T/K table spans 64 rounds with each entry "
+                  "used once.\"",
+                  stdout);
+        }
+        fputc('}', stdout);
+    }
+
+    /* FIX F-17 merge: emit InstructionPattern (SIMD broadcast) hits from
+     * the same parallel pass. Each thread already accumulated into
+     * ip_per_thread[t*ip_count + f]; we sum + sort sample_lines globally. */
+    for (size_t f = 0; f < ip_count; f++) {
+        const InstructionPattern *ip = &INSTR_PATTERNS[f];
+        uint64_t total_hits = 0;
+        size_t scratch_n = 0;
+        for (int t = 0; t < nthreads; t++) {
+            IpResult *r = &ip_per_thread[(size_t)t * ip_count + f];
+            total_hits += r->total_hits;
+            for (size_t k = 0; k < r->sample_n; k++) {
+                scratch[scratch_n++] = r->sample_lines[k];
+            }
+        }
+        if (total_hits == 0) continue;
+        if (scratch_n > 1) qsort(scratch, scratch_n, sizeof(uint64_t), u64_cmp_asc);
+        size_t emit_samples = scratch_n < limit_per_fp ? scratch_n : limit_per_fp;
+
+        if (emitted_any) putchar(',');
+        emitted_any = true;
+        fputs("{\"fingerprint\":", stdout);
+        json_write_cstr(ip->name);
+        fputs(",\"category\":", stdout);
+        json_write_cstr(ip->category);
+        fputs(",\"confidence\":", stdout);
+        json_write_cstr(confidence_str(ip->conf));
+        fputs(",\"match_pattern\":", stdout);
+        json_write_cstr(ip->match_text);
+        printf(",\"total_hits\":%" PRIu64, total_hits);
+        fputs(",\"evidence\":{\"simd_broadcast\":", stdout);
+        printf("%" PRIu64, total_hits);
+        fputs(",\"load_imm\":0,\"mem_r\":0,\"mem_r_addr\":0,"
+              "\"mem_w\":0,\"alu\":0,\"other\":0}", stdout);
+        fputs(",\"verdict\":\"real_simd\"", stdout);
+        fputs(",\"primitive\":", stdout);
+        json_write_cstr(ip->primitive);
+        fputs(",\"interpretation\":", stdout);
+        json_write_cstr(ip->interpretation);
+        fputs(",\"sample_lines\":[", stdout);
+        for (size_t i = 0; i < emit_samples; i++) {
+            if (i > 0) putchar(',');
+            printf("%" PRIu64, scratch[i]);
         }
         fputs("]}", stdout);
     }
+
     fputs("]}\n", stdout);
+    /* Cleanup. */
+    free(scratch);
+    for (size_t f = 0; f < fp_count; f++) bmh_destroy(&fp_searchers[f]);
+    for (size_t f = 0; f < ip_count; f++) bmh_destroy(&ip_searchers[f]);
+    free(fp_searchers); free(fp_mlens); free(ip_searchers); free(ip_mlens);
+    free(works); free(threads); free(fp_per_thread); free(ip_per_thread);
     return 0;
 }
 
@@ -2632,6 +3071,13 @@ static int cmd_constscan(int argc, char **argv) {
             if (!parse_u64(argv[++i], &limit_per_fp) || limit_per_fp == 0) {
                 fprintf(stderr, "invalid --samples\n"); return 2;
             }
+        }
+        else if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
+            uint64_t n;
+            if (!parse_u64(argv[++i], &n) || n == 0 || n > 64) {
+                fprintf(stderr, "invalid --threads (must be 1..64)\n"); return 2;
+            }
+            g_thread_count = (int)n;
         }
         else { usage(stderr); return 2; }
     }
@@ -2861,40 +3307,124 @@ static const CryptoInsn CRYPTO_INSNS[] = {
     {NULL, NULL, FP_WEAK, NULL},
 };
 
-static int run_cryptoinstr(const IndexedFile *indexed, uint64_t limit_per_insn) {
-    size_t insn_count = 0;
-    while (CRYPTO_INSNS[insn_count].mnem != NULL) insn_count++;
+#define CRYPTOINSTR_MAX_SAMPLES_PER_THREAD 8
 
-    /* Per-insn counters + sample lines */
-    uint64_t *hits = calloc(insn_count, sizeof(uint64_t));
-    uint64_t (*samples)[8] = calloc(insn_count, sizeof(*samples));
-    uint64_t *sample_n = calloc(insn_count, sizeof(uint64_t));
-    if (!hits || !samples || !sample_n) {
-        free(hits); free(samples); free(sample_n);
-        fprintf(stderr, "cryptoinstr: out of memory\n");
-        return 1;
-    }
-    if (limit_per_insn > 8) limit_per_insn = 8;
+typedef struct {
+    uint64_t total_hits;
+    uint64_t sample_lines[CRYPTOINSTR_MAX_SAMPLES_PER_THREAD];
+    size_t sample_n;
+} CryptoinstrResult;
 
-    /* Single pass over the trace */
-    for (uint64_t line_no = 1; line_no <= indexed->index.count; line_no++) {
+typedef struct {
+    const IndexedFile *indexed;
+    uint64_t line_from, line_to;
+    size_t insn_count;
+    const size_t *insn_mlens;     /* precomputed strlen of each mnemonic */
+    CryptoinstrResult *results;   /* thread-local, size insn_count */
+    uint64_t limit_per_insn;
+} CryptoinstrWork;
+
+static void *cryptoinstr_worker(void *arg) {
+    CryptoinstrWork *w = (CryptoinstrWork *)arg;
+    const IndexedFile *indexed = w->indexed;
+    uint64_t cap = w->limit_per_insn;
+    if (cap > CRYPTOINSTR_MAX_SAMPLES_PER_THREAD) cap = CRYPTOINSTR_MAX_SAMPLES_PER_THREAD;
+    for (uint64_t line_no = w->line_from; line_no <= w->line_to; line_no++) {
         size_t off = indexed->index.offsets[line_no - 1];
         LineView line = line_at_offset(indexed->mapped.data, indexed->mapped.size, off);
         const unsigned char *mn, *op;
         size_t mn_len, op_len;
         if (!parse_mnem_and_operands(line, &mn, &mn_len, &op, &op_len)) continue;
         (void)op; (void)op_len;
-        /* Exact mnemonic match (case-sensitive — GumTrace emits lowercase). */
-        for (size_t i = 0; i < insn_count; i++) {
-            size_t l = strlen(CRYPTO_INSNS[i].mnem);
+        for (size_t i = 0; i < w->insn_count; i++) {
+            size_t l = w->insn_mlens[i];
             if (mn_len == l && memcmp(mn, CRYPTO_INSNS[i].mnem, l) == 0) {
-                hits[i]++;
-                if (sample_n[i] < limit_per_insn) {
-                    samples[i][sample_n[i]++] = line_no;
+                CryptoinstrResult *r = &w->results[i];
+                r->total_hits++;
+                if (r->sample_n < cap) {
+                    r->sample_lines[r->sample_n++] = line_no;
                 }
                 break;
             }
         }
+    }
+    return NULL;
+}
+
+static int run_cryptoinstr(const IndexedFile *indexed, uint64_t limit_per_insn) {
+    size_t insn_count = 0;
+    while (CRYPTO_INSNS[insn_count].mnem != NULL) insn_count++;
+    if (limit_per_insn > 8) limit_per_insn = 8;
+
+    /* Precompute mnemonic lengths so the hot loop avoids strlen per line. */
+    size_t *insn_mlens = calloc(insn_count, sizeof(size_t));
+    if (!insn_mlens) { fprintf(stderr, "cryptoinstr: out of memory\n"); return 1; }
+    for (size_t i = 0; i < insn_count; i++) insn_mlens[i] = strlen(CRYPTO_INSNS[i].mnem);
+
+    int nthreads = get_thread_count();
+    if (indexed->index.count < 32768) nthreads = 1;
+    if ((uint64_t)nthreads > indexed->index.count) nthreads = (int)indexed->index.count;
+    if (nthreads < 1) nthreads = 1;
+
+    CryptoinstrWork *works = calloc((size_t)nthreads, sizeof(CryptoinstrWork));
+    pthread_t *threads = calloc((size_t)nthreads, sizeof(pthread_t));
+    CryptoinstrResult *per_thread = calloc((size_t)nthreads * insn_count, sizeof(CryptoinstrResult));
+    if (!works || !threads || !per_thread) {
+        free(works); free(threads); free(per_thread); free(insn_mlens);
+        fprintf(stderr, "cryptoinstr: out of memory\n"); return 1;
+    }
+
+    for (int t = 0; t < nthreads; t++) {
+        CryptoinstrWork *w = &works[t];
+        w->indexed = indexed;
+        partition_line_range(indexed->index.count, t, nthreads,
+                             &w->line_from, &w->line_to);
+        w->insn_count = insn_count;
+        w->insn_mlens = insn_mlens;
+        w->results = &per_thread[(size_t)t * insn_count];
+        w->limit_per_insn = limit_per_insn;
+    }
+
+    if (nthreads == 1) {
+        cryptoinstr_worker(&works[0]);
+    } else {
+        for (int t = 0; t < nthreads; t++) {
+            int rc = pthread_create(&threads[t], NULL, cryptoinstr_worker, &works[t]);
+            if (rc != 0) {
+                fprintf(stderr, "cryptoinstr: pthread_create failed (rc=%d)\n", rc);
+                for (int j = 0; j < t; j++) pthread_join(threads[j], NULL);
+                free(works); free(threads); free(per_thread); free(insn_mlens);
+                return 1;
+            }
+        }
+        for (int t = 0; t < nthreads; t++) pthread_join(threads[t], NULL);
+    }
+
+    /* Merge into per-insn totals + globally-sorted sample lines. */
+    uint64_t *hits = calloc(insn_count, sizeof(uint64_t));
+    uint64_t (*samples)[8] = calloc(insn_count, sizeof(*samples));
+    uint64_t *sample_n = calloc(insn_count, sizeof(uint64_t));
+    if (!hits || !samples || !sample_n) {
+        free(hits); free(samples); free(sample_n);
+        free(works); free(threads); free(per_thread); free(insn_mlens);
+        fprintf(stderr, "cryptoinstr: out of memory in merge\n"); return 1;
+    }
+    uint64_t scratch[CRYPTOINSTR_MAX_SAMPLES_PER_THREAD * 64];
+    for (size_t i = 0; i < insn_count; i++) {
+        size_t scratch_n = 0;
+        for (int t = 0; t < nthreads; t++) {
+            CryptoinstrResult *r = &per_thread[(size_t)t * insn_count + i];
+            hits[i] += r->total_hits;
+            for (size_t k = 0; k < r->sample_n; k++) {
+                if (scratch_n < sizeof(scratch)/sizeof(scratch[0])) {
+                    scratch[scratch_n++] = r->sample_lines[k];
+                }
+            }
+        }
+        if (scratch_n > 1) qsort(scratch, scratch_n, sizeof(uint64_t), u64_cmp_asc);
+        size_t emit = scratch_n < limit_per_insn ? scratch_n : limit_per_insn;
+        sample_n[i] = emit;
+        for (size_t k = 0; k < emit; k++) samples[i][k] = scratch[k];
     }
 
     /* Aggregate per-primitive verdict */
@@ -2939,6 +3469,7 @@ static int run_cryptoinstr(const IndexedFile *indexed, uint64_t limit_per_insn) 
     fputs("]}\n", stdout);
 
     free(hits); free(samples); free(sample_n);
+    free(works); free(threads); free(per_thread); free(insn_mlens);
     return 0;
 }
 
@@ -2951,6 +3482,13 @@ static int cmd_cryptoinstr(int argc, char **argv) {
             if (!parse_u64(argv[++i], &samples) || samples == 0) {
                 fprintf(stderr, "invalid --samples\n"); return 2;
             }
+        }
+        else if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
+            uint64_t n;
+            if (!parse_u64(argv[++i], &n) || n == 0 || n > 64) {
+                fprintf(stderr, "invalid --threads (must be 1..64)\n"); return 2;
+            }
+            g_thread_count = (int)n;
         }
         else { usage(stderr); return 2; }
     }

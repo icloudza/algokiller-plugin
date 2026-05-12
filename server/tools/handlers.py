@@ -907,6 +907,46 @@ def tool_trace_modgraph(args: dict[str, Any]) -> dict:
     return STATE.daemon.run_cli("modgraph", cli, timeout=120)
 
 
+# ObjC ARC bookkeeping symbol prefixes. When a `call func:` block names one
+# of these AND carries a hexdump, the dump is almost always a Frida-stalker
+# side-effect dump of the receiver (NSData / NSString / NSDictionary) being
+# retained/autoreleased/released — NOT a fresh input or output of the call.
+# Agents have repeatedly misread 2-3 consecutive ARC dumps of the same NSData
+# as "the JSON is fed into 3 different hash contexts" — see the real-world
+# audit logged in CHANGELOG v0.9.6.
+_ARC_BOOKKEEPING_PREFIXES: tuple[str, ...] = (
+    "objc_retain",
+    "objc_autorelease",
+    "objc_release",
+    "swift_retain",
+    "swift_release",
+    "swift_bridgeObjectRetain",
+    "swift_bridgeObjectRelease",
+    "_Block_copy",
+    "_Block_release",
+)
+
+
+def _classify_call_kind(call_name: str) -> str:
+    """Return one of 'arc_bookkeeping' | 'normal' for a `call func:` symbol.
+
+    The ARC list intentionally matches `objc_retain` / `objc_retain_x0` /
+    `objc_retainAutoreleasedReturnValue` etc as one family. Anything else
+    (memcpy, encrypt_helper, NSJSONSerialization etc) keeps `normal`.
+    """
+    if not call_name:
+        return "normal"
+    name = call_name.strip()
+    for prefix in _ARC_BOOKKEEPING_PREFIXES:
+        if name == prefix or name.startswith(prefix + "(") or name.startswith(prefix):
+            # Accept both exact (`objc_release`) and decorated forms
+            # (`objc_retain_x0`, `objc_retainAutoreleasedReturnValue`).
+            tail = name[len(prefix):]
+            if tail == "" or tail[0] in ("_", "(",) or tail[0].isupper():
+                return "arc_bookkeeping"
+    return "normal"
+
+
 def tool_trace_hexblock(args: dict[str, Any]) -> dict:
     err = _require_bound()
     if err is not None:
@@ -949,6 +989,48 @@ def tool_trace_hexblock(args: dict[str, Any]) -> dict:
         for hd in block.get("hexdumps", []) or []:
             if "direction" not in hd:
                 hd["direction"] = "unknown"
+        # FIX F-16 (v0.9.6, XHS register-di audit closure):
+        # Classify the call as ARC bookkeeping vs normal. ObjC retain /
+        # autorelease / release / Swift refcount calls cause Frida-stalker
+        # to emit a hexdump of the receiver as a side effect. A naive agent
+        # reads N consecutive same-address-same-length hexdumps from
+        # `objc_retainAutoreleasedReturnValue` / `objc_autoreleaseReturnValue`
+        # / `objc_retainAutoreleasedReturnValue` (very common ARC triplet
+        # around a `dataWithJSONObject:` return) and concludes the payload
+        # was fed into N independent hash contexts. It wasn't — the call
+        # itself did no algorithmic work.
+        #
+        # Behaviour:
+        #   * If the C engine already emitted `call_kind` (ak_search built
+        #     from v0.9.6+ source), reuse it verbatim.
+        #   * Otherwise fall back to the Python classifier so older binaries
+        #     still benefit from F-16 over the MCP path.
+        call_name = str(block.get("call", "") or "")
+        if "call_kind" not in block:
+            block["call_kind"] = _classify_call_kind(call_name)
+        if block["call_kind"] == "arc_bookkeeping" and (block.get("hexdumps") or []):
+            # Synthesize arc_warning only if C engine didn't already.
+            if "arc_warning" not in block:
+                hd0 = (block.get("hexdumps") or [])[0]
+                addr = hd0.get("address", "?")
+                length = hd0.get("length", "?")
+                block["arc_warning"] = (
+                    f"call_kind='arc_bookkeeping': {call_name!r} is an ObjC/Swift "
+                    "reference-count call, not an algorithmic helper. The "
+                    f"hexdump at address={addr} length={length} is a Frida-stalker "
+                    "side-effect dump of the receiver object — NOT an input/"
+                    "output of any cipher/hash/HMAC operation. Two or more "
+                    "consecutive ARC blocks dumping the same address+length "
+                    "represent ONE buffer being retained/autoreleased multiple "
+                    "times, not N independent algorithm invocations. If the "
+                    "buffer is genuinely the algorithm payload (it usually is), "
+                    "anchor evidence to the upstream call that PRODUCED the "
+                    "buffer (e.g. `NSJSONSerialization dataWithJSONObject:`), "
+                    "not these ARC bookkeeping dumps."
+                )
+            # The MCP-level instruction lifting always happens in Python,
+            # regardless of which side produced the warning text.
+            result["instruction"] = block["arc_warning"]
         if not has_ret or (max_lines > 1 and lines_scanned >= max_lines):
             block["status"] = "truncated"
             block["warning"] = (
@@ -961,7 +1043,10 @@ def tool_trace_hexblock(args: dict[str, Any]) -> dict:
                 f"max_lines-bounded scan without nesting awareness.)"
             )
             result["status"] = "ok_truncated"
-            result["instruction"] = block["warning"]
+            # Compose with any prior instruction (ARC warning takes the lead
+            # because it's the more common evidence pitfall).
+            existing = result.get("instruction") or ""
+            result["instruction"] = (existing + "\n" + block["warning"]) if existing else block["warning"]
         result["stdout"] = "\n".join(json.dumps(r, ensure_ascii=False) for r in rows)
     return result
 
@@ -969,6 +1054,117 @@ def tool_trace_hexblock(args: dict[str, Any]) -> dict:
 # ---------------------------------------------------------------------------
 # Crypto detection
 # ---------------------------------------------------------------------------
+
+# FIX F-17 (v0.9.6): SIMD broadcast post-processing for constscan.
+# Many production iOS/Android builds use NEON for hash/HMAC pad. The C
+# fingerprint table only matches scalar 32-bit/64-bit literals (the
+# `-> regN=MAGIC` pattern), so `movi v0.16b, #0x36` (the canonical HMAC
+# SIMD ipad broadcast) registers ZERO scalar hits even though it is the
+# real init event. Meanwhile the *post*-broadcast scalar reload-from-
+# stack-buffer (`ldur w11,[x11,#-1] -> w11=0x36363636 ; str w11,...`)
+# fires hundreds of times because the byte-wise serialisation walks 16×
+# 32-bit words of the already-padded buffer. Net effect: HMAC.ipad shows
+# total_hits=710 from a buffer-memcpy that doesn't represent HMAC ops.
+#
+# This helper detects the SIMD init events directly via the daemon's
+# match interface and reports them separately so the agent can:
+#   1. Use SIMD broadcast count as the upper-bound HMAC call estimate.
+#   2. See in `interpretation_note` why the scalar count is decoupled
+#      from HMAC operation count.
+_SIMD_PATTERNS: dict[str, dict[str, str]] = {
+    # NEON 16-byte broadcast of a single byte. Generated by clang -O when
+    # filling a 16-byte vector register with a repeating constant. The
+    # surface form in GumTrace output is the disassembly text — we match
+    # the `.16b, #0xHH` suffix to stay register-agnostic (v0..v31).
+    "HMAC.ipad.simd_movi": {
+        "magic": "0x36",
+        "query": ".16b, #0x36",
+        "primitive": "HMAC.ipad",
+        "instruction": "movi v*.16b, #0x36",
+        "interpretation": (
+            "NEON broadcast of 0x36 across 16 bytes — canonical "
+            "HMAC-* ipad initialisation. Each hit corresponds to ONE "
+            "HMAC inner-pad setup. Use this as the upper bound on "
+            "HMAC operation count."
+        ),
+    },
+    "HMAC.opad.simd_movi": {
+        "magic": "0x5c",
+        "query": ".16b, #0x5c",
+        "primitive": "HMAC.opad",
+        "instruction": "movi v*.16b, #0x5c",
+        "interpretation": (
+            "NEON broadcast of 0x5c across 16 bytes — canonical "
+            "HMAC-* opad initialisation. Pair with ipad.simd_movi to "
+            "confirm full HMAC pad construction."
+        ),
+    },
+}
+
+
+def _exhaustive_match_count(query: str, *, max_total: int = 1000,
+                            page_limit: int = 100,
+                            max_samples: int = 8) -> dict[str, Any]:
+    """Issue successive daemon `match` requests across the whole trace,
+    starting at line 1 and advancing past the highest line returned each
+    page. Caps at `max_total` to bound work.
+
+    Returns {"total": int, "samples": [line, ...], "saturated": bool}.
+    `saturated=True` means `total == max_total` and there may be more.
+    """
+    total = 0
+    samples: list[int] = []
+    from_line = 1
+    while total < max_total:
+        page_limit_eff = min(page_limit, max_total - total)
+        sub = _search_once(query, from_line=from_line, limit=page_limit_eff)
+        if sub.get("status") != "ok":
+            break
+        rows = _parse_jsonl(sub.get("stdout") or "")
+        match_lines = [r.get("line") for r in rows
+                       if r.get("type") == "match" and isinstance(r.get("line"), int)]
+        if not match_lines:
+            break
+        for ln in match_lines:
+            total += 1
+            if len(samples) < max_samples:
+                samples.append(ln)
+        next_line = max(match_lines) + 1
+        if next_line <= from_line:
+            break  # defensive: daemon returned non-advancing page
+        from_line = next_line
+        if len(match_lines) < page_limit_eff:
+            break  # short page → exhausted
+    return {"total": total, "samples": samples, "saturated": total >= max_total}
+
+
+# Fingerprints whose magic appears EXACTLY ONCE per compression block.
+# For these, total_hits ≈ block count (modulo evidence filtering).
+# Agents have miscalculated this as total_hits / 4 (MD5) or /16/64
+# (SHA-256) in the wild — see XHS register-di audit in CHANGELOG v0.9.6.
+_PER_BLOCK_FINGERPRINTS: dict[str, str] = {
+    # MD5: T[1..64] each fire once per 64-round compression. We track
+    # only T[1..4] but each individually maps 1:1 to blocks.
+    "MD5.T[1]": "MD5",
+    "MD5.T[2]": "MD5",
+    "MD5.T[3]": "MD5",
+    "MD5.T[4]": "MD5",
+    # SHA-256: K[0..63] each once per block.
+    "SHA256.K[0]": "SHA-256",
+    "SHA256.K[1]": "SHA-256",
+    "SHA256.K[2]": "SHA-256",
+    "SHA256.K[3]": "SHA-256",
+    "SHA256.K[4]": "SHA-256",
+    "SHA256.K[5]": "SHA-256",
+    "SHA256.K[6]": "SHA-256",
+    "SHA256.K[7]": "SHA-256",
+    # SM3: T_j fires per round but only takes 2 distinct values across the
+    # 64-round schedule, so it's not a clean 1:1 — we still hint but with
+    # the j-range note.
+    "SM3.T_j[0..15]": "SM3 (16 rounds; total_hits ≈ blocks × 16)",
+    "SM3.T_j[16..63]": "SM3 (48 rounds; total_hits ≈ blocks × 48)",
+}
+
 
 def tool_trace_constscan(args: dict[str, Any]) -> dict:
     err = _require_bound()
@@ -983,7 +1179,172 @@ def tool_trace_constscan(args: dict[str, Any]) -> dict:
         if not (1 <= s <= 16):
             return {"status": "error", "error": "samples must be in [1, 16]"}
         cli += ["--samples", str(s)]
-    return STATE.daemon.run_cli("constscan", cli, timeout=300, max_output_chars=200_000)
+    if "threads" in args:
+        try:
+            n = int(args["threads"])
+        except (TypeError, ValueError):
+            return {"status": "error", "error": "threads must be an integer"}
+        if not (1 <= n <= 64):
+            return {"status": "error", "error": "threads must be in [1, 64]"}
+        cli += ["--threads", str(n)]
+    result = STATE.daemon.run_cli("constscan", cli, timeout=300, max_output_chars=200_000)
+    if result.get("status") != "ok":
+        return result
+
+    # ---- FIX F-17: SIMD broadcast augmentation ----
+    rows = _parse_jsonl(result.get("stdout") or "")
+    if not rows:
+        return result
+    summary_row = rows[0]
+    if summary_row.get("type") != "constscan":
+        return result
+    hits: list[dict] = summary_row.get("hits") or []
+    by_fp_initial = {h.get("fingerprint") for h in hits if isinstance(h, dict)}
+
+    # Detect SIMD broadcasts via daemon match queries and append as
+    # synthetic fingerprints. Bound work via per-query max_total — these
+    # patterns are rare (one per HMAC call), so 1000 is generous.
+    #
+    # ak_search v0.9.6+ emits these natively via its InstructionPattern
+    # table. When that's the case we skip the per-pattern daemon round-
+    # trip and just use the values already in `hits`. Falls back to the
+    # Python scan when running against an older binary so MCP behaviour
+    # is consistent regardless of which engine version is installed.
+    simd_summary: dict[str, dict] = {}
+    for fp_name, spec in _SIMD_PATTERNS.items():
+        if fp_name in by_fp_initial:
+            existing = next(h for h in hits if h.get("fingerprint") == fp_name)
+            simd_summary[fp_name] = {
+                "total": int(existing.get("total_hits", 0) or 0),
+                "samples": list(existing.get("sample_lines") or []),
+                "saturated": False,
+                "source": "c_engine",
+            }
+            continue
+        counts = _exhaustive_match_count(spec["query"], max_total=1000,
+                                         page_limit=100, max_samples=8)
+        simd_summary[fp_name] = {**counts, "source": "python_wrapper"}
+        if counts["total"] == 0:
+            continue
+        hits.append({
+            "fingerprint": fp_name,
+            "category": "mac" if "HMAC" in fp_name else "hash",
+            "confidence": "strong",
+            "magic": spec["magic"],
+            "match_pattern": spec["instruction"],
+            "total_hits": counts["total"],
+            "evidence": {
+                "simd_broadcast": counts["total"],
+                "load_imm": 0, "mem_r": 0, "mem_r_addr": 0,
+                "mem_w": 0, "alu": 0, "other": 0,
+            },
+            "verdict": "real_simd",
+            "saturated": counts["saturated"],
+            "sample_lines": counts["samples"],
+            "interpretation": spec["interpretation"],
+            "primitive": spec["primitive"],
+        })
+
+    # ---- HMAC scalar-vs-SIMD cross-check ----
+    # Find the scalar HMAC.ipad / HMAC.opad rows produced by the C engine
+    # and pair them with the SIMD counts to give the agent a clear ops
+    # estimate WITHOUT the scalar-reload inflation.
+    by_fp: dict[str, dict] = {h.get("fingerprint"): h for h in hits if isinstance(h, dict)}
+    ipad_scalar = by_fp.get("HMAC.ipad")
+    opad_scalar = by_fp.get("HMAC.opad")
+    simd_ipad = simd_summary.get("HMAC.ipad.simd_movi", {}).get("total", 0)
+    simd_opad = simd_summary.get("HMAC.opad.simd_movi", {}).get("total", 0)
+    if ipad_scalar or opad_scalar or simd_ipad or simd_opad:
+        hmac_estimate: dict[str, Any] = {
+            "simd_movi_ipad": simd_ipad,
+            "simd_movi_opad": simd_opad,
+            "scalar_ipad_total_hits": int((ipad_scalar or {}).get("total_hits", 0) or 0),
+            "scalar_opad_total_hits": int((opad_scalar or {}).get("total_hits", 0) or 0),
+        }
+        # Estimate HMAC call count. SIMD is the reliable signal when
+        # present (one broadcast per HMAC init). If only scalar hits
+        # exist, the C engine's `evidence.load_imm` row is the closest
+        # proxy for "real init" — `mem_r`-dominated counts are the
+        # post-broadcast memcpy noise.
+        if simd_ipad > 0 or simd_opad > 0:
+            hmac_estimate["estimated_hmac_calls"] = max(simd_ipad, simd_opad)
+            hmac_estimate["estimate_basis"] = "simd_movi (one broadcast per HMAC init)"
+        elif ipad_scalar:
+            load_imm = int(((ipad_scalar.get("evidence") or {}).get("load_imm")) or 0)
+            mem_r = int(((ipad_scalar.get("evidence") or {}).get("mem_r")) or 0)
+            if load_imm > 0:
+                hmac_estimate["estimated_hmac_calls"] = load_imm // 16 if load_imm >= 16 else "scalar_init_partial"
+                hmac_estimate["estimate_basis"] = (
+                    "scalar load_imm hits / 16 (RFC 2104 fills a 64-byte pad as 16×32-bit words)"
+                )
+            elif mem_r > 0:
+                hmac_estimate["estimated_hmac_calls"] = "unknown_mem_r_dominated"
+                hmac_estimate["estimate_basis"] = (
+                    "scalar hits are mem_r dominated — these are reload-from-stack-buffer "
+                    "events (memcpy-style serialisation of an already-padded block), NOT "
+                    "independent HMAC inits. Cannot derive op count without SIMD evidence."
+                )
+        summary_row["hmac_estimate"] = hmac_estimate
+
+    # ---- Block-count hint for per-block-firing constants ----
+    # ak_search v0.9.6+ attaches `block_count_estimate` directly to each
+    # qualifying hit. Build the summary from whichever source is present
+    # (C-engine field takes priority; Python table is the fallback for
+    # older binaries). This keeps `block_count_hints` shape stable for
+    # the agent regardless of which engine is shipping the data.
+    block_hints: list[dict] = []
+    for hit in hits:
+        fp = hit.get("fingerprint")
+        if "block_count_estimate" in hit:
+            block_hints.append({
+                "fingerprint": fp,
+                "primitive": hit.get("primitive_for_blocks") or _PER_BLOCK_FINGERPRINTS.get(fp, "?"),
+                "total_hits": int(hit.get("total_hits", 0) or 0),
+                "block_count_estimate": int(hit.get("block_count_estimate") or 0),
+                "note": hit.get("block_count_note") or (
+                    "This constant fires exactly once per compression block. "
+                    "total_hits ≈ block count. Do NOT divide by 4 / 16 / 64 — "
+                    "that's the most common arithmetic error agents make on "
+                    "constscan output (CHANGELOG v0.9.6 audit)."
+                ),
+                "source": "c_engine",
+            })
+        elif fp in _PER_BLOCK_FINGERPRINTS:
+            block_hints.append({
+                "fingerprint": fp,
+                "primitive": _PER_BLOCK_FINGERPRINTS[fp],
+                "total_hits": int(hit.get("total_hits", 0) or 0),
+                "block_count_estimate": int(hit.get("total_hits", 0) or 0),
+                "note": (
+                    "This constant fires exactly once per compression block. "
+                    "total_hits ≈ block count. Do NOT divide by 4 / 16 / 64 — "
+                    "that's the most common arithmetic error agents make on "
+                    "constscan output (CHANGELOG v0.9.6 audit)."
+                ),
+                "source": "python_wrapper",
+            })
+    if block_hints:
+        summary_row["block_count_hints"] = block_hints
+
+    sources = {h.get("source") for h in block_hints} | {
+        v.get("source") for v in simd_summary.values() if v
+    }
+    summary_row["augmentation_note"] = (
+        "FIX F-17 (v0.9.6): SIMD broadcast detection + per-block-constant "
+        f"hints. Sources active in this run: {sorted(s for s in sources if s)!r}. "
+        "C-engine `c_engine` rows come from the native InstructionPattern "
+        "table (ak_search v0.9.6+); `python_wrapper` rows are the MCP-side "
+        "fallback when an older binary is in use. Production iOS Swift / "
+        "Android NDK builds commonly use NEON `movi v*.16b, #imm` for HMAC "
+        "pad init, which the scalar Fingerprint table cannot see. When "
+        "SIMD rows are present (verdict='real_simd'), treat them as the "
+        "authoritative HMAC call count — the scalar HMAC.ipad / HMAC.opad "
+        "rows are usually inflated by post-broadcast scalar-reload memcpy "
+        "and overestimate HMAC ops by an order of magnitude."
+    )
+    summary_row["hits"] = hits
+    result["stdout"] = json.dumps(summary_row, ensure_ascii=False) + "\n"
+    return result
 
 
 def tool_trace_bytes(args: dict[str, Any]) -> dict:
@@ -1068,6 +1429,16 @@ def tool_trace_cryptoinstr(args: dict[str, Any]) -> dict:
             return {"status": "error", "error": "samples must be in [1, 8]",
                     "_skip_discipline": True}
         cli += ["--samples", str(s)]
+    if "threads" in args:
+        try:
+            n = int(args["threads"])
+        except (TypeError, ValueError):
+            return {"status": "error", "error": "threads must be an integer",
+                    "_skip_discipline": True}
+        if not (1 <= n <= 64):
+            return {"status": "error", "error": "threads must be in [1, 64]",
+                    "_skip_discipline": True}
+        cli += ["--threads", str(n)]
     result = STATE.daemon.run_cli("cryptoinstr", cli, timeout=120)
     if result.get("status") != "ok":
         return result

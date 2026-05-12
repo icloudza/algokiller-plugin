@@ -274,7 +274,19 @@ TOOLS: list[dict[str, Any]] = [
             "KNOWN GAP F-15 (deferred to 0.9.2): hexdumps currently report "
             "`direction='unknown'`. In 0.9.2 each dump will be tagged 'in' (mem_r) or "
             "'out' (mem_w) so the agent can distinguish memcpy(src=in, dst=out) at a "
-            "glance."
+            "glance.\n\n"
+            "FIX F-16 (v0.9.6): each block now carries `call_kind` "
+            "('arc_bookkeeping' | 'normal'). When the call name matches an ObjC ARC / "
+            "Swift refcount symbol (objc_retain*, objc_autorelease*, objc_release, "
+            "swift_retain, swift_release, swift_bridgeObject*, _Block_copy/release) "
+            "AND a hexdump is present, the block is flagged 'arc_bookkeeping' and "
+            "carries an `arc_warning` field. Such hexdumps are Frida-stalker side-"
+            "effect dumps of the receiver object (NSData / NSString etc), NOT "
+            "inputs/outputs of any algorithmic helper. Two or three consecutive ARC "
+            "blocks dumping the same address+length are the SAME buffer being "
+            "retained/autoreleased — not N independent algorithm invocations. "
+            "Anchor evidence to the upstream call that PRODUCED the buffer "
+            "(e.g. NSJSONSerialization dataWithJSONObject:) instead."
         ),
         "inputSchema": {
             "type": "object",
@@ -302,12 +314,33 @@ TOOLS: list[dict[str, Any]] = [
             "On iOS apps `constscan` may report 0 hits when the binary actually IS doing MD5. "
             "If you suspect this case, corroborate with `trace_cryptoinstr` and "
             "`trace_callgraph --to <crypto_symbol>` before concluding 'no crypto'. The C-side "
-            "EV_POOL_LOAD detector ships in 0.9.2."
+            "EV_POOL_LOAD detector ships in 0.9.2.\n\n"
+            "FIX F-17 (v0.9.6): SIMD broadcast post-processing. The C scanner only "
+            "matches scalar 32-/64-bit literals (`-> regN=MAGIC`); production iOS / "
+            "Android NDK builds commonly use NEON `movi v*.16b, #imm` for HMAC pad "
+            "init, which the scalar fingerprint misses entirely. The wrapper now "
+            "issues match queries for `.16b, #0x36` and `.16b, #0x5c` and appends "
+            "`HMAC.ipad.simd_movi` / `HMAC.opad.simd_movi` synthetic fingerprints "
+            "with `verdict='real_simd'`. The summary carries `hmac_estimate` with "
+            "`estimated_hmac_calls` derived from SIMD broadcast count (one per HMAC "
+            "init) — use THIS rather than the scalar HMAC.ipad total_hits which is "
+            "inflated by post-broadcast scalar reload-from-stack memcpy traffic. "
+            "Per-block constants (MD5.T[1..4], SHA256.K[0..7]) also gain a "
+            "`block_count_hints` entry — total_hits IS the block count (one T/K "
+            "load per round, all rounds in one block), do NOT divide by 4/16/64.\n\n"
+            "FIX F-18: data-parallel line scan. The C engine partitions the trace "
+            "line range across `threads` workers (default = host CPU count, capped "
+            "at 16). Output is byte-identical to single-threaded across all sample "
+            "counts and evidence categories. On a 4.5 GB / 48 M-line trace 8 threads "
+            "gives ~6× wall-clock speedup (121s → 19s), keeping completion within "
+            "the wrapper's 300s timeout up to ~80 GB inputs. Pass `threads` only if "
+            "you need to constrain parallelism (e.g. CI shared runner)."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "samples": {"type": "integer", "minimum": 1, "maximum": 16, "description": "Sample line numbers per fingerprint (default 5)."},
+                "threads": {"type": "integer", "minimum": 1, "maximum": 64, "description": "Worker thread count (default = host CPU, capped at 16). Output is deterministic regardless of value."},
             },
         },
     },
@@ -362,6 +395,7 @@ TOOLS: list[dict[str, Any]] = [
             "type": "object",
             "properties": {
                 "samples": {"type": "integer", "minimum": 1, "maximum": 8, "description": "Sample line numbers per mnemonic (default 5)."},
+                "threads": {"type": "integer", "minimum": 1, "maximum": 64, "description": "Worker thread count (default = host CPU, capped at 16). Output is deterministic regardless of value."},
             },
         },
     },

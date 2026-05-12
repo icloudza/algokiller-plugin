@@ -44,12 +44,14 @@ claude plugin update algokiller@algokiller-suite
    - 数据流：`trace_regflow`（寄存器演化）/ `trace_producer`（找值的最近写入者）/ `trace_semop`（指令语义分类，11 类）
    - 体检与降噪：`trace_lint`（一遍 JSON 体检）/ `trace_fold`（block-aware 折叠，115 MB → 1.1 MB）
    - 调用图：`trace_callgraph`（Top-K / xref）/ `trace_modgraph`（跨模块矩阵）/ `trace_hexblock`（call+args+hexdump+ret 结构化）
-   - 密码学指纹：`trace_constscan`（**95 个** hash/cipher/ecc/crc/mac 常数,v0.9.2 起含 MD5 T 表 / SHA-256 K 表 / SM3 round constants / HMAC ipad/opad / DES SP-box,带 real/weak/alu_only verdict 分级）/ `trace_cryptoinstr`（ARM Crypto Extensions 硬件指令：AES/SHA-1/SHA-256/SHA-512/SHA-3/SM3/SM4/GHASH）/ `trace_bytes`（hex 字面量含自动反序）
+   - 密码学指纹：`trace_constscan`（**97 个** hash/cipher/ecc/crc/mac 常数指纹 — 95 个 scalar literal + 2 个 NEON SIMD 广播；含 MD5 init+T 表 / SHA-256 init+K 表 / SM3 init+T_j / SHA-3 / CRC32 / AES sbox+Te0 / SM4 / ChaCha20 / Poly1305 / SipHash / HMAC ipad-opad (scalar + SIMD) / P-256 / secp256k1 / Ed25519 / Curve25519；带 `verdict` 分级 `real` / `real_simd` / `weak` / `alu_only`；MD5.T[i] 等主循环常数附 `block_count_estimate`）/ `trace_cryptoinstr`（ARM Crypto Extensions 硬件指令：AES/SHA-1/SHA-256/SHA-512/SHA-3/SM3/SM4/GHASH）/ `trace_bytes`（hex 字面量含自动反序变体）
    - 静态分析：`run_static_tool` —— 白名单调用系统 CLI（radare2 / binutils / LLVM / jtool2 / class-dump / ripgrep / jq）
 4. **反漂移注入**
    - 每次工具返回带 `discipline_reminder`；每 20 次附 `discipline_full_reinjection` 完整规则段
-5. **Sub-agents**（v0.9.0+ 新增）
+5. **Sub-agents**
    - `hypothesis-reviewer` —— 独立 context 蓝军，`hypothesis_conclude(high)` 之前主 agent 通过 `Agent` 工具 spawn 它做独立证据审查。详见 [docs/agents.md](docs/agents.md)。
+6. **大 trace 多线程扫描**
+   - `trace_constscan` / `trace_cryptoinstr` 自动按 CPU 数据并行（默认 = 主机核数，封顶 16，可经 `threads` 参数覆盖）。4.5 GB / 48 M 行 trace 上 `constscan` 8 线程 ≈ 19 s（单线程 121 s），输出对所有线程数 byte-identical。
 
 ---
 
@@ -80,11 +82,7 @@ git clone https://github.com/icloudza/algokiller-plugin
 
 装完应能看到 `algokiller` 在 **Plugins** 菜单，`/algokiller:ciphertext` 和 `/algokiller:general` 在 **Slash commands**。
 
-如果之前手动装过同名 plugin（如 `algokiller@local-desktop-app-uploads`），用 marketplace 装新版后先卸老版避免双注册：
-
-```bash
-claude plugin uninstall algokiller@local-desktop-app-uploads
-```
+> 如果之前以本地目录方式注册过同名 plugin，marketplace 装新版后用 `claude plugin uninstall <name>@<old-source>` 卸掉老版本，避免双注册。
 
 ---
 
@@ -187,7 +185,7 @@ printf '%s\n' \
   | python3 server/algokiller_mcp.py
 ```
 
-期望：`initialize` 响应 + `tools/list` 返回 25 个工具（18 个 trace/artifact/static 工具 + 7 个 hypothesis-ledger 工具,含 v0.9.1 新增的 `mark_hypothesis_reviewed` 和 `hypothesis_archive`）。
+期望：`initialize` 响应 + `tools/list` 返回 25 个工具（18 个 trace/artifact/static 工具 + 7 个 hypothesis-ledger 工具，含 `mark_hypothesis_reviewed` 和 `hypothesis_archive`）。
 
 ---
 

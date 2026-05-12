@@ -4,19 +4,120 @@ All notable changes to **algokiller-plugin** are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.9.5.1] — Audit-driven patch: ARC tagging, SIMD detection, multithreaded scan, skill hygiene
+
+Versioning note: this release uses the 4-segment `0.9.5.x` patch scheme.
+The work is substantial (3 FIX numbers, new C-engine features, new MCP
+fields, fully parallel scan workers) but is conceptually a **patch** of
+the 0.9.5 release — every change traces back to gaps surfaced by a real
+external audit of the v0.9.5 toolchain on a 4.5 GB XHS register-di
+trace. The MINOR position (0.9.6) is reserved for net-new feature
+batches that are not audit remediation.
 
 ### Added
 
 - Cursor/Codex MCP client setup docs in `docs/mcp-clients.md`.
 - Project-scoped Cursor MCP config at `.cursor/mcp.json`.
 - Codex MCP config example at `examples/mcp/codex.config.toml`.
+- **FIX F-16 (hexblock ARC-bookkeeping detection) — full-stack.**
+  Fix lives at every layer that touches `trace_hexblock` output, so a
+  CLI user calling `ak_search hexblock` raw gets the same protection
+  as an MCP agent.
+  - **C engine (`tools/search/search.c`):** `run_hexblock` now emits a
+    `"call_kind"` field (`"arc_bookkeeping"` or `"normal"`) computed
+    against an explicit prefix table (`ARC_BOOKKEEPING_PREFIXES`:
+    `objc_retain*`, `objc_autorelease*`, `objc_release`,
+    `swift_retain`, `swift_release`, `swift_bridgeObject*`,
+    `_Block_copy/release`). When `call_kind="arc_bookkeeping"` AND
+    the block carries one or more hexdumps, the JSON also includes an
+    `"arc_warning"` field stating the buffer is a Frida-stalker
+    side-effect dump of the receiver, not an algorithmic input.
+  - **MCP wrapper (`server/tools/handlers.py`):** detects whether the
+    C engine already set `call_kind` / `arc_warning`; if so, passes
+    them through verbatim. Falls back to the Python classifier when
+    running against an older binary. Always lifts `arc_warning` into
+    `result.instruction` so the discipline-reminder path surfaces it.
+  - **Skill docs:** new "证据陷阱清单 (v0.9.6)" subsection in
+    `skills/trace-analysis/SKILL.md` documents the pitfall, and
+    `skills/ciphertext-recovery/SKILL.md`'s `trace_hexblock` bullet
+    references `call_kind`. The "工具使用规则" subsection adds a
+    must-read rule on `call_kind` interpretation.
+  - **Background:** real-world trace audit (XHS iOS register-di,
+    4.5 GB / 48 M lines) showed an agent reading three consecutive
+    same-address-same-length hexdumps from an ARC triplet and
+    concluding the payload was fed into three independent HMAC
+    contexts — when in fact only one `dataWithJSONObject:` call ever
+    ran on that buffer. F-16 closes the gap at C, MCP, and methodology
+    levels simultaneously so the misread is impossible regardless of
+    entry point.
+- **FIX F-18 (data-parallel scan in ak_search).** `constscan` and
+  `cryptoinstr` partition the trace line range across worker threads
+  (default = host CPU count, capped at 16; overridable via
+  `--threads N` / MCP `threads` param). The mmap'd buffer and line
+  index are shared read-only; each worker writes into a thread-local
+  result struct; the main thread merges counters (commutative) and
+  sample_lines (sorted multiset → take first K in line order) so the
+  output is byte-identical between any thread count.
+  - **Why "speed and accuracy":** on a 4.5 GB / 48 M-line trace
+    `constscan` went from 121 s single-threaded → 19 s with 8 threads
+    (≈ 6.3× wall-clock). The Python wrapper's 300 s timeout was the
+    real accuracy hit before — single-threaded constscan on a 10 GB+
+    trace would hit it, producing a truncated result that read as
+    "no crypto detected" to the agent. With F-18 the same scan
+    handles ~80 GB inputs inside the timeout.
+  - **Determinism is locked in** by 10 new native tests
+    (`sprint34.trace`, `v092-constscan.trace`, `sprint5-constscan.trace`,
+    `v096-arc-and-simd.trace` × `constscan` + `cryptoinstr`, plus
+    `--threads 0` / `--threads 100` rejection cases). The same
+    invariant holds against the real 4.5 GB XHS trace.
+  - C source touched: `tools/search/search.c` only (added pthread
+    include, `detect_default_threads`, `partition_line_range`,
+    `u64_cmp_asc`, worker types `ConstscanWork` / `CryptoinstrWork`,
+    rewrote `run_constscan` / `run_cryptoinstr` to spawn + merge).
+    `tools/search/Makefile` gains `-pthread` (no-op on macOS, links
+    libpthread on Linux). Single-source compile preserved.
+
+- **FIX F-17 (constscan SIMD broadcast detection + per-block hint) —
+  full-stack.** Same layering as F-16.
+  - **C engine:** new `InstructionPattern` table (substring matches on
+    disassembly text, not on `-> reg=MAGIC` output values) with
+    `HMAC.ipad.simd_movi` / `HMAC.opad.simd_movi` patterns. Each hit
+    emits `verdict="real_simd"`, `match_pattern=".16b, #0x36/0x5c"`,
+    `primitive="HMAC.ipad/opad"`, and an `interpretation` field.
+    Per-block fingerprints (`MD5.T[i]`, `SHA256.K[i]`,
+    `SM3.T_j[*]`) now also emit `block_count_estimate`,
+    `primitive_for_blocks`, and a `block_count_note` directly from
+    `run_constscan`.
+  - **MCP wrapper:** treats C-engine output as primary, builds
+    `hmac_estimate` (cross-references SIMD count against scalar
+    `evidence.mem_r` / `load_imm`) and `block_count_hints` summaries
+    on top. When the binary is older and emits no SIMD rows, the
+    wrapper still does the daemon-side match scan as a fallback so
+    MCP behaviour is consistent across binary versions.
+  - **Skill docs:** the new "证据陷阱清单" subsection has dedicated
+    bullets for SIMD-vs-scalar HMAC counting and for per-block table
+    constants ("`MD5.T[1]=114` → 114 blocks, NOT 28 blocks"); the
+    ciphertext-recovery skill's HMAC row in the "已识别 → 直接深挖
+    的算法" table is rewritten to point at `simd_movi` as the
+    primary signal.
+  - **Background:** XHS audit predicted 44 HMAC ops from a 710-hit
+    scalar `HMAC.ipad` count; the actual SIMD count is 11 (matches
+    independent rmcp engine cross-check). The same audit divided
+    `MD5.T[1]=114` by 4 to get "28 blocks ≈ 1.8 KB" — the correct
+    answer is 114 blocks ≈ 7 KB.
 
 ### Changed
 
 - Aligned marketplace metadata with v0.9.5: 25 MCP tools, 95 crypto
   fingerprints, and 14 native `ak_search` subcommands.
-- Updated stale native test-count references from 132 to 146.
+- Updated stale native test-count references from 132 to 163.
+- E2E test suite: 14 → 20 cases (`TestF16ArcBookkeepingHexblock` ×2 +
+  `TestF17ConstscanSimdAugmentation` ×4) backed by new fixture
+  `tools/search/tests/fixtures/v096-arc-and-simd.trace`.
+- Native shell test suite: 146 → 163 cases (added F-16 `call_kind` /
+  `arc_warning` assertions and F-17 SIMD-pattern / block-count-hint
+  assertions, both running directly against the C engine without the
+  Python wrapper to verify end-to-end coverage).
 
 ## [0.9.5] — Full VM reversal methodology in ciphertext-recovery SKILL
 

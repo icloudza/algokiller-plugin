@@ -208,6 +208,148 @@ class TestL1Plumbing(unittest.TestCase):
         self.assertIn("available_tools", r)
 
 
+class TestF16ArcBookkeepingHexblock(unittest.TestCase):
+    """FIX F-16 (v0.9.6): trace_hexblock tags ARC bookkeeping calls so
+    agents stop reading consecutive same-buffer hexdumps from
+    objc_retainAutoreleasedReturnValue / objc_autoreleaseReturnValue as
+    independent algorithm-input events. Real-world repro: XHS iOS
+    register-di trace, where one NSData was dumped 3 times by Frida-
+    stalker on retain/autorelease/retain and the analysis report (using
+    earlier algokiller) misread this as a 3-way HMAC pipeline."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not _ensure_binary():
+            raise unittest.SkipTest(f"ak_search not built at {AK_SEARCH}")
+        cls.client = MCPClient()
+        trace = FIXTURES / "v096-arc-and-simd.trace"
+        r = cls.client.call_tool("bind_trace",
+                                 {"path": str(trace), "mode": "general"})
+        if r.get("status") != "ok":
+            raise unittest.SkipTest(f"bind_trace failed: {r}")
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, "client"):
+            cls.client.close()
+
+    def _find_call_line(self, needle: str) -> int:
+        """Use trace_search to resolve the line number of a `call func:` row."""
+        r = self.client.call_tool("trace_search",
+                                  {"query": needle, "from_line": 1, "limit": 5})
+        self.assertEqual(r["status"], "ok", r)
+        for raw in (r.get("stdout") or "").splitlines():
+            raw = raw.strip()
+            if not raw or not raw.startswith("{"):
+                continue
+            row = json.loads(raw)
+            if row.get("type") == "match" and "call func:" in row.get("text", ""):
+                return int(row["line"])
+        self.fail(f"could not resolve a call_func line for {needle!r}: {r}")
+
+    def test_01_arc_call_tagged_and_warned(self):
+        """objc_retainAutoreleasedReturnValue + hexdump → arc_bookkeeping
+        + arc_warning surfaced as instruction so agents see it."""
+        line = self._find_call_line("objc_retainAutoreleasedReturnValue")
+        r = self.client.call_tool("trace_hexblock", {"line": line})
+        self.assertEqual(r["status"], "ok", r)
+        body = json.loads(r["stdout"].splitlines()[0])
+        self.assertEqual(body.get("call_kind"), "arc_bookkeeping",
+                         f"expected arc_bookkeeping tag: {body}")
+        self.assertIn("arc_warning", body,
+                      "hexdump on ARC call must carry arc_warning")
+        # Warning text should explain the side-effect-dump pitfall.
+        self.assertIn("Frida-stalker side-effect", body["arc_warning"])
+        # Engine must also lift the warning into result.instruction so it
+        # rides the discipline-reminder path back to the agent.
+        self.assertIn("arc_bookkeeping", r.get("instruction", ""),
+                      f"arc warning must propagate to instruction: {r.get('instruction')}")
+
+    def test_02_normal_call_not_tagged_as_arc(self):
+        """A non-ARC call (memcpy) must NOT be flagged arc_bookkeeping
+        even though its hexdump shape is identical to ARC's."""
+        line = self._find_call_line("__memcpy_aarch64_simd")
+        r = self.client.call_tool("trace_hexblock", {"line": line})
+        self.assertEqual(r["status"], "ok", r)
+        body = json.loads(r["stdout"].splitlines()[0])
+        self.assertEqual(body.get("call_kind"), "normal",
+                         f"memcpy must stay normal: {body}")
+        self.assertNotIn("arc_warning", body)
+
+
+class TestF17ConstscanSimdAugmentation(unittest.TestCase):
+    """FIX F-17 (v0.9.6): trace_constscan post-processing detects NEON
+    `movi v*.16b, #0x36/0x5c` HMAC pad broadcasts that the scalar C
+    engine misses, and emits a per-block hint so agents stop dividing
+    MD5.T[i] / SHA256.K[i] hit counts by 4 / 16 / 64."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not _ensure_binary():
+            raise unittest.SkipTest(f"ak_search not built at {AK_SEARCH}")
+        cls.client = MCPClient()
+        trace = FIXTURES / "v096-arc-and-simd.trace"
+        r = cls.client.call_tool("bind_trace",
+                                 {"path": str(trace), "mode": "general"})
+        if r.get("status") != "ok":
+            raise unittest.SkipTest(f"bind_trace failed: {r}")
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, "client"):
+            cls.client.close()
+
+    def _summary(self) -> dict:
+        r = self.client.call_tool("trace_constscan", {})
+        self.assertEqual(r["status"], "ok", r)
+        body = json.loads(r["stdout"].splitlines()[0])
+        self.assertEqual(body.get("type"), "constscan")
+        return body
+
+    def test_01_simd_movi_fingerprints_appended(self):
+        body = self._summary()
+        fps = {h.get("fingerprint"): h for h in body.get("hits", [])}
+        # Fixture contains 2 `movi v0.16b, #0x36` and 2 `movi v1.16b, #0x5c`.
+        ipad = fps.get("HMAC.ipad.simd_movi")
+        opad = fps.get("HMAC.opad.simd_movi")
+        self.assertIsNotNone(ipad, f"missing HMAC.ipad.simd_movi: keys={list(fps)}")
+        self.assertIsNotNone(opad, f"missing HMAC.opad.simd_movi: keys={list(fps)}")
+        self.assertEqual(ipad["total_hits"], 2, ipad)
+        self.assertEqual(opad["total_hits"], 2, opad)
+        self.assertEqual(ipad["verdict"], "real_simd")
+        self.assertEqual(opad["verdict"], "real_simd")
+        # Sample lines must be present so the agent can verify.
+        self.assertGreaterEqual(len(ipad["sample_lines"]), 1)
+        self.assertGreaterEqual(len(opad["sample_lines"]), 1)
+
+    def test_02_hmac_estimate_from_simd(self):
+        body = self._summary()
+        est = body.get("hmac_estimate")
+        self.assertIsNotNone(est, f"hmac_estimate missing: {list(body)}")
+        self.assertEqual(est.get("simd_movi_ipad"), 2)
+        self.assertEqual(est.get("simd_movi_opad"), 2)
+        # SIMD takes precedence over scalar when present.
+        self.assertEqual(est.get("estimated_hmac_calls"), 2)
+        self.assertIn("simd_movi", est.get("estimate_basis", ""))
+
+    def test_03_block_count_hints_for_md5_T(self):
+        body = self._summary()
+        hints = body.get("block_count_hints") or []
+        by_fp = {h.get("fingerprint"): h for h in hints}
+        # Fixture has 1 MD5.T[1..4] ldr each → block_count_estimate=1.
+        for k in ("MD5.T[1]", "MD5.T[2]", "MD5.T[3]", "MD5.T[4]"):
+            h = by_fp.get(k)
+            self.assertIsNotNone(h, f"missing block_count_hint for {k}: keys={list(by_fp)}")
+            self.assertEqual(h["block_count_estimate"], 1, h)
+            self.assertEqual(h["primitive"], "MD5")
+            # Note must explicitly warn against the /4 /16 /64 mistake.
+            self.assertIn("Do NOT divide", h["note"])
+
+    def test_04_augmentation_note_present(self):
+        body = self._summary()
+        self.assertIn("FIX F-17", body.get("augmentation_note", ""))
+
+
 class TestL3LedgerEndToEnd(unittest.TestCase):
     """L3: anti-hallucination scaffold runs end-to-end in the real JSON-RPC
     path. Validates that FIX #1–#4 are not just unit-test artefacts."""

@@ -1,0 +1,32 @@
+[app_main] 0x100001000!0x1000 mov w0, #0x67452301; -> w0=0x67452301
+[app_main] 0x100001004!0x1004 mov w1, #0xefcdab89; -> w1=0xefcdab89
+[app_main] 0x100001008!0x1008 mov w2, #0x98badcfe; -> w2=0x98badcfe
+[app_main] 0x10000100c!0x100c mov w3, #0x10325476; -> w3=0x10325476
+[app_main] 0x100001010!0x1010 ldr w4, [x9, #0]; mem_r=0x115000000 -> w4=0xd76aa478
+[app_main] 0x100001014!0x1014 ldr w5, [x9, #4]; mem_r=0x115000004 -> w5=0xe8c7b756
+[app_main] 0x100001018!0x1018 ldr w6, [x9, #8]; mem_r=0x115000008 -> w6=0x242070db
+[app_main] 0x10000101c!0x101c ldr w7, [x9, #12]; mem_r=0x11500000c -> w7=0xc1bdceee
+[app_main] 0x100001020!0x1020 mov w0, #0x6a09e667; -> w0=0x6a09e667
+[app_main] 0x100001024!0x1024 mov w1, #0xbb67ae85; -> w1=0xbb67ae85
+[app_main] 0x100001028!0x1028 ldr w8, [x10, #0]; mem_r=0x115000100 -> w8=0x428a2f98
+[app_main] 0x10000102c!0x102c movi v0.16b, #0x36; -> v0=0x36363636363636363636363636363636
+[app_main] 0x100001030!0x1030 movi v1.16b, #0x5c; -> v1=0x5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c
+[app_main] 0x100001034!0x1034 eor v3.16b, v2.16b, v0.16b;
+[app_main] 0x100001038!0x1038 eor v4.16b, v2.16b, v1.16b;
+[app_main] 0x10000103c!0x103c movi v0.16b, #0x36; -> v0=0x36363636363636363636363636363636
+[app_main] 0x100001040!0x1040 movi v1.16b, #0x5c; -> v1=0x5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c
+[app_main] 0x100001044!0x1044 eor v3.16b, v2.16b, v0.16b;
+call func: NSJSONSerialization_dataWithJSONObject(0x21456a918, 0x1ba4be296)
+ret: 0x283d919a0
+call func: objc_retainAutoreleasedReturnValue(0x283d919a0)
+hexdump at address 0x13d1af000 with length 0x10:
+13d1af000: 7b 22 68 70 5f 63 6f 6e 22 3a 66 61 6c 73 65 7d |{"hp_con":false}|
+ret: 0x283d919a0
+call func: objc_autoreleaseReturnValue(0x283d919a0)
+hexdump at address 0x13d1af000 with length 0x10:
+13d1af000: 7b 22 68 70 5f 63 6f 6e 22 3a 66 61 6c 73 65 7d |{"hp_con":false}|
+ret: 0x283d919a0
+call func: __memcpy_aarch64_simd(0x300001000, 0x400001000, 0x10)
+hexdump at address 0x400001000 with length 0x10:
+400001000: 41 42 43 44 45 46 47 48 49 4a 4b 4c 4d 4e 4f 50 |ABCDEFGHIJKLMNOP|
+ret: 0x300001000

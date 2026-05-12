@@ -13,11 +13,11 @@ description: ARM64 trace 密文还原方法论。当用户给出一段 ARM64 执
 
 你必须基于 trace 证据回答用户任务。不要编造指令、寄存器值、内存字节、函数边界、密钥、常量、字段语义、分支结果或调用关系。
 
-可用工具（均由 `algokiller` MCP server 提供, v0.9.1 共 25 个 = 18 trace/artifact + 7 ledger，按使用顺序分组）：
+可用工具（均由 `algokiller` MCP server 提供，25 个 = 18 trace/artifact + 7 ledger，按使用顺序分组）：
 
 **🔍 体检与总览（bind_trace 之后第一波必做）**
 - `algokiller.trace_lint`：单遍扫 trace 得 JSON 体检——行数/模块分布/Top-K mnemonic/call_func 块数/有无寄存器观察/format_ok + warnings。先调一次，确认 trace 格式可用、结构画像清晰。
-- `algokiller.trace_constscan`：扫 **95 个**密码学常数指纹（MD5 init+T 表/SHA-1/SHA-256 init+K 表/SHA-512/SM3 init+T_j 轮常数/SHA-3/CRC32/FNV1a/AES sbox/AES Te0/SM4/ChaCha20/TEA/DES SP-box/Whirlpool/Poly1305/SipHash/**HMAC ipad-opad** + P-256/secp256k1/Ed25519/Curve25519）。**v0.9.2 关键升级**:除 IV 外还扫**主循环常数**(MD5 T 表 / SHA-256 K 表 / SM3 T_j),它们每个 block 命中 64 次而 IV 只命中 1 次——活跃 hash trace 的真实信号密度由这些主循环常数主导。**必看 `verdict` 字段而不是 `total_hits`**：`real` = load_imm 或 mem_r 真信号；`alu_only` = ALU 运算碰撞假阳，必须忽略；`weak` = 仅 mem_w/mem_r_addr 间接信号。每个命中带 `evidence` 分项（load_imm / mem_r / alu / ...）和 `sample_lines` 锚点。`category` 分类：hash / cipher_sym / ecc / crc / mac；`confidence` 分级：strong / medium / weak。
+- `algokiller.trace_constscan`：扫密码学常数指纹（含 scalar 字面量 + NEON SIMD 广播两类），覆盖 MD5 init+T 表/SHA-1/SHA-256 init+K 表/SHA-512/SM3 init+T_j 轮常数/SHA-3/CRC32/FNV1a/AES sbox/AES Te0/SM4/ChaCha20/TEA/DES SP-box/Whirlpool/Poly1305/SipHash/**HMAC ipad-opad（scalar + SIMD broadcast）** + P-256/secp256k1/Ed25519/Curve25519。除 IV 外还扫**主循环常数**(MD5 T 表 / SHA-256 K 表 / SM3 T_j)——活跃 hash trace 的真实信号密度由这些主循环常数主导。**关键计数规则**：每个 fingerprint（如 `MD5.T[1]`、`SHA256.K[0]`）**在单个压缩 block 内出现 1 次**，整张 T/K 表跨 64 轮分给 T[1..64] / K[0..63] 各 1 次；所以 `MD5.T[1].total_hits ≈ MD5 block 数`（不是 64×block 数）。对于带 `block_count_estimate` 字段的 fingerprint，直接读该字段最稳。**必看 `verdict` 字段而不是 `total_hits`**：`real` = load_imm 或 mem_r scalar 真信号；`real_simd` = NEON 广播证据（HMAC ipad/opad 等）；`alu_only` = ALU 运算碰撞假阳，必须忽略；`weak` = 仅 mem_w/mem_r_addr 间接信号。每个命中带 `evidence` 分项（load_imm / mem_r / alu / simd_broadcast / ...）和 `sample_lines` 锚点。`category` 分类：hash / cipher_sym / ecc / crc / mac；`confidence` 分级：strong / medium / weak。
 - `algokiller.trace_cryptoinstr`：扫 ARM Crypto Extensions 硬件加密指令（AES `aese/aesmc/aesd/aesimc`、SHA-1 `sha1c/m/p/h/su0/su1`、SHA-256 `sha256h/h2/su0/su1`、SHA-512 `sha512h/h2/su0/su1`、SHA-3 `eor3/rax1/xar/bcax`、GHASH `pmull/pmull2`、SM3 `sm3*`、SM4 `sm4e/sm4ekey`）。**这是 constscan 的盲区补丁**：当 binary 走硬件加密（iOS CryptoKit / BoringSSL ARM / libsodium-arm / Android Keystore HW path / iPhone 5s+ 默认），软件 sbox/常数完全消失——只有硬件指令本身能识别。**必须 constscan + cryptoinstr 一起跑**：如果 constscan 报 AES.Te0 = 0 但 cryptoinstr 报 aese hits > 0，那就是 AES-NI 在跑，不是没加密。
 - `algokiller.trace_callgraph --top N`：Top-K 最常被调的 `call func: NAME(args)` 符号 + 计数。一眼看见热路径（malloc/memcpy/objc_msgSend/CCCrypt/...）。
 - `algokiller.trace_modgraph --top N`：跨模块跳转矩阵。看 caller_mod → callee_mod 邻接 + 边权重，定位密码学边界(如 app_main → openssl / target_sign → libc++)。
@@ -33,7 +33,7 @@ description: ARM64 trace 密文还原方法论。当用户给出一段 ARM64 执
 - `algokiller.trace_semop --line N | --from-line A --to-line B`：分类每条指令为 11 类语义（`zero` xor x,x,x / `crypto_candidate` eor 不同寄存器 / `hash_loop_candidate` madd/msub / `stack_save|restore` stp/ldp x29,x30 / `memory_load|store` / `branch` b/bl/cbz/ret / `addr_calc` adrp/adr / `data_move` mov / `alu` add/sub/orr/and/eor/mul / `compare` cmp/tst/subs / `unknown`）。用来剪掉非密码学候选行。
 
 **🧱 数据块结构化提取**
-- `algokiller.trace_hexblock --line N`：解析 `call func: NAME(args)` 块——返回 call、args、可选 `class:` 标签、可选 `hexdumps[]`（每段 `{address, length, bytes_hex}`，bytes_hex 已拼接所有 hexdump 行）、`ret`。替代手动凑 `trace_context` + 拼字节。memcpy/sprintf/CCCrypt 后取数据流首选。
+- `algokiller.trace_hexblock --line N`：解析 `call func: NAME(args)` 块——返回 call、`call_kind`（`"arc_bookkeeping"` 或 `"normal"`）、args、可选 `class:` 标签、可选 `hexdumps[]`（每段 `{address, length, bytes_hex}`，bytes_hex 已拼接所有 hexdump 行）、`ret`、可选 `arc_warning`。替代手动凑 `trace_context` + 拼字节。memcpy/sprintf/CCCrypt 后取数据流首选。**`call_kind="arc_bookkeeping"` 的 hexdump 是 Frida-stalker 对 receiver 对象的副作用 dump，不是算法输入/输出**——必须放弃，沿 trace 上溯找产生该 buffer 的真正 call（例如 `NSJSONSerialization dataWithJSONObject:` / `[NSString dataUsingEncoding:]`）。
 
 **📉 体量管理**
 - `algokiller.trace_fold --out_path PATH --block 4 --threshold 100`：写一份新 trace，连续 W 行相同 signature 的重复块折叠为 first-block + sentinel + last-block。大型移动应用启动 trace 实测 115MB → 1.1MB(99% 压缩),保留首末块数据流证据。Hash loop(madd / ldrsb / subs / b.ne 4 条交替)用 `--block 4`,单指令重复用 `--block 1`。
@@ -54,10 +54,11 @@ description: ARM64 trace 密文还原方法论。当用户给出一段 ARM64 执
 **bind_trace 后第一波动作（务必按序）**：
 
 1. `trace_lint` —— 确认 trace 是合法 GumTrace 格式（`format_ok: true`）、模块分布、有无 `call_func_blocks` / 寄存器观察。如果 `warnings` 非空、`format_ok: false`，立即向用户报告并停止——别在残废 trace 上烧 token。
-2. `trace_constscan` —— 拿软件密码学算法清单(95 个常数指纹,v0.9.2 起包含主循环常数)。**必须按 `verdict` 字段过滤**：
-   - 只信 `verdict: "real"`（load_imm > 0 或 mem_r > 0）的指纹。
-   - **明确忽略 `verdict: "alu_only"`**——这些是 ALU 运算碰撞的假阳。例如 0x9e3779b9（TEA delta）加自己等于 0x3c6ef372（SHA-256.h2）——agent 必须看 verdict 不被 total_hits 误导。
+2. `trace_constscan` —— 拿软件密码学算法清单（含主循环常数 + NEON SIMD 广播）。**必须按 `verdict` 字段过滤**：
+   - 信 `verdict: "real"`（scalar load_imm > 0 或 mem_r > 0）和 `verdict: "real_simd"`（NEON 广播命中，如 `HMAC.ipad.simd_movi`）。
+   - **明确忽略 `verdict: "alu_only"`**——这些是 ALU 运算碰撞的假阳。例如 0x9e3779b9（TEA delta）加自己等于 0x3c6ef372（SHA-256.h2）——必须看 verdict 不被 total_hits 误导。
    - `verdict: "weak"` 仅作为辅助提示。
+   - 带 `block_count_estimate` 字段的 fingerprint（MD5.T[i] / SHA256.K[i] / SM3.T_j）直接读该字段拿 block 数，**不要拿 total_hits 再除以 4/16/64**。
 3. `trace_cryptoinstr` —— 扫 ARM Crypto Extensions 硬件加密指令清单。**必须跟 constscan 一起读**：
    - constscan 命中 + cryptoinstr 0 命中 → **纯软件实现**(常见于自研签名 SO 跑 MD5/SHA-1/AES Te0/SM3 等软件 T-table 路径)。
    - constscan 0 命中 + cryptoinstr 命中 → **纯硬件加密**（如 iOS CryptoKit 跑 AES-NI）。
@@ -69,9 +70,9 @@ description: ARM64 trace 密文还原方法论。当用户给出一段 ARM64 执
 
 ---
 
-## 🧠 Hypothesis Ledger — 思考模式脚手架（v0.8.0+ 必走）
+## 🧠 Hypothesis Ledger — 思考模式脚手架（必走）
 
-trace 工具给你"看到什么"的能力, ledger 给你"想清楚什么"的脚手架. **每一个你打算放进 write_artifact 的结论, 必须先在 ledger 里走完 add → update → conclude 的闭环, 且 confidence ≥ medium**. 这是反幻觉硬约束——不是建议。
+trace 工具给你"看到什么"的能力，ledger 给你"想清楚什么"的脚手架。**每一个你打算放进 write_artifact 的结论，必须先在 ledger 里走完 add → update → conclude 的闭环，且 confidence ≥ medium**。这是反幻觉硬约束——不是建议。
 
 ### 5 个 ledger MCP 工具
 
@@ -99,24 +100,24 @@ B. 实验
    - hypothesis_update 把该 tool_call_id 作为 supporting/contradicting 引用
    - server 校验 id 必须在 [1, 当前 tool_call_count] 区间 (反"凭空捏造证据")
 
-C. 反驳尝试 (conclude=high 必经, v0.9.1 升级为 FIX #5)
+C. 反驳尝试 (conclude=high 必经)
    - 主动跑 falsification_plan 描述的实验, 即使预期会失败
    - 跑完后调 hypothesis_update(id, falsification_evidence={tool_call_id, excerpt})
-   - **v0.9.1 起 boolean falsification_attempted=true 不再够用** —— 必须 cite 真实 tool_call_id + 该工具输出里的 verbatim excerpt
+   - boolean falsification_attempted=true 不够用 —— 必须 cite 真实 tool_call_id + 该工具输出里的 verbatim excerpt
    - server 端再校验 tool_call_id 必须**大于** 该假设的 created_at_tool_call (实验必须在假设之后跑)
    - 没满足 → server 拒绝 conclude(high), 报错指明哪一条没过
 
-D. 收敛 / 弃用 / 归档 (v0.9.1)
-   - 满足 gate → 先 spawn hypothesis-reviewer (FIX #6, 见下节), reviewer confirm 后 → hypothesis_conclude(id, final_statement, final_confidence)
+D. 收敛 / 弃用 / 归档
+   - 满足 gate → 先 spawn hypothesis-reviewer (见下节), reviewer confirm 后 → hypothesis_conclude(id, final_statement, final_confidence)
    - 不满足 + 证据矛盾 → hypothesis_abandon(id, reason)
    - 不满足 + 证据不足 → 回到 B 继续
-   - **已 concluded 但最终交付不需要引用** → hypothesis_archive(id, reason) (FIX #7)
+   - **已 concluded 但最终交付不需要引用** → hypothesis_archive(id, reason)
      - 例:你 conclude 了 H3="binary 不用 RSA"(排除分析), 但最终 recovered.py 不需要在叙事里点 H3
      - archive 让 H3 退出 "concluded 必须被引用" 的硬约束, 但 audit log 仍保留
 
 E. 交付
-   - write_artifact 的内容必须用 [H<id>] 引用 concluded 假设 (v0.9.1: bracket format)
-     - 旧格式 H1 / H2 不再被识别为引用 —— 这是为了避免 Python 变量名 / SHA-512 H1/H2 状态量误伤
+   - write_artifact 的内容必须用 `[H<id>]` bracket 格式引用 concluded 假设
+     - 裸 `H1` / `H2` 不识别为引用 —— 避免 Python 变量名 / SHA-512 H1/H2 状态量误伤
    - server 反查每个 [H<id>]: 必须 state="concluded" + confidence>=medium + 有真实 supporting
    - 没引用 + ledger 有 (非 archived 的) concluded 假设 → 拒收 ("bypass ledger")
    - 引用了但 [H<id>] 不合规 → 拒收 + 列具体错误
@@ -126,9 +127,9 @@ E. 交付
 
 每 5 次 tool call, server 自动把当前 active ledger summary 附在工具返回里. 你不需要主动 `hypothesis_list`——但**看到 inject summary 后必须更新状态**: 没进展的 active 假设要么补 evidence 要么 abandon. 长期挂着 falsification_attempted=false 是 3.25 行为.
 
-### conclude(high) 必经蓝军审查 (v0.9.0 文档级, v0.9.1 升级为 server 端硬 gate)
+### conclude(high) 必经蓝军审查
 
-**任何 load-bearing 假设升 high 之前必须 spawn `hypothesis-reviewer` agent 做独立审查**。**v0.9.1 升级**:server 端 FIX #6 现在直接检查 `reviewer_verdict == 'confirm'` 且 `reviewed_at_tool_call` 不能比当前调用早超过 30 次——没记录的话 conclude(high) 直接被拒。
+**任何 load-bearing 假设升 high 之前必须 spawn `hypothesis-reviewer` agent 做独立审查**。server 端 hard gate 直接检查 `reviewer_verdict == 'confirm'` 且 `reviewed_at_tool_call` 不能比当前调用早超过 30 次——没记录或已过期，conclude(high) 直接被拒。
 
 工作流:
 
@@ -139,8 +140,8 @@ E. 交付
                  H<N> statement: '<full statement>'. Bound trace: <trace path> (mode=ciphertext)")
    ```
 
-2. **Reviewer 独立审查** (独立 context、看不到你的推理),走完 5 步:
-   - load ledger → gate-check FIX#1-#7 → audit evidence excerpts → 找反证 → **调 mark_hypothesis_reviewed(id, verdict, reason) 落锤**
+2. **Reviewer 独立审查** (独立 context、看不到你的推理), 走完 5 步:
+   - load ledger → gate-check → audit evidence excerpts → 找反证 → **调 mark_hypothesis_reviewed(id, verdict, reason) 落锤**
 
 3. **Reviewer 返回 JSON**:
    ```json
@@ -149,18 +150,18 @@ E. 交付
    ```
 
 4. **主 agent 根据 recommendation 行动**:
-   - `confirm` → `hypothesis_conclude(id, ..., final_confidence="high")` ✓ (server gate FIX #6 已满足)
+   - `confirm` → `hypothesis_conclude(id, ..., final_confidence="high")` ✓ (server gate 已满足)
    - `refute` → 按 next_steps 补 evidence 或换思路, **不要硬 conclude**(server 也会拒)
    - `abandon` → 调 `hypothesis_abandon(id, reason)`, 重新规划
 
 **什么算 load-bearing**: 这个假设的结论会被 `write_artifact` 的最终交付物以 `[H<N>]` 引用。简单说"决定 recovered.py 里哪段代码长什么样"的, 都是 load-bearing。
 
-**v0.9.1 关键约束**:
-- **不要自己调 mark_hypothesis_reviewed** —— 这是 reviewer 的 verdict 落锤动作,主 agent 自调会在 jsonl audit log 上留下 "同一 context spawn 自审" 的痕迹,事后翻车有据
-- **超过 30 次 tool 调用前的 review 已过期** —— 需要重新 spawn reviewer
-- **reviewer verdict != confirm 就别 retry conclude(high)** —— 重新走完 reviewer workflow
+**关键约束**:
+- **不要自己调 mark_hypothesis_reviewed** —— 这是 reviewer 的 verdict 落锤动作。主 agent 自调会在 jsonl audit log 上留下 "同一 context spawn 自审" 的痕迹, 事后翻车有据。
+- **超过 30 次 tool 调用前的 review 已过期** —— 需要重新 spawn reviewer。
+- **reviewer verdict != confirm 就别 retry conclude(high)** —— 重新走完 reviewer workflow。
 
-**为什么强制走 reviewer**: server 端 FIX#1-#5 拦得住"凭空捏造证据 / 数量不够 / 没反证 / 反证捏造"——但拦不住"你为这个假设花了 20 轮调用, 沉没成本让你倾向 confirm"。reviewer 没沉没成本, 客观性更高。**这是 algokiller v0.9.1 反幻觉护城河的第四层 (FIX #6)。**
+**为什么强制走 reviewer**: server 端 gate 拦得住"凭空捏造证据 / 数量不够 / 没反证 / 反证捏造"——但拦不住"你为这个假设花了 20 轮调用, 沉没成本让你倾向 confirm"。reviewer 没沉没成本, 客观性更高。
 
 **medium 可选走 reviewer**: 不强制, 但对会驱动主要分支的关键假设建议过一遍——花 1 次 spawn 换"早期纠偏", 比走到 write_artifact 才被拒收 cost 低得多。
 
@@ -168,19 +169,19 @@ E. 交付
 
 | 幻觉模式 | 被哪一道防线挡住 |
 |---|---|
-| 凭空给结论 | write_artifact `[H<id>]` 引用强校验 (v0.9.1 bracket-only) |
-| 引用不存在的证据 | tool_call_id 范围校验 (FIX #1) |
-| 引用文本不是真证据 | excerpt verbatim verification 校验 (FIX #1) |
-| confidence=high 但证据不足 | conclude gate 数量校验 (FIX #2 / #3) |
-| supporting 三条全来自同一工具 | source diversity ≥ 2 distinct tools (FIX #3) |
-| **跳过反驳直接 conclude high** | **v0.8.x**: falsification_attempted boolean / **v0.9.1**: falsification_evidence verbatim 校验 (FIX #5) |
-| 反证捏造 boolean=True 但没真跑 | FIX #5 verbatim + tool_call_id 必须晚于 created_at |
-| 互斥假设双 conclude | conflicts_with 图 (FIX #4) |
+| 凭空给结论 | write_artifact `[H<id>]` 引用强校验（bracket-only） |
+| 引用不存在的证据 | tool_call_id 范围校验 |
+| 引用文本不是真证据 | excerpt verbatim verification |
+| confidence=high 但证据不足 | conclude gate 数量校验 |
+| supporting 三条全来自同一工具 | source diversity ≥ 2 distinct tools |
+| 跳过反驳直接 conclude high | falsification_evidence verbatim 校验 |
+| 反证捏造 boolean=True 但没真跑 | tool_call_id 必须晚于 created_at |
+| 互斥假设双 conclude | conflicts_with 图 |
 | 下游错误传播 | abandon 时自动 surface 依赖者 |
-| 隐式断言 (写报告不引用 [H<id>]) | write_artifact 检测到 ledger 有 (非 archived) concluded 但 0 引用 → 拒收 |
-| **不相关 concluded 假设硬塞进交付物** (v0.9.1) | **hypothesis_archive(id, reason) (FIX #7) 退出引用约束** |
-| **沉没成本驱动的 conclude(high)** (v0.9.0 / v0.9.1) | **v0.9.0 文档级 + v0.9.1 mark_hypothesis_reviewed server 端硬 gate (FIX #6)** |
-| Python 变量名 H1/H2 被误识为引用 (v0.8.x 真实 bug) | 引用语法收紧为 `[H<n>]` 或 `<H<n>>` (FIX A-8) |
+| 隐式断言（写报告不引用 [H<id>]） | write_artifact 检测到 ledger 有 (非 archived) concluded 但 0 引用 → 拒收 |
+| 不相关 concluded 假设硬塞进交付物 | hypothesis_archive(id, reason) 退出引用约束 |
+| 沉没成本驱动的 conclude(high) | mark_hypothesis_reviewed server 端硬 gate |
+| Python 变量名 H1/H2 被误识为引用 | 引用语法收紧为 `[H<n>]` 或 `<H<n>>` |
 
 **底层逻辑**: ledger 让 AI 不能瞎说. 它把推理从"AI 自说自话"变成"AI 必须显式构建可证伪 + 可审计的论证链".
 
@@ -239,7 +240,7 @@ constscan + cryptoinstr 都缺信号时（**两者都 0 命中或全 `alu_only`*
 | **AES T-table (OpenSSL aes_core 风格)** | `AES.Te0[0..3] verdict=real` + `mem_r=表基址+idx*4` | 抓 sample_lines, trace_regflow 追 round key 演化 |
 | **国密 SM2/SM3/SM4** | SM3.IV0..7 + SM4.FK*/CK*/sbox verdict=real | trace_callgraph 找 sm3_compress / sm4_crypt 入口 |
 | **Ed25519 / secp256k1 / P-256** | `Ed25519.d_lo` / `secp256k1.p_lo` / `P256.b_lo` verdict=real | trace_callgraph 找 ed25519_sign / ecdsa_sign / point_mul 入口 |
-| **HMAC / KDF 串联** | hash IV 命中 + 看到 0x36/0x5c 字节 pad | **注意**：很多实现 runtime 计算 `ipad[i] = key[i] ^ 0x36`，不会 materialize 0x3636... 整段；`trace_bytes` 搜 0x36 重复字节是**额外信号**，不是必要条件 |
+| **HMAC / KDF 串联** | hash IV/K 命中 + **`HMAC.ipad.simd_movi` / `HMAC.opad.simd_movi` verdict=`real_simd`** 为首选信号；也接受 scalar `HMAC.ipad` / `HMAC.opad` verdict=real（`load_imm > 0`）或 trace_bytes 看到 0x36/0x5c 字节 pad | **计数规则**：现代 aarch64 编译大量走 NEON `movi v*.16b, #0x36` 一条指令完成 ipad 16 字节广播，SIMD 行 `total_hits` ≈ HMAC 调用次数。scalar 路径仍可能出现（runtime `ipad[i]=key[i]^0x36` / 非 NEON / 32-bit / WASM 桥接），但当同 trace 里 SIMD 与 scalar 同时命中时，**优先 SIMD**：scalar 大概率是 byte-juggling memcpy 噪声（reload 已填好的 ipad 缓冲再 store，`evidence.mem_r >> evidence.load_imm` 时 100% 是噪声），不能除以 16 估 HMAC 次数。两边数字不要简单相加（重复计数同一段 HMAC） |
 | **NEON SIMD bitslicing AES** | tbl/tbx/shrn/shll/ushr/sli 大量 + 0 sbox | hexblock 看密钥/密文边界，不要期望常数 |
 
 ### 5. ARM Crypto Extensions cheatsheet (cryptoinstr 输出对照)
@@ -303,11 +304,11 @@ constants          (constscan verdict=real)
 - 通过多轮 `trace_search` 追踪寄存器值、内存地址、返回值、函数名、字段名、hexdump ASCII 和常量，逐步建立证据链；是否继续追踪取决于当前模式和用户任务。
 - 每轮 `trace_search` 前先明确本轮搜索目的：定位目标实例、寻找最近写入/生成点、追踪输入来源、验证字段/分支/算法假设、确认调用边界或确认后续消费者。不要把同一次搜索结果同时解释成多个角色。
 - hex/字节按字节处理（`0x11223344` 反序 = `44 33 22 11`），不按字符或 nibble 反转。
-- `0x` 前缀查询由 server 自动尝试 fallback（reversed / leading-zero-trim 组合）；命中变体时返回里 `fallback_query` 字段标明。非 `0x` 前缀的 hex（如 `08 d2 11`、`08d211`）需自己尝试原序 + 反序。
+- **hex 字面量搜索不要用 `trace_search` 期待自动反序**。`trace_search` 对 `0x...` 查询是字面 substring 匹配；零命中时它只返回一条 hint 指向 `trace_bytes`，**不会自动 fallback 反序或剥前导零**。要找一个值在 trace 全局出现多少次/位置，直接 `trace_bytes --query 0xVAL`，它**显式**枚举原序 / byte-reversed / 剥前导零等变体，并在结果里给每个变体单独的命中数，避免把反序匹配误读成原值的来源。非 `0x` 前缀 hex（如 `08 d2 11` / `08d211`）需自己尝试原序 + 反序。
 - >4 字节查询：完整失败后用 2-4 个高辨识度 4 字节滑动窗口 × (原序 + 反序)；命中冲突 / 低熵窗口才换 offset 或扩 5-8 字节。
 - 小步搜索、小范围上下文。询问用户的限制见下面"输入假设与询问限制"。
 
-**扩展工具替代手工循环（v0.6.0 强烈推荐）**
+**扩展工具替代手工循环**
 
 | 你想做 | ❌ 老姿势（多轮 token 烧光） | ✅ 新姿势（一次拿结果） |
 |---|---|---|
@@ -518,7 +519,7 @@ open thread: <一句话描述发现>
 
 > **重要前提**:绝大多数 VMP 任务**不应该**走这条全量还原路径。先尝试上面的"语义算子序列"绕过策略 —— 7-8 成场景这就够了。仅当:**(a)** 用户明确要求完整字节码 → 可执行 Python decoder,或 **(b)** bypass 路径死锁(IO buffer 中间态完全藏在 VM context 内,trace 不可见),才进入下面 4 阶段。
 >
-> **脆性警告**:VMP 反编译是脆性活,任一阶段判错会导致后续 100+ 条 listing 看起来合理但实际全错。每个阶段都有**强制验证 gate**,不通过不进下一阶。**严禁**为求进度跳过验证 —— v0.9.3 anti-hallucination layer 4(高置信推断必须 `[H<n>]` + 蓝军 reviewer)在这条路径上**全程激活**。
+> **脆性警告**：VMP 反编译是脆性活，任一阶段判错会导致后续 100+ 条 listing 看起来合理但实际全错。每个阶段都有**强制验证 gate**，不通过不进下一阶。**严禁**为求进度跳过验证 —— 高置信推断必须 `[H<n>]` + 蓝军 reviewer 的硬约束在这条路径上**全程激活**。
 
 #### Stage A · VMP 识别(三特征同时命中才算确认)
 
@@ -595,7 +596,7 @@ open thread: <一句话描述发现>
 **Stage C 强制约束**:
 
 - **每个 handler 单独走一遍 ledger 闭环**。50 个 handler = 50 次 `hypothesis_add → conclude`,每个都有独立 [H<n>]
-- 这是 algokiller 反幻觉骨架的本职场景:**严禁** "看起来像 ADD 就当 ADD"。`ADD` vs `ADC`(带进位)/ `MOV` vs `CSEL`(条件)/ `LDR` vs `LDP`(成对)在 trace 上表现极接近,语义完全不同 —— 不做 round-trip 验证就 conclude 是 v0.9.3 anti-hallucination layer 4 想拦的事
+- 这是 algokiller 反幻觉骨架的本职场景：**严禁** "看起来像 ADD 就当 ADD"。`ADD` vs `ADC`（带进位）/ `MOV` vs `CSEL`（条件）/ `LDR` vs `LDP`（成对）在 trace 上表现极接近，语义完全不同 —— 不做 round-trip 验证就 conclude 正是 ledger 高置信推断 gate 要拦的行为
 - handler 数 >30 时,**蓝军 reviewer 必经**(FIX#6):每 10 个 handler concluded 后 spawn 一次 `hypothesis-reviewer` 抽审 3-5 个;抽审挑被高频引用的(top dispatch path)
 - handler 之间存在 `depends_on` 关系(handler A 的语义结论依赖 handler B 的寄存器映射)→ 必须用 `depends_on` 字段连成 DAG,FIX#4 abandon-cascade 才能正确传播
 
@@ -635,7 +636,7 @@ open thread: <一句话描述发现>
 **降级交付条件(必须遵守)**:
 
 - 累计 >100 tool 调用未通过 Stage D 业务级验证 → **强制**降级:交付 "已 round-trip 通过的 handler 子集 + 待 reverse handler 列表 + 已确认 schema 参数"
-- **严禁**写出"完整 decoder"措辞(那是 v0.9.3 高置信推断 gate 在这场景的具体落地);只能写"覆盖 X/Y handler,余下 (Y-X) 个待补"
+- **严禁**写出"完整 decoder"措辞（那是高置信推断 gate 在这场景的具体落地）；只能写"覆盖 X/Y handler，余下 (Y-X) 个待补"
 
 ---
 
@@ -755,8 +756,9 @@ Poly1305 r mask:
   0FFFFFFC 0FFFFFFC 0FFFFFFC 0FFFFFFF
 
 Curve25519 / Ed25519:
-  a24 = 121665 = 0x1DB42
+  a24 = 121665 = 0x1DB41           (= (A - 2) / 4, A = 486662)
   Ed25519 d = -121665 / 121666 mod p
+  Ed25519 d (低 64 位): 0x52036cee2b6ffe73
 
 GCM GHASH polynomial:
   0xE1000000_00000000_00000000_00000000 (reflected GCM polynomial)
