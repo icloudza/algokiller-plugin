@@ -99,7 +99,7 @@ discipline:
 ```text
 Use the algokiller MCP tools on /Users/me/captures/login.trace.log.
 Mode: ciphertext.
-Task: recover how the X-Sign header is produced.
+Task: recover how the request signing header is produced.
 
 Start by calling bind_trace, then trace_lint. Use trace_search,
 trace_context, trace_bytes, trace_regflow, trace_producer, trace_constscan,
