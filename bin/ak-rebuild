@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# ak-rebuild — recompile the native ak_search engine and copy it to
+# the runtime location ``server/bin/ak_search``. This is the path the
+# MCP daemon execs.
+#
+# Use this after pulling new commits OR when the architecture of the
+# bundled binary doesn't match the host (e.g. you grabbed an arm64
+# build but run x86_64). The plugin always reads from
+# ``server/bin/ak_search`` so a successful run leaves you ready to
+# reload the MCP server (or restart Claude Desktop) and resume work.
+set -euo pipefail
+
+# Locate the plugin root: prefer the env var Claude Code sets when a
+# hook invokes us; fall back to walking up from this script's location.
+if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -d "${CLAUDE_PLUGIN_ROOT}/tools/search" ]; then
+    PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT}"
+else
+    PLUGIN_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+fi
+
+cd "${PLUGIN_ROOT}/tools/search"
+make clean
+make
+cp ak_search "${PLUGIN_ROOT}/server/bin/ak_search"
+chmod +x "${PLUGIN_ROOT}/server/bin/ak_search"
+
+# macOS Gatekeeper xattr — strip once so the plugin doesn't have to
+# re-strip on every launch.
+if command -v xattr >/dev/null 2>&1; then
+    xattr -d com.apple.quarantine "${PLUGIN_ROOT}/server/bin/ak_search" 2>/dev/null || true
+fi
+
+echo "ak-rebuild: server/bin/ak_search rebuilt and installed."
+file "${PLUGIN_ROOT}/server/bin/ak_search" 2>/dev/null || true

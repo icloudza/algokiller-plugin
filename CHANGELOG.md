@@ -4,7 +4,141 @@ All notable changes to **algokiller-plugin** are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.9.6] — Project-aware artifact routing + native folder picker + drop `.notes.md`
+## [1.0.0] — Hooks + subagents + commands + slash-namespace rename
+
+First stable release. The plugin's behavioural surface is now declared
+stable: subsequent breaking changes will bump to 2.0.0. Audit-driven
+fixes flow into 1.0.x patches.
+
+---
+
+### ⚠️ Breaking changes
+
+- **Plugin identifier renamed `algokiller` → `ak`**. Slash commands
+  invoked through Claude Code change accordingly:
+  * `/algokiller:ciphertext` → `/ak:ciphertext`
+  * `/algokiller:general`    → `/ak:general`
+  * Methodology skill references (`algokiller:trace-analysis` /
+    `algokiller:ciphertext-recovery`) → `ak:trace-analysis` /
+    `ak:ciphertext-recovery`.
+  Install command changes from
+  `claude plugin install algokiller@algokiller-suite` to
+  `claude plugin install ak@ak-suite`.
+- **MCP tool prefix renamed** `mcp__plugin_algokiller_algokiller__*`
+  → `mcp__plugin_ak_ak__*`. Subagent `tools:` arrays, sample
+  configurations, and any external code referencing the prefix must
+  be updated.
+- **Marketplace renamed** `algokiller-suite` → `ak-suite`. The GitHub
+  repository URL (`icloudza/algokiller-plugin`) is unchanged.
+
+### Added
+
+- **PreCompact / SessionStart / Stop / SubagentStop / PreToolUse hooks.**
+  Plugin ships a complete hook set so the Customize UI exposes them
+  the same way the PUA reference plugin does. The hook scripts live
+  under `hooks/`; the registration is in `hooks/hooks.json`.
+  - `PreCompact(auto)` runs `pre-compact-auto.sh` — probes the
+    kernel-flock scan lock (via `hooks/lock-check.py`); if a
+    `trace_constscan` / `trace_cryptoinstr` is in flight, returns
+    exit 2 to **block** auto-compact. Then dumps the ledger summary
+    (`hooks/dump-session-state.py` → `_compact_state.json`) so the
+    post-compact SessionStart can rehydrate it. Manual `/compact`
+    skips the block but still dumps state.
+  - `SessionStart(compact)` runs `session-start-compact.sh` — cats
+    `context/post-compact-rules.md` (static rules: `[H<n>]` references
+    still resolve, output_dir survives, raw tool outputs must be
+    re-run not reconstructed) plus the most recent
+    `_compact_state.json` so the new session has the same anchors.
+  - `SessionStart(startup|resume)` runs `session-start-bootstrap.sh` —
+    auto-installs `pyright` via `pip3 install --user pyright` if
+    missing (drives the bundled `.lsp.json` for type feedback on
+    `recovered.py` decoders), and diagnoses obvious env gaps
+    (Python <3.11, missing `ak_search` binary, Windows `msvcrt`).
+    A one-line stderr notice fires the first time pyright is
+    installed; subsequent sessions are silent.
+  - `Stop` runs `stop.sh` → `write-session-summary.py` which writes
+    `session-summary.md` to the active session directory. Survives
+    even when no subagent was spawned (belt-and-braces vs the
+    `ledger-curator` subagent).
+  - `SubagentStop` runs `subagent-stop.sh` → `validate-reviewer.py`
+    which checks that any `hypothesis-reviewer` invocation actually
+    recorded a verdict via `mark_hypothesis_reviewed`. Emits a stderr
+    warning to nudge the agent before the server-side conclude(high)
+    gate rejects the next call.
+  - `PreToolUse(mcp__plugin_ak_ak__write_artifact)` runs
+    `pre-write-artifact.sh` — greps the draft for `[H<n>]` citations
+    and warns (does not block) when the ledger has concluded
+    hypotheses the draft doesn't cite. Client-side companion to the
+    v0.9.3 server-side bypass-detection gate.
+
+- **Kernel-flock scan lock (`server/locks.py`).** `trace_constscan`
+  and `trace_cryptoinstr` now hold a cross-process advisory lock
+  (`fcntl.flock` on POSIX, `msvcrt.locking` on Windows) on
+  `~/.algokiller/active-scans.lock` for the duration of the scan.
+  The kernel auto-releases the lock when the holder process dies for
+  any reason — no stale-lock cleanup path is needed. PreCompact uses
+  this same lock to decide whether to block auto-compact.
+
+- **Three new read-only subagents** (under `agents/`):
+  - `trace-hexdump-extractor` — pulls large hexdumps in its own
+    context, returns structured field summaries; main agent never
+    sees raw kilobytes of hex. Whitelisted tools: `trace_hexblock`,
+    `trace_context`, `trace_search`, `trace_bytes`.
+  - `binary-static-inspector` — wraps Binary Ninja MCP /
+    BinAssistMCP / `run_static_tool` (radare2, objdump, otool,
+    class-dump, strings). Returns named symbols and decompile
+    summaries, not raw 50 KB disassembly listings.
+  - `ledger-curator` — read-only consistency checker; spawn before
+    final `write_artifact` to audit `[H<n>]` citation coverage and
+    surface conflict edges. Does NOT mutate the ledger — that's the
+    main agent's job.
+
+- **Three new slash commands** (under `commands/`, namespace `/ak:`):
+  - `/ak:status` — one-screen session digest (binding, output_dir,
+    ledger counts, artifacts written, recommended next action).
+  - `/ak:rebind` — re-binds the current trace under a fresh
+    `<timestamp>/` directory while preserving the output_dir parent,
+    so multiple analyses of the same trace live side-by-side.
+  - `/ak:fold` — runs `trace_fold` with sensible defaults for the
+    bound trace's shape, then asks the user whether to rebind to
+    the folded derivative.
+
+- **Output style** `output-styles/ciphertext-report.md` — fixed
+  section structure for ciphertext-recovery reports so cross-trace
+  deliverables are directly comparable. Required sections: executive
+  summary → algorithm identification → key schedule → round function
+  → ledger trace-back table → artifacts → open gaps.
+
+- **`.lsp.json` Python LSP integration** — wires `pyright-langserver`
+  to all Python files Claude edits during the session. Recovered
+  decoder type errors surface at edit time, not at user-run time.
+
+- **`userConfig` schema in `plugin.json`** — install-time prompts
+  for `default_output_dir`, `default_threads`, `bn_mcp_priority`.
+  All optional; the existing auto-resolution paths (env vars,
+  project-marker walk-up) remain authoritative when unset.
+
+- **`bin/` helpers**:
+  - `bin/ak-rebuild` — recompiles the native `ak_search` engine,
+    copies it to `server/bin/`, strips Gatekeeper xattr.
+  - `bin/ak-clean-locks` — force-removes a stranded scan lock file
+    (rarely needed; the kernel auto-releases on process death).
+
+- **`context/post-compact-rules.md`** — static rules cat'd into
+  context on every post-compact session start: how to interpret
+  `[H<n>]` citations, why raw tool outputs were dropped and must be
+  re-run, the output_dir is still valid.
+
+### Test coverage
+
+- Python suite: 109 → **125** tests (+16). New:
+  - `test_locks.py` × 7 — acquire/release lifecycle, re-entrant
+    semantics, metadata file contents, cross-process probe via
+    subprocess, fail-safe release-without-acquire.
+  - `test_hooks.py` × 9 — dump-session-state ledger summarisation,
+    pre-write-artifact citation gap detection, validate-reviewer
+    warning emission, hooks.json schema referential integrity.
+- Native suite: 173 PASS (unchanged).
 
 Versioning note: this batch genuinely warrants a MINOR bump (not a
 0.9.5.x patch) because it adds a new MCP tool (`pick_output_dir`,

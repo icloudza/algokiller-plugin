@@ -9,11 +9,11 @@ You are now entering **AlgoKiller general trace-analysis mode**. Open-ended ques
 
 **MANDATORY FIRST STEPS — execute in order:**
 
-1. Load the full methodology from the `algokiller:trace-analysis` skill. Read it completely before any tool call. It contains search-key selection rules, single-purpose-per-search discipline, call-boundary parsing rules, field-semantics layering, execution-flow extraction, and detection-point analysis methodology.
+1. Load the full methodology from the `ak:trace-analysis` skill. Read it completely before any tool call. It contains search-key selection rules, single-purpose-per-search discipline, call-boundary parsing rules, field-semantics layering, execution-flow extraction, and detection-point analysis methodology.
 
 2. Parse the user input below. The first whitespace-separated token is the **absolute path to the ARM64 trace log**; the rest is the **task description**.
 
-3. Call MCP tool `algokiller.bind_trace` with that path and `mode="general"`. Do not proceed if bind fails.
+3. Call MCP tool `ak.bind_trace` with that path and `mode="general"`. Do not proceed if bind fails.
 
 4. Proceed with the methodology from the skill. Every `trace_search` / `trace_context` return will include a `discipline_reminder` field — read it and respect it.
 

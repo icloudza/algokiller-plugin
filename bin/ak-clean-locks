@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# ak-clean-locks — force-release the algokiller scan lock.
+#
+# The kernel auto-releases the advisory flock when the holder process
+# exits, so this command is normally NOT needed. Use it only if you
+# observe the PreCompact hook blocking compact and you're sure no
+# scan is in flight (e.g. after a Claude Desktop force-quit that
+# somehow left a fd alive).
+#
+# Removes the lock file from disk. Any subsequent ScanLock.acquire()
+# will recreate it.
+set -euo pipefail
+LOCKFILE="${HOME}/.algokiller/active-scans.lock"
+if [ ! -e "$LOCKFILE" ]; then
+    echo "ak-clean-locks: no lock file at $LOCKFILE; nothing to clean."
+    exit 0
+fi
+
+# Try to surface the holder metadata before removing, so the user
+# knows what they're about to override.
+if command -v python3 >/dev/null 2>&1; then
+    python3 - <<PY 2>/dev/null || true
+import json, sys
+from pathlib import Path
+data = Path("$LOCKFILE").read_text(errors="ignore").strip()
+try:
+    info = json.loads(data)
+    print(f"ak-clean-locks: removing lock held by pid={info.get('pid')}, "
+          f"acquired_at={info.get('acquired_at')}, "
+          f"platform={info.get('platform')}.")
+except Exception:
+    pass
+PY
+fi
+
+rm -f "$LOCKFILE"
+echo "ak-clean-locks: lock removed. If a scan is genuinely in progress, the next acquire from that process will recreate it."

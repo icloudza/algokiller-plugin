@@ -1,0 +1,18 @@
+{
+  "$schema_note": "Claude Code language-server hook config. Forwards Python files Claude edits to pyright for type/syntax feedback so recovered.py decoders get error reporting at edit time rather than at user-run time. See https://docs.claude.com/en/docs/claude-code/lsp",
+  "languageServers": [
+    {
+      "name": "pyright",
+      "command": "pyright-langserver",
+      "args": ["--stdio"],
+      "filetypes": ["python"],
+      "rootMarkers": ["pyproject.toml", "setup.py", "setup.cfg", "Pipfile", ".git"],
+      "settings": {
+        "python.analysis.typeCheckingMode": "basic",
+        "python.analysis.diagnosticMode": "openFilesOnly",
+        "python.analysis.autoImportCompletions": true
+      },
+      "comment": "basic typeCheckingMode keeps signal-to-noise high for the recovered-decoder use case (single-file Python, no large dependency graph). Bump to 'strict' if you want exhaustive checks on decoder output."
+    }
+  ]
+}

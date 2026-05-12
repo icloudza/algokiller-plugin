@@ -14,14 +14,14 @@ Claude Desktop plugin for ARM64 trace evidence analysis and cipher/algorithm rec
 
 ```bash
 claude plugin marketplace add icloudza/algokiller-plugin
-claude plugin install algokiller@algokiller-suite
+claude plugin install ak@ak-suite
 ```
 
 Updates:
 
 ```bash
 claude plugin marketplace update
-claude plugin update algokiller@algokiller-suite
+claude plugin update ak@ak-suite
 ```
 
 > Inside the Claude Code REPL you can also use the equivalent `/plugin marketplace add ...` / `/plugin install ...` slash commands. Manual install is covered below in [Install](#install).
@@ -33,11 +33,11 @@ claude plugin update algokiller@algokiller-suite
 ## Capabilities
 
 1. **Skills** (model-invoked, auto-loaded)
-   - `algokiller:ciphertext-recovery` — reverse-recover encryption / signing / encoding algorithms from a ciphertext / header / token
-   - `algokiller:trace-analysis` — field semantics / execution flow / detection points / buffer lifecycle
+   - `ak:ciphertext-recovery` — reverse-recover encryption / signing / encoding algorithms from a ciphertext / header / token
+   - `ak:trace-analysis` — field semantics / execution flow / detection points / buffer lifecycle
 2. **Slash commands** (strong activation)
-   - `/algokiller:ciphertext <trace> <task>`
-   - `/algokiller:general <trace> <task>`
+   - `/ak:ciphertext <trace> <task>`
+   - `/ak:general <trace> <task>`
 3. **26 MCP tools** (19 trace/artifact/static + 7 hypothesis-ledger)
    - Binding / artifacts: `bind_trace` / `pick_output_dir` (native folder picker) / `write_artifact` / `list_artifacts` / `read_artifact`
    - Core search: `trace_search` / `trace_context`
@@ -80,7 +80,7 @@ cp ak_search ../../server/bin/ak_search
 git clone https://github.com/icloudza/algokiller-plugin
 ```
 
-After install you should see `algokiller` under **Plugins** and `/algokiller:ciphertext` + `/algokiller:general` under **Slash commands**.
+After install you should see `ak` under **Plugins** and `/ak:ciphertext` + `/ak:general` under **Slash commands**.
 
 > If you previously registered the plugin from a local directory under the same name, uninstall it via `claude plugin uninstall <name>@<old-source>` after switching to the marketplace install to avoid double-registration.
 
@@ -129,8 +129,8 @@ For detailed hook scripts, see GumTrace's [example.js](https://github.com/lidong
 **Strong activation (recommended)**:
 
 ```
-/algokiller:ciphertext /path/to/login.trace.log Recover the ciphertext a3b2c1d4... inside header X-Sign
-/algokiller:general    /path/to/risk.trace.log  Explain how the x0 return on line 99999 is computed
+/ak:ciphertext /path/to/login.trace.log Recover the ciphertext a3b2c1d4... inside header X-Sign
+/ak:general    /path/to/risk.trace.log  Explain how the x0 return on line 99999 is computed
 ```
 
 **Free-form** (Claude auto-loads the skill by description):
@@ -186,8 +186,8 @@ algokiller-plugin/
 │   ├── static_tools.py             # allow-listed CLI runner
 │   └── bin/ak_search               # native search engine (Mach-O), **NOT injected into Bash PATH**
 ├── skills/                         # all skills (slash activation entries + methodologies)
-│   ├── ciphertext/SKILL.md         # /algokiller:ciphertext strong activation (user-only)
-│   ├── general/SKILL.md            # /algokiller:general strong activation (user-only)
+│   ├── ciphertext/SKILL.md         # /ak:ciphertext strong activation (user-only)
+│   ├── general/SKILL.md            # /ak:general strong activation (user-only)
 │   ├── ciphertext-recovery/SKILL.md  # full ciphertext recovery methodology (model + user)
 │   └── trace-analysis/SKILL.md       # full general trace-analysis methodology (model + user)
 └── README.md / README.en.md

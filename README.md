@@ -14,14 +14,14 @@
 
 ```bash
 claude plugin marketplace add icloudza/algokiller-plugin
-claude plugin install algokiller@algokiller-suite
+claude plugin install ak@ak-suite
 ```
 
 更新：
 
 ```bash
 claude plugin marketplace update
-claude plugin update algokiller@algokiller-suite
+claude plugin update ak@ak-suite
 ```
 
 > Claude Code REPL 里也可以用 `/plugin marketplace add ...` / `/plugin install ...` slash 等价命令。手动安装方式见下方 [完整安装说明](#安装)。
@@ -33,11 +33,14 @@ claude plugin update algokiller@algokiller-suite
 ## 能力
 
 1. **Skills**（model-invoked 自动加载）
-   - `algokiller:ciphertext-recovery` —— 密文 / header / token 反向还原加密、签名、编码算法
-   - `algokiller:trace-analysis` —— 字段语义 / 执行流 / 检测点 / buffer 生命周期等开放问题
-2. **Slash commands**（强激活）
-   - `/algokiller:ciphertext <trace> <task>`
-   - `/algokiller:general <trace> <task>`
+   - `ak:ciphertext-recovery` —— 密文 / header / token 反向还原加密、签名、编码算法
+   - `ak:trace-analysis` —— 字段语义 / 执行流 / 检测点 / buffer 生命周期等开放问题
+2. **Slash commands**（5 个，`/ak:` 命名空间）
+   - `/ak:ciphertext <trace> <task>` —— 强激活：密文 / 算法还原模式
+   - `/ak:general <trace> <task>` —— 强激活：通用 trace 分析模式
+   - `/ak:status` —— 当前 session digest（绑定 / output_dir / ledger 摘要 / artifacts）
+   - `/ak:rebind` —— 同 trace 新 `<timestamp>/` 重绑（多次分析对照不冲突）
+   - `/ak:fold` —— 折叠当前 trace（hash loop 类 99% 压缩，然后可选 rebind 到折叠版）
 3. **26 个 MCP 工具**(19 trace/artifact/static + 7 hypothesis-ledger)
    - 绑定 / 制品：`bind_trace` / `pick_output_dir`（弹原生目录选择器）/ `write_artifact` / `list_artifacts` / `read_artifact`
    - 基础检索：`trace_search` / `trace_context`
@@ -48,10 +51,22 @@ claude plugin update algokiller@algokiller-suite
    - 静态分析：`run_static_tool` —— 白名单调用系统 CLI（radare2 / binutils / LLVM / jtool2 / class-dump / ripgrep / jq）
 4. **反漂移注入**
    - 每次工具返回带 `discipline_reminder`；每 20 次附 `discipline_full_reinjection` 完整规则段
-5. **Sub-agents**
-   - `hypothesis-reviewer` —— 独立 context 蓝军，`hypothesis_conclude(high)` 之前主 agent 通过 `Agent` 工具 spawn 它做独立证据审查。详见 [docs/agents.md](docs/agents.md)。
-6. **大 trace 多线程扫描**
+5. **Sub-agents**（4 个，全部 read-only 隔离）
+   - `hypothesis-reviewer` —— 独立 context 蓝军，`hypothesis_conclude(high)` 之前主 agent spawn 它做独立证据审查。详见 [docs/agents.md](docs/agents.md)。
+   - `trace-hexdump-extractor` —— 大 hexdump 在子上下文里解析成结构化字段返回，主会话不被 raw bytes 淹没
+   - `binary-static-inspector` —— 包 Binary Ninja MCP / BinAssistMCP / `run_static_tool`，主会话只接收符号 / decompile 结论而非 50 KB disassembly
+   - `ledger-curator` —— 写交付物前的 ledger 一致性 audit，识别未引用的 concluded 假设
+6. **Hooks**（v1.0.0 新增；6 类 + 2 matcher 共 7 条注册）
+   - `PreCompact(auto)` —— 长 scan 持锁中阻断 auto-compact + dump session 摘要到磁盘
+   - `PreCompact(manual)` —— 用户主动 `/compact` 时不阻断，仍 dump 摘要
+   - `SessionStart(compact)` —— compact 后注入 ledger 摘要 + `[H<n>]` 引用规则
+   - `SessionStart(startup|resume)` —— 自动装 `pyright`（驱动 .lsp.json）+ 环境诊断
+   - `Stop` —— 写 `session-summary.md`
+   - `SubagentStop` —— 校验 `hypothesis-reviewer` 真的落了 `mark_hypothesis_reviewed`
+   - `PreToolUse(write_artifact)` —— 客户端预警：draft 里 `[H<n>]` 引用数 < ledger concluded 数时 emit warning
+7. **大 trace 多线程扫描**
    - `trace_constscan` / `trace_cryptoinstr` 自动按 CPU 数据并行（默认 = 主机核数，封顶 16，可经 `threads` 参数覆盖）。4.5 GB / 48 M 行 trace 上 `constscan` 8 线程 ≈ 19 s（单线程 121 s），输出对所有线程数 byte-identical。
+   - 长 scan 通过 `~/.algokiller/active-scans.lock` 持 kernel-flock；PreCompact 钩子据此阻断 auto-compact，进程崩溃时内核自动释放锁，无 stale-lock 风险。
 
 ---
 
@@ -80,7 +95,7 @@ cp ak_search ../../server/bin/ak_search
 git clone https://github.com/icloudza/algokiller-plugin
 ```
 
-装完应能看到 `algokiller` 在 **Plugins** 菜单，`/algokiller:ciphertext` 和 `/algokiller:general` 在 **Slash commands**。
+装完应能看到 `ak` 在 **Plugins** 菜单，`/ak:ciphertext` 和 `/ak:general` 在 **Slash commands**。
 
 > 如果之前以本地目录方式注册过同名 plugin，marketplace 装新版后用 `claude plugin uninstall <name>@<old-source>` 卸掉老版本，避免双注册。
 
@@ -129,8 +144,8 @@ adb pull /data/data/com.example.app/trace.log ~/captures/login.trace.log
 **强激活（推荐）**：
 
 ```
-/algokiller:ciphertext /Users/you/login.trace.log 还原 header X-Sign 中的密文 a3b2c1d4...
-/algokiller:general    /Users/you/risk.trace.log  说明第 99999 行 x0 返回值是怎么计算出来的
+/ak:ciphertext /Users/you/login.trace.log 还原 header X-Sign 中的密文 a3b2c1d4...
+/ak:general    /Users/you/risk.trace.log  说明第 99999 行 x0 返回值是怎么计算出来的
 ```
 
 **自由输入**（让 Claude 按 skill description 自动加载）：
@@ -184,8 +199,8 @@ algokiller-plugin/
 │   ├── static_tools.py             # 白名单 CLI runner
 │   └── bin/ak_search               # native 搜索引擎 (Mach-O)，**不进 Bash PATH**
 ├── skills/                         # 所有 skill（含 slash 激活入口和方法论）
-│   ├── ciphertext/SKILL.md         # /algokiller:ciphertext 强激活（user-only）
-│   ├── general/SKILL.md            # /algokiller:general 强激活（user-only）
+│   ├── ciphertext/SKILL.md         # /ak:ciphertext 强激活（user-only）
+│   ├── general/SKILL.md            # /ak:general 强激活（user-only）
 │   ├── ciphertext-recovery/SKILL.md  # 完整密文还原方法论（model + user）
 │   └── trace-analysis/SKILL.md       # 完整通用 trace 分析方法论（model + user）
 └── README.md / README.en.md

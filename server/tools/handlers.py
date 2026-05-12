@@ -36,6 +36,7 @@ from artifacts import ArtifactStore
 from static_tools import run_static_tool
 from output_dir import resolve_output_dir
 from picker import pick_directory
+from locks import SCAN_LOCK
 
 
 # ---------------------------------------------------------------------------
@@ -1258,7 +1259,16 @@ def tool_trace_constscan(args: dict[str, Any]) -> dict:
         if not (1 <= n <= 64):
             return {"status": "error", "error": "threads must be in [1, 64]"}
         cli += ["--threads", str(n)]
-    result = STATE.daemon.run_cli("constscan", cli, timeout=300, max_output_chars=200_000)
+    # FIX F-21 (1.0.0): hold the cross-process scan lock so the
+    # PreCompact hook knows not to interrupt us. The lock is kernel-
+    # backed (fcntl.flock on POSIX / msvcrt.locking on Windows), so
+    # if our process dies mid-scan the lock releases automatically
+    # — no stale-lock cleanup needed. See server/locks.py.
+    SCAN_LOCK.acquire()
+    try:
+        result = STATE.daemon.run_cli("constscan", cli, timeout=300, max_output_chars=200_000)
+    finally:
+        SCAN_LOCK.release()
     if result.get("status") != "ok":
         return result
 
@@ -1510,7 +1520,14 @@ def tool_trace_cryptoinstr(args: dict[str, Any]) -> dict:
             return {"status": "error", "error": "threads must be in [1, 64]",
                     "_skip_discipline": True}
         cli += ["--threads", str(n)]
-    result = STATE.daemon.run_cli("cryptoinstr", cli, timeout=120)
+    # FIX F-21: hold the scan lock for the same reason constscan does;
+    # cryptoinstr is fast on small traces but linear in line count so
+    # multi-GB inputs cross the "must not be compact-interrupted" line.
+    SCAN_LOCK.acquire()
+    try:
+        result = STATE.daemon.run_cli("cryptoinstr", cli, timeout=120)
+    finally:
+        SCAN_LOCK.release()
     if result.get("status") != "ok":
         return result
     # FIX F-5: primitive-level corroboration. The engine reports raw mnemonic

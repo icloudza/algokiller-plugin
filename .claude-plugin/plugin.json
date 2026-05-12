@@ -1,10 +1,11 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
-  "name": "algokiller",
-  "version": "0.9.6",
-  "description": "ARM64 trace evidence analysis & cipher algorithm recovery. Bundles the AlgoKiller methodology as skills + a local MCP server that drives the native ak_search engine over GB-scale trace files.",
+  "name": "ak",
+  "version": "1.0.0",
+  "description": "AlgoKiller — ARM64 trace evidence analysis & cipher algorithm recovery. Bundles the AlgoKiller methodology as skills + a local MCP server (26 tools) that drives the native ak_search engine over GB-scale trace files. v1.0.0 adds PreCompact / SessionStart / Stop / SubagentStop hooks for compact-aware ledger preservation, three new read-only subagents (trace-hexdump-extractor / binary-static-inspector / ledger-curator), and three slash commands (/ak:status, /ak:rebind, /ak:fold).",
   "author": {
-    "name": "cloudza"
+    "name": "cloudza",
+    "url": "https://github.com/icloudza"
   },
   "homepage": "https://github.com/icloudza/algokiller-plugin",
   "repository": "https://github.com/icloudza/algokiller-plugin",
@@ -18,6 +19,25 @@
     "cryptanalysis",
     "binary-analysis",
     "mcp",
-    "claude-desktop"
-  ]
+    "claude-desktop",
+    "frida",
+    "gumtrace"
+  ],
+  "userConfig": {
+    "default_output_dir": {
+      "type": "string",
+      "title": "Default output directory",
+      "description": "Optional absolute base directory for analysis reports. Overrides the project-marker walk-up. Equivalent to setting the ALGOKILLER_OUTPUT_DIR env var. Leave blank to use the 5-priority auto-resolution: project-marker walk-up → ~/Documents/AlgoKiller-Reports/."
+    },
+    "default_threads": {
+      "type": "string",
+      "title": "Default thread count for parallel scans",
+      "description": "Worker thread count for trace_constscan / trace_cryptoinstr. Leave blank for auto-detect (host CPU count, capped at 16). Set to 1 for serial scans (debugging) or higher for big multi-GB traces on workstations."
+    },
+    "bn_mcp_priority": {
+      "type": "string",
+      "title": "Binary Ninja MCP priority",
+      "description": "When both Binary Ninja MCPs are online, which to prefer: 'fosdickio' (stdio, GPL-3.0) or 'binassist' (HTTP/SSE, MIT). Leave blank for auto."
+    }
+  }
 }

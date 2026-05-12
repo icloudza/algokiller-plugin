@@ -9,11 +9,11 @@ You are now entering **AlgoKiller ciphertext-recovery mode**. High-discipline an
 
 **MANDATORY FIRST STEPS — execute in order:**
 
-1. Load the full methodology from the `algokiller:ciphertext-recovery` skill. Read it completely before any tool call. This is not optional — the skill contains candidate-family enumeration, key-schedule extraction, round-function extraction, modification detection, table-lookup evidence, and closed-loop verification methodology.
+1. Load the full methodology from the `ak:ciphertext-recovery` skill. Read it completely before any tool call. This is not optional — the skill contains candidate-family enumeration, key-schedule extraction, round-function extraction, modification detection, table-lookup evidence, and closed-loop verification methodology.
 
 2. Parse the user input below. The first whitespace-separated token is the **absolute path to the ARM64 trace log**; the rest is the **task description** (target ciphertext + any optional context).
 
-3. Call MCP tool `algokiller.bind_trace` with that path and `mode="ciphertext"`. Do not proceed if bind fails.
+3. Call MCP tool `ak.bind_trace` with that path and `mode="ciphertext"`. Do not proceed if bind fails.
 
 4. Proceed with the methodology from the skill. Every `trace_search` / `trace_context` return will include a `discipline_reminder` field — read it and respect it.
 
