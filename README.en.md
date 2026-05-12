@@ -6,7 +6,7 @@ Claude Desktop plugin for ARM64 trace evidence analysis and cipher/algorithm rec
 
 > **Methodology + ak_search engine origin**: [AlgoKiller](https://github.com/lidongyooo/AlgoKiller) by [@lidongyooo](https://github.com/lidongyooo)
 > Upstream contributes the three core subcommands (`match` / `context` / `daemon` — mmap + BMH + line index + tab-protocol daemon) and the original methodology harness.
-> This repo extends the native engine with 10 additional subcommands (`regflow` / `producer` / `semop` / `lint` / `fold` / `callgraph` / `modgraph` / `hexblock` / `constscan` / `bytes` — see [tools/search/README.md](tools/search/README.md)) and packages everything as a Claude Desktop plugin. Original code copyright belongs to upstream; plugin extensions are MIT.
+> This repo extends the native engine with 11 additional subcommands (`regflow` / `producer` / `semop` / `lint` / `fold` / `callgraph` / `modgraph` / `hexblock` / `constscan` / `cryptoinstr` / `bytes` — see [tools/search/README.md](tools/search/README.md)) and packages everything as a Claude Desktop plugin. Original code copyright belongs to upstream; plugin extensions are MIT.
 
 ---
 
@@ -25,6 +25,8 @@ claude plugin update algokiller@algokiller-suite
 ```
 
 > Inside the Claude Code REPL you can also use the equivalent `/plugin marketplace add ...` / `/plugin install ...` slash commands. Manual install is covered below in [Install](#install).
+
+**Cursor / Codex**: this repo also ships standard stdio MCP server setup examples. Cursor can use `.cursor/mcp.json` directly; Codex users can copy `examples/mcp/codex.config.toml` into `~/.codex/config.toml`. See [Cursor and Codex MCP setup](docs/mcp-clients.md). Non-Claude clients can use the MCP tools directly, but they do not automatically get Claude slash commands or skill auto-loading.
 
 ---
 

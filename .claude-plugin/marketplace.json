@@ -1,6 +1,6 @@
 {
     "name": "algokiller-suite",
-    "description": "ARM64 trace evidence analysis & cipher algorithm recovery. Claude Desktop plugin packaging the AlgoKiller methodology as skills + a local MCP server driving the native ak_search engine (13 subcommands) over GB-scale trace files.",
+    "description": "ARM64 trace evidence analysis & cipher algorithm recovery. Claude Desktop plugin packaging the AlgoKiller methodology as skills + a local MCP server driving the native ak_search engine (14 subcommands) over GB-scale trace files.",
     "owner": {
         "name": "cloudza",
         "url": "https://github.com/icloudza"
@@ -8,8 +8,8 @@
     "plugins": [
         {
             "name": "algokiller",
-            "description": "ARM64 trace evidence analysis & cipher algorithm recovery. 17 MCP tools (search / regflow / producer / semop / lint / fold / callgraph / modgraph / hexblock / constscan / bytes + artifact / static-tool), 4 skills (ciphertext-recovery / general / trace-analysis / ciphertext), evidence-classified verdict engine (real / weak / alu_only), 71-fingerprint crypto-constant scanner.",
-            "version": "0.8.1",
+            "description": "ARM64 trace evidence analysis & cipher algorithm recovery. 25 MCP tools (trace / artifact / static-tool / hypothesis-ledger), 4 skills (ciphertext-recovery / general / trace-analysis / ciphertext), evidence-classified verdict engine (real / weak / alu_only), 95-fingerprint crypto-constant scanner.",
+            "version": "0.9.5",
             "source": "./",
             "author": {
                 "name": "cloudza",

@@ -2,11 +2,11 @@
 
 **语言**：**中文** | [English](README.en.md)
 
-面向 ARM64 trace 证据分析与算法/密文还原的 **Claude Desktop plugin**。把 AlgoKiller 方法论打包为 skill，配本地 MCP server 驱动 native `ak_search` 引擎（13 个 subcommand，专攻 GB 级 trace）。
+面向 ARM64 trace 证据分析与算法/密文还原的 **Claude Desktop plugin**。把 AlgoKiller 方法论打包为 skill，配本地 MCP server 驱动 native `ak_search` 引擎（14 个 subcommand，专攻 GB 级 trace）。
 
 > **方法论 + ak_search 引擎原作**：[AlgoKiller](https://github.com/lidongyooo/AlgoKiller) by [@lidongyooo](https://github.com/lidongyooo)
 > 上游贡献 `match` / `context` / `daemon` 三个核心子命令（mmap + BMH + 行号索引 + tab 协议 daemon）以及原始方法论 harness。
-> 本仓库在此之上额外扩展了 10 个 native 子命令（`regflow` / `producer` / `semop` / `lint` / `fold` / `callgraph` / `modgraph` / `hexblock` / `constscan` / `bytes`，详见 [tools/search/README.md](tools/search/README.md)）并把整套打包为 Claude Desktop plugin。原始代码版权归上游作者；plugin 自身的扩展代码 MIT。
+> 本仓库在此之上额外扩展了 11 个 native 子命令（`regflow` / `producer` / `semop` / `lint` / `fold` / `callgraph` / `modgraph` / `hexblock` / `constscan` / `cryptoinstr` / `bytes`，详见 [tools/search/README.md](tools/search/README.md)）并把整套打包为 Claude Desktop plugin。原始代码版权归上游作者；plugin 自身的扩展代码 MIT。
 
 ---
 
@@ -25,6 +25,8 @@ claude plugin update algokiller@algokiller-suite
 ```
 
 > Claude Code REPL 里也可以用 `/plugin marketplace add ...` / `/plugin install ...` slash 等价命令。手动安装方式见下方 [完整安装说明](#安装)。
+
+**Cursor / Codex**：本仓库也提供标准 stdio MCP server 配置示例。Cursor 可直接使用 `.cursor/mcp.json`；Codex 可复制 `examples/mcp/codex.config.toml` 到 `~/.codex/config.toml`。详见 [Cursor and Codex MCP setup](docs/mcp-clients.md)。注意：非 Claude 客户端只能直接使用 MCP 工具，不会自动获得 Claude slash commands / skill 自动加载。
 
 ---
 

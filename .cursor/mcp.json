@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "algokiller": {
+      "type": "stdio",
+      "command": "python3",
+      "args": [
+        "-u",
+        "${workspaceFolder}/server/algokiller_mcp.py"
+      ],
+      "env": {
+        "ALGOKILLER_PLUGIN_ROOT": "${workspaceFolder}",
+        "PYTHONUNBUFFERED": "1"
+      }
+    }
+  }
+}

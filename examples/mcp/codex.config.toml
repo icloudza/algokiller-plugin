@@ -1,0 +1,13 @@
+# Copy this block into ~/.codex/config.toml, then replace /ABS/PATH with
+# the absolute path to this algokiller-plugin checkout.
+#
+# Example:
+#   /Users/alice/tools/algokiller-plugin
+
+[mcp_servers.algokiller]
+command = "python3"
+args = ["-u", "/ABS/PATH/algokiller-plugin/server/algokiller_mcp.py"]
+cwd = "/ABS/PATH/algokiller-plugin"
+env = { ALGOKILLER_PLUGIN_ROOT = "/ABS/PATH/algokiller-plugin", PYTHONUNBUFFERED = "1" }
+startup_timeout_sec = 30
+tool_timeout_sec = 600
