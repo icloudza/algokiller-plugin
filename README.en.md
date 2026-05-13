@@ -118,7 +118,9 @@ adb pull /data/data/com.example.app/trace.log ~/captures/login.trace.log
 #    e.g. "Use algokiller ciphertext mode on ~/captures/login.trace.log to recover the X-Sign cipher a3b2c1..."
 ```
 
-For detailed hook scripts, see GumTrace's [example.js](https://github.com/lidongyooo/GumTrace/blob/main/example.js) / [example_ios.js](https://github.com/lidongyooo/GumTrace/blob/main/example_ios.js).
+For detailed hook scripts, see GumTrace's [example.js](https://github.com/lidongyooo/GumTrace/blob/main/example.js) / [example_ios.js](https://github.com/lidongyooo/GumTrace/blob/main/example_ios.js), plus this repo's three production templates under [`examples/frida-gumtrace/`](examples/frida-gumtrace/) (including an anti-jailbreak-bypass spawn pattern).
+
+> **Full iOS jailbreak deployment guide** (iproxy + scp + ldid + anti-jailbreak / anti-frida bypass) is in **[docs/setup-ios.md](docs/setup-ios.md)** — covers Dopamine, known_hosts collisions, TweakInject injection failures, the Dopamine "Hide Jailbreak" ↔ GumTrace loading conflict, and resilient transfer for multi-GB traces over USB.
 
 > Frida's native trace formats (`frida-trace` / Stalker default emit) are NOT compatible — GumTrace's custom emitter is required.
 
