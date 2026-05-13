@@ -2,14 +2,17 @@
 
 把 [GumTrace](https://github.com/lidongyooo/GumTrace)(@lidongyooo 基于 frida-gum Stalker 写的 ARM64 trace 工具)部署到越狱 iOS 设备,对**任意目标 App** 做指令级动态追踪,产物可直接喂给 AlgoKiller plugin 做密文 / 流程分析。
 
-本目录两个示例脚本:
+本目录三个示例脚本:
 
 | 脚本 | 用途 | hook 入口 |
 |---|---|---|
 | `targetapp-correct.js` | 最小可用版(单 hook 点 + 简单验证) | `-[UIView layoutSubviews]` 首次触发 |
 | `targetapp-startup-trace.js` | 启动期完整 trace(推荐用作生产模板) | `-[<AppDelegate> applicationDidBecomeActive:]` + autotrigger |
+| `targetapp-anti-jb-spawn.js` | **带反越狱 bypass 的 spawn 模式 trace**(目标 App 检测越狱时用) | `arc4random_buf` 深度调用栈 + `-[NSURLSession dataTaskWithRequest:]` 业务 URL 首次触发 |
 
-> **重要**:这两个脚本顶部都有 `TARGET_APP_NAME` / `TARGET_APP_DELEGATE_CLASS` 占位符。**用之前必须改成你目标 App 的实际 module 名 + AppDelegate 类名**。脚本本身是算法/品牌无关的模板。
+> **重要**:这三个脚本顶部都有 `TARGET_APP_NAME` / `TARGET_MODULE` / 业务 URL regex 等占位符。**用之前必须改成你目标 App 的实际 module 名 / AppDelegate 类名 / URL 模式**。脚本本身是算法/品牌无关的模板。
+>
+> **iOS 越狱设备部署**(iproxy / scp / ldid / 反越狱处理)详见 [`docs/setup-ios.md`](../../docs/setup-ios.md)。
 
 ---
 

@@ -133,7 +133,9 @@ adb pull /data/data/com.example.app/trace.log ~/captures/login.trace.log
 #    例如："用 algokiller ciphertext 模式分析 ~/captures/login.trace.log，还原 X-Sign 密文 a3b2c1..."
 ```
 
-详细 hook 写法见 GumTrace 的 [example.js](https://github.com/lidongyooo/GumTrace/blob/main/example.js) / [example_ios.js](https://github.com/lidongyooo/GumTrace/blob/main/example_ios.js)。
+详细 hook 写法见 GumTrace 的 [example.js](https://github.com/lidongyooo/GumTrace/blob/main/example.js) / [example_ios.js](https://github.com/lidongyooo/GumTrace/blob/main/example_ios.js)，以及本仓库 [`examples/frida-gumtrace/`](examples/frida-gumtrace/) 的三个实战模板（含 anti-jailbreak bypass + spawn 范式）。
+
+> **iOS 越狱设备部署完整步骤**（iproxy + scp + ldid + 反越狱 / 反 frida 检测处理）详见 **[docs/setup-ios.md](docs/setup-ios.md)** —— Dopamine 越狱、known_hosts 冲突、TweakInject 注入失败、Dopamine 隐藏越狱与 GumTrace 加载冲突、大 trace 文件 USB 续传等坑都有命令级处置方案。
 
 > Frida 原生 trace（`frida-trace` / Stalker 默认 emit）格式不兼容本 plugin —— 必须用 GumTrace 的自定义 emitter。
 
