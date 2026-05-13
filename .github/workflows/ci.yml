@@ -86,7 +86,7 @@ jobs:
           assert 1 in got, f'no response to initialize; got ids={sorted(got)}'
           assert 2 in got, f'no response to tools/list; got ids={sorted(got)}'
           tools = got[2]['result']['tools']
-          assert len(tools) == 26, f'expected 26 tools (incl. pick_output_dir), got {len(tools)}'
+          assert len(tools) == 28, f'expected 28 tools (incl. trace_function + trace_immseq added in v1.2.0), got {len(tools)}'
           # Spot-check a few must-be-present names so a silent rename of any
           # critical tool fails the gate even if the total count is right.
           names = {t['name'] for t in tools}
