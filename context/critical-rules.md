@@ -42,6 +42,9 @@ Self-promotion to `final_confidence="high"` is blocked at the ledger level. Spaw
 **R8 — Earliest hit is a candidate, not a conclusion.**
 First match in a `trace_search` does not prove role. Classify every notable hit as one of: `origin` / `generation` / `copy` / `encode` / `consume` / `stale` / `conflict`. Verify the hit sits on the upstream data-flow of the target before naming it the source.
 
+**R9 — GumTrace `regN=X -> regN=Y` semantics: `X` is the OLD value (before the instruction wrote), not what the instruction read.**
+For `ldr` / `ldp` / `ldur` / `mov` / `csel` etc., the form `<inst>; regN=X x0=... mem_r=... -> regN=Y` means `regN` carried value `X` **into** the instruction and now carries `Y` **after**. The instruction's actual *input* came from the memory address / source register named on the right side of the operands, **not** from `regN=X`. This is the single most common LLM mis-read in obfuscated control-flow-flattened code: confusing `q1=0x2` (NEON register stale residue before `ldp q0,q1,[x0]`) with "ldp read 0x2 into q1". Verify a register's true upstream value by chasing the most recent prior `mov xN, #imm` / `csel xN, ...` / `ldr xN, [src]` that wrote that register — `trace_producer(value, sink_line)` is the canonical tool. Inverse use: `mov w8, #0x1b; w8=PREV -> w8=0x1b` makes `PREV` a goldmine — it's whatever was last written to w8, often a per-loop multiplier (matrix coefficient, table index) in extraction-friendly position right before the GF-2^8 mod-reduce constant load.
+
 ---
 
 ### §3 Behavior boundaries
@@ -49,8 +52,8 @@ First match in a `trace_search` does not prove role. Classify every notable hit 
 **B1 — Do not `bind_trace` again on the same trace mid-session.**
 Each `bind_trace` mints a fresh `<timestamp>/` subdirectory and resets the tool-call counter, breaking evidence citations from the previous slice. Rebind only when the user explicitly switches traces or asks for a fresh slice.
 
-**B2 — Do not re-run a tool with the same arguments expecting different results.**
-`trace_search` / `trace_constscan` / `trace_cryptoinstr` are deterministic on a bound trace. If hits = 0 the first time, hits = 0 the second time. Change the query, switch tools, or accept that the signal is not in this trace.
+**B2 — Do not re-run a tool with the same arguments and no new context.**
+`trace_search` / `trace_constscan` / `trace_cryptoinstr` are deterministic on a bound trace. If hits = 0 the first time, hits = 0 the second time. Change the query, switch tools, or accept that the signal is not in this trace. **Exempt**: legitimate fallback paths where one tool's hint points to another (e.g. `trace_search` returning 0 hits on a `0x`-hex query and emitting `hint: use trace_bytes`, then immediately calling `trace_bytes` with that same hex value — that's a deliberate format-aware retry, not a redundant re-run).
 
 **B3 — After calling a subagent (hypothesis-reviewer / trace-hexdump-extractor / binary-static-inspector / ledger-curator), do not write "based on the findings" or "according to the review" as a placeholder.** Read the subagent's report, restate the specific finding in your own words with `[H<n>]` ids and trace offsets, then decide next action. The coordinator must synthesise — synthesis cannot be outsourced to the worker.
 

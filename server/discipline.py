@@ -20,6 +20,8 @@ CIPHERTEXT_SHORT_REMINDERS = [
     "Backward chain-chasing: hard limit 3 hops; verify chain integrity first.",
     "TIME-BOX: >30 calls without algorithm candidate → start degraded delivery (confirmed + high-confidence + gaps + open threads).",
     "STATIC-AID: if BN MCP offline, use algokiller.run_static_tool (rabin2 -Iz / objdump -d --start/--stop / r2 -q -2 -n -c / rax2 / class-dump). r2 single-command only; no -A / aaa.",
+    "R9 PREV/NEW: in trace lines `<inst>; regN=X ... -> regN=Y`, `X` is the OLD value (before the write), NOT what the instruction read. Misreading `q1=0x2` from `ldp q0,q1,[x0]` as msg_len has burned 3 report versions. Use trace_producer to chase the true upstream writer.",
+    "OBFUSCATED EXTRACTION: when OLLVM flattens generate_*/transform code, static `pdf` fails but trace is linear. Anchor on a per-loop constant (e.g. `mov w?, #0x1b` for GF-2^8) and read the `prev_val` of the destination register — it's the immediate that was just consumed (matrix coefficient, table index). Sequence them by trace line to reconstruct tables.",
 ]
 
 GENERAL_SHORT_REMINDERS = [
@@ -37,6 +39,8 @@ GENERAL_SHORT_REMINDERS = [
     # zero [H<n>] backing — write_artifact now hard-rejects this, but the
     # agent should learn the protocol before hitting the gate.
     "LEDGER (v0.9.3): any '高置信推断' / 'high-confidence inference' tier claim in your deliverable MUST be backed by a concluded [H<n>] hypothesis. write_artifact rejects high-conf labels without [H<n>] citation. '已确认' (raw observation) and '推断' (tentative) tiers don't require ledger.",
+    "R9 PREV/NEW: in trace lines `<inst>; regN=X ... -> regN=Y`, `X` is the OLD value (before the write), NOT what the instruction read. Misreading `q1=0x2` from `ldp q0,q1,[x0]` as a count/length has burned multi-version analyses. Use trace_producer to chase the true upstream writer.",
+    "OBFUSCATED EXTRACTION: when OLLVM/control-flow-flattening hides table-driven transforms, static decompile fails but trace is linear. Anchor on a per-iteration constant load (e.g. `mov w?, #0x1b` GF-2^8 mod-reduce, AES-Tbox base, S-box page) and read prev_val of the destination register — it's the immediate just consumed (matrix coefficient / table index). Sequence by trace line to reconstruct the table.",
 ]
 
 CIPHERTEXT_FULL_BLOCK = """[Full-rule reinjection — ciphertext mode]

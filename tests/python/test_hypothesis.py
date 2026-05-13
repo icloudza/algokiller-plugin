@@ -286,9 +286,16 @@ class TestConflictGraph(unittest.TestCase):
     already concluded ≥medium."""
 
     def _add(self, ledger, counter, statement, n_sup=2, conflicts_with=None):
+        # Tool-name pool: FIX #8 (v0.9.7) requires algorithm-named hypotheses
+        # (e.g. "Binary uses MD5") to carry trace_cryptoinstr / trace_constscan
+        # supporting before they can conclude at medium/high. The pool rotates
+        # trace_constscan first so even n_sup=1 cases satisfy the gate.
+        tool_pool = ["trace_constscan", "trace_cryptoinstr",
+                     "trace_callgraph", "trace_search"]
         sup = [{"tool_call_id":
                 _record_tool_call(ledger.tool_log, counter,
-                                  f"t{i}", f"evidence chunk {i}"),
+                                  tool_pool[i % len(tool_pool)],
+                                  f"evidence chunk {i}"),
                 "excerpt": f"evidence chunk {i}"}
                for i in range(n_sup)]
         out = ledger.add(

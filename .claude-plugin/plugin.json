@@ -1,8 +1,8 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "ak",
-  "version": "1.1.0",
-  "description": "AlgoKiller — ARM64 trace evidence analysis & cipher algorithm recovery. Bundles the AlgoKiller methodology as skills + a local MCP server (26 tools) that drives the native ak_search engine over GB-scale trace files. v1.1.0 promotes anti-hallucination hard rules to a single source of truth (context/critical-rules.md) injected via SessionStart as the plugin's equivalent of --append-system-prompt, and upgrades PreCompact dump to schema v2 — active hypotheses, rejected paths, tool-call ledger, structured markdown — so post-compact rehydration rebuilds the runtime *work semantics* per the Harness Engineering playbook, not just the interpretation layer.",
+  "version": "1.2.0",
+  "description": "AlgoKiller — ARM64 trace evidence analysis & cipher algorithm recovery. Bundles the AlgoKiller methodology as skills + a local MCP server (28 tools) that drives the native ak_search engine over GB-scale trace files. v1.2.0 adds two trace tools targeted at OLLVM-flattened binaries — `trace_function` (PC-level invocation analyzer with depth-counter ret boundary, replaces manual trace_search + trace_context loop for stripped helpers) and `trace_immseq` (anchor-driven prev_reg sequence extraction, recovers table-consumption order from jump-table-dispatcher functions). Formalizes R9 (`regN=X -> regN=Y` prev/new semantics — single most common LLM misread in obfuscated code) and FIX #8 (algorithm-name claims require trace_cryptoinstr/trace_constscan/trace_immseq/trace_function fingerprint corroboration before conclude(>=medium)). Loosens five over-strict gates: trace_search limit 100→500, B2 same-args rule exempts hint-driven fallback paths, cross-session [H<n>] references become non-blocking warnings instead of hard errors. Tests 128 → 149 PASS.",
   "author": {
     "name": "cloudza",
     "url": "https://github.com/icloudza"

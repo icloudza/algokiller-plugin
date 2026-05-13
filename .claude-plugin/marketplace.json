@@ -8,8 +8,8 @@
     "plugins": [
         {
             "name": "ak",
-            "description": "AlgoKiller — ARM64 trace evidence analysis & cipher algorithm recovery. 26 MCP tools (trace / artifact / static-tool / hypothesis-ledger / native folder picker), 4 skills + 3 slash commands (/ak, /ak:ciphertext, /ak:general, /ak:status, /ak:rebind, /ak:fold), 4 subagents (hypothesis-reviewer, trace-hexdump-extractor, binary-static-inspector, ledger-curator), 6 hooks (PreCompact auto/manual, SessionStart compact/startup-resume injecting context/critical-rules.md, Stop, SubagentStop) for compact-aware ledger preservation + post-compact work-semantics rebuild, 97-fingerprint crypto-constant scanner with NEON SIMD broadcast detection, data-parallel scan workers, kernel-flock-guarded long scans.",
-            "version": "1.1.0",
+            "description": "AlgoKiller — ARM64 trace evidence analysis & cipher algorithm recovery. 28 MCP tools (trace / artifact / static-tool / hypothesis-ledger / native folder picker) including v1.2.0 additions trace_function (PC-level invocation analyzer for stripped helpers) + trace_immseq (anchor-driven prev_reg sequence extraction for OLLVM-flattened tables); 4 skills + 3 slash commands (/ak, /ak:ciphertext, /ak:general, /ak:status, /ak:rebind, /ak:fold), 4 subagents (hypothesis-reviewer, trace-hexdump-extractor, binary-static-inspector, ledger-curator), 6 hooks (PreCompact auto/manual, SessionStart compact/startup-resume injecting context/critical-rules.md, Stop, SubagentStop) for compact-aware ledger preservation + post-compact work-semantics rebuild, 97-fingerprint crypto-constant scanner with NEON SIMD broadcast detection, data-parallel scan workers, kernel-flock-guarded long scans.",
+            "version": "1.2.0",
             "source": "./",
             "author": {
                 "name": "cloudza",

@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
@@ -61,6 +62,54 @@ from typing import Optional
 
 
 VALID_CONFIDENCE = ("unknown", "low", "medium", "high")
+
+# FIX #8 (v0.9.7): business-name guard. When a hypothesis statement names a
+# standard cryptographic *primitive* (the underlying algorithm, not a
+# construction mode), conclusion at medium/high requires at least one
+# supporting evidence item from a fingerprint-producing tool. Retrofitted
+# after a real-world incident where v4-v7 reports concluded "X25519 ECDH
+# shared_secret" four times in a row, each time supported by
+# trace_search/trace_context excerpts of the same 32B buffer that was
+# actually derive_key1() output from a hardcoded constant table — the
+# business name had zero algorithmic corroboration.
+#
+# v0.9.7 refinement: HMAC/GMAC/CMAC removed from the keyword list because
+# they are *constructions* (any hash + ipad/opad), not primitives. They are
+# already protected by R5 (SIMD broadcast evidence) and constscan picks up
+# the underlying SHA-256/MD5 fingerprint. Forcing cryptoinstr/constscan
+# for "HMAC" blocks the legitimate "I observed ipad/opad SIMD broadcast,
+# therefore this is HMAC-something" inference. The underlying hash name
+# (SHA-256, MD5, ...) still triggers the gate, which is the correct level
+# to enforce. Similarly Poly1305 is a MAC over ChaCha20-Poly1305 — keep
+# it gated since it has a distinct primitive fingerprint.
+#
+# v0.9.7 evidence-tools widen: trace_immseq (constant-table extraction)
+# and trace_function (invocation-structure analysis) also produce
+# algorithm-specific corroborating signal. A reconstructed S-box matching
+# a known AES table fingerprint, or a 5-invocation HMAC-helper PC analysis
+# with EPOC/NONC msg patterns, are both legitimate algorithm evidence.
+_ALGO_NAME_RE = re.compile(
+    r"\b("
+    r"X25519|Curve25519|Ed25519|"
+    r"AES(?:-?\d+)?|"
+    r"ChaCha20|Poly1305|Salsa20|XSalsa20|"
+    r"RSA(?:-?\d+)?|"
+    r"ECDH|ECDSA|EdDSA|ECIES|"
+    r"HKDF|PBKDF2|Argon2|scrypt|bcrypt|"
+    r"SHA-?1|SHA-?224|SHA-?256|SHA-?384|SHA-?512|SHA-?3|"
+    r"MD[245]|"
+    r"SM2|SM3|SM4|"
+    r"3DES|TripleDES|DES|"
+    r"Blake2[bs]?|Blake3"
+    r")\b",
+    re.IGNORECASE,
+)
+_ALGO_EVIDENCE_TOOLS = frozenset({
+    "trace_cryptoinstr",   # ARM Crypto Extensions: aese / sha256h etc.
+    "trace_constscan",     # constant fingerprints: MD5.T[i] / SHA256.K[i] / SM4 sbox
+    "trace_immseq",        # reconstructed table coefficients (matrix / S-box)
+    "trace_function",      # invocation-structure: PC + arg pattern (e.g. HMAC helper)
+})
 # FIX #7 (v0.9.1): "archived" is concluded-but-deliberately-deprioritised so
 # the artifact-reference gate doesn't force agents to cite hypotheses that
 # turned out non-load-bearing. Cannot transition from abandoned.
@@ -308,6 +357,35 @@ class HypothesisLedger:
     def _can_conclude(self, h: Hypothesis, target_confidence: str) -> tuple[bool, str]:
         if target_confidence not in ("low", "medium", "high"):
             return False, "final_confidence must be low / medium / high"
+
+        # FIX #8 (v0.9.7): business-name guard. If the statement names a
+        # standard cryptographic primitive (X25519, AES, HKDF, ...),
+        # conclusion at medium/high requires at least one supporting
+        # evidence item from trace_cryptoinstr or trace_constscan.
+        # Without algorithm-specific fingerprint corroboration, the name is
+        # a business label projected onto data — the exact failure mode
+        # behind the v4-v7 "X25519 shared_secret" mis-attribution.
+        if target_confidence in ("medium", "high"):
+            algo_match = _ALGO_NAME_RE.search(h.statement)
+            if algo_match:
+                algo = algo_match.group(1)
+                has_algo_evidence = any(
+                    ev.get("tool_name", "") in _ALGO_EVIDENCE_TOOLS
+                    for ev in h.supporting
+                )
+                if not has_algo_evidence:
+                    return False, (
+                        f"statement names algorithm '{algo}' but supporting "
+                        f"evidence has no trace_cryptoinstr / trace_constscan "
+                        f"fingerprint (FIX #8 business-name guard). Naming a "
+                        f"standard primitive at confidence>=medium requires "
+                        f"corroborating algorithm-specific signal from those "
+                        f"two tools. Options: (a) add a trace_cryptoinstr or "
+                        f"trace_constscan supporting item that actually "
+                        f"fingerprints '{algo}'; (b) reword the statement to "
+                        f"describe the observed behaviour without the "
+                        f"algorithm name; (c) conclude at 'low' confidence."
+                    )
 
         n_sup = len(h.supporting)
         n_con = len(h.contradicting)
@@ -725,19 +803,31 @@ class HypothesisLedger:
         # Requiring an explicit bracket makes citations syntactically obvious
         # to both human readers and the validator. Skill docs are updated to
         # teach the [H<n>] form.
+        #
+        # v0.9.7 cross-session relaxation: "not in ledger" is no longer a
+        # hard error — it becomes a non-blocking `unresolved_references`
+        # warning. Rationale: hypothesis_ledger.jsonl persists across
+        # sessions, but the in-memory _by_id dict is per-session. Prior
+        # behaviour blocked legitimate cross-session continuation reports
+        # (v6 cites v5's H2/H3/H4) forcing the agent to re-add identical
+        # hypotheses every session. Other validation errors (active state,
+        # low confidence, empty supporting) remain hard errors because
+        # those are bugs in THIS session that the agent can fix.
         import re
         # Capture bracketed and angle-bracketed forms — both visually obvious
         # citations that no naturally-occurring identifier would collide with.
         ids = sorted(set(re.findall(r"\[H(\d+)\]|<H(\d+)>", content or "")))
         ids_flat = [a or b for (a, b) in ids]
         errors: list[str] = []
+        unresolved: list[str] = []
         referenced = []
         for n in ids_flat:
             hid = f"H{n}"
             referenced.append(hid)
             h = self._by_id.get(hid)
             if h is None:
-                errors.append(f"{hid} referenced but not in ledger")
+                # v0.9.7: cross-session reference — warning, not error
+                unresolved.append(hid)
                 continue
             if h.state != "concluded":
                 errors.append(f"{hid} is '{h.state}', not 'concluded' — "
@@ -752,6 +842,7 @@ class HypothesisLedger:
         return {
             "ok": not errors,
             "errors": errors,
+            "unresolved_references": unresolved,
             "referenced_ids": referenced,
             "high_confidence_markers_found": self._detect_high_confidence_tier(content),
         }

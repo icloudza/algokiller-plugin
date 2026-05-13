@@ -38,7 +38,7 @@ claude plugin update ak@ak-suite
 2. **Slash commands** (strong activation)
    - `/ak:ciphertext <trace> <task>`
    - `/ak:general <trace> <task>`
-3. **26 MCP tools** (19 trace/artifact/static + 7 hypothesis-ledger)
+3. **28 MCP tools** (21 trace/artifact/static + 7 hypothesis-ledger; v1.2.0 added `trace_function` + `trace_immseq` for OLLVM-flattened binary analysis)
    - Binding / artifacts: `bind_trace` / `pick_output_dir` (native folder picker) / `write_artifact` / `list_artifacts` / `read_artifact`
    - Core search: `trace_search` / `trace_context`
    - Data flow: `trace_regflow` (register-value evolution) / `trace_producer` (nearest writer of a value) / `trace_semop` (11-class instruction classifier)
@@ -205,7 +205,7 @@ printf '%s\n' \
   | python3 server/algokiller_mcp.py
 ```
 
-Expect: `initialize` response + `tools/list` advertising 26 tools (19 trace/artifact/static tools + 7 hypothesis-ledger tools, including `pick_output_dir` / `mark_hypothesis_reviewed` / `hypothesis_archive`).
+Expect: `initialize` response + `tools/list` advertising 28 tools (21 trace/artifact/static tools + 7 hypothesis-ledger tools, including `pick_output_dir` / `mark_hypothesis_reviewed` / `hypothesis_archive` / `trace_function` / `trace_immseq`).
 
 ---
 

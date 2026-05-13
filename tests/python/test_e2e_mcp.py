@@ -153,10 +153,12 @@ class TestL1Plumbing(unittest.TestCase):
         if hasattr(cls, "client"):
             cls.client.close()
 
-    def test_01_tools_list_returns_26(self):
+    def test_01_tools_list_returns_28(self):
+        # v0.9.7: +trace_immseq (anchor-driven prev_reg sequence extraction)
+        #         +trace_function (PC-level invocation analyzer)
         resp = self.client.request("tools/list")
         tools = resp["result"]["tools"]
-        self.assertEqual(len(tools), 26)
+        self.assertEqual(len(tools), 28)
         names = {t["name"] for t in tools}
         # Sanity-check a few across categories.
         for required in ("bind_trace", "pick_output_dir",

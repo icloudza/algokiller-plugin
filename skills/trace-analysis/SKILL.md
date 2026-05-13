@@ -270,6 +270,98 @@ Frida-stalker 在 `objc_retain*` / `objc_autorelease*` / `objc_release` / `swift
 - 处置：`trace_constscan` 返回的 `block_count_estimate` 字段直接是 block 数，照抄即可。需要 KB 数就乘 64（MD5/SHA-256 block size）；SHA-512 / SHA-3 是 128 / r=1088 bit 不一样，按算法 block size 折算。
 - 交叉校验：如果同算法的多个 fingerprint（MD5.T[1..4]）命中数差异 > 5%，说明 trace 中有部分 block 命中被 fold 折叠或者中间 trace 截断，取**最小值**作为保守 block 数估计。
 
+**陷阱 4（R9）：`regN=X -> regN=Y` 中的 `X` 是写入前的旧值，不是指令读取值**
+
+GumTrace 一行格式为：
+
+```
+[discover] 0x10543cf80!0x27ecf80 ldp q0, q1, [x0]; q0=0x0 q1=0x2 x0=0x16efbdcb0 mem_r=0x16efbdcb0 -> q0=0xd60b2d95... q1=0x2924f672...
+```
+
+`q1=0x2` 是 ldp 写之前 NEON 寄存器 q1 里的旧值（很可能是上一条指令留下的残值），**不是 ldp 从内存读到 q1 里的值**。后者在 `->` 右侧：`-> q1=0x2924f672...`。混淆 / control-flow-flattened 代码下，LLM 极容易把 `q1=0x2` 当成 "ldp 读到 0x2 → 那这是 msg_len/size/counter"，进而衍生整段错误叙事（"v2.x 把 HMAC msg 改成 2B 短二进制 tag" 之类的连锁误判）。
+
+- 处置：要确定 `regN` 进入指令时的真值，**用 `trace_producer(value, sink_line)` 反推最近一条写 regN 的指令**（通常是 caller 的 `mov regN, #imm` / `csel regN, ...` / `ldr regN, [src]`）。不要相信同行的 `regN=X` 字段是输入。
+- 反向利用：在循环跳转密集的混淆代码里，`mov w8, #0x1b; w8=PREV -> w8=0x1b` 的 `PREV` 就是 w8 在被 0x1b 覆盖之前最后承载的值——往往正是上一轮 GF(2^8) 乘法的 multiplier（矩阵系数）。配合 `trace_immseq` 工具可以**按消费顺序**重组整张矩阵 / S-box 表。
+
+---
+
+## OLLVM control-flow-flattened binary 的常量提取（`trace_immseq`）
+
+当目标二进制使用 OLLVM 控制流扁平化 / bogus-flow / xy_obfuscator 等保护时：
+
+- `pdf` / Binary Ninja HLIL 看到的是"跳到 jump-table dispatcher → state ID 决定下一个 basic block"，函数体被打散，矩阵/表常量与 OLLVM state ID 的 immediate 混杂在一起；静态肉眼读不出消费顺序。
+- 但 trace 是**运行时执行流**，所有混淆都被运行时去掉了 —— 真实的算法顺序就是 trace 行号顺序。
+
+#### 反推手法（v0.9.7 实战验证）
+
+1. **找一个"每轮固定加载"的常量**作为锚点。对 GF(2^8) 乘法是 `mov w?, #0x1b`（mod 不可约多项式低 8 位）。对 AES 是 `aese` / `aesmc`。对 SHA-256 是 `sha256h` / `sha256su0`。
+2. 锚点会在每轮迭代固定位置出现 1 次，且 `mov` 类锚点写之前 寄存器里残留的就是**上一轮刚消费完的常量**（矩阵元素 / S-box index / round constant 索引）。
+3. 调 `trace_immseq(anchor="mov w8, #0x1b;", from_line=..., to_line=..., limit=...)`：工具会按 trace 行号顺序拉所有锚点命中，并解析每行的 `prev_val`（dst 寄存器写入前的旧值），返回完整 `sequence` 列表。
+4. 把 `prev_val` 字段按 `line` 排序输出，就是按消费顺序的常量序列。
+
+#### 验证手法（关键）
+
+- 编译器经常为同一个函数 inline 出**两份**（如 sig 路径 + nsig 路径 各调一次 generate_nsig，inline 两次）。两份函数体的 PC 不同，但 trace_immseq 序列**前若干个 prev_val 必须完全一致** —— 互证读对了。
+- 取一组已知输入 → 已知输出（如某次抓包的 sig hex），用反推出的矩阵跑 Python 等价实现，byte-by-byte 对比。一致即完成攻破。
+
+#### 何时不要用 trace_immseq
+
+- 算法不是表驱动 / 每轮 immediate 不固定（如 ARX 加密里的旋转量散布在不同指令）—— 没有稳定锚点，序列重组无意义。
+- 静态反编译能直接读出来（非混淆 binary）—— 静态更省时间。
+- 锚点命中数 << 64（如 < 32）—— 数据量太小，单次签名可能没跑完整张表，需要先扩 trace 时间窗。
+
+---
+
+## PC 函数级分析（`trace_function`）
+
+当一个**函数 PC** 在 trace 中被反复调用（如 HMAC dispatcher / generate_nsig / cipher round helper），过去你必须做的事：
+
+1. `trace_search` 找 PC 命中（限 100 行）
+2. 每个命中行 `trace_context(before=1, after=40)` 读 caller + 入参寄存器状态
+3. 人工 depth counter（`bl`/`blr` +1，`ret` -1）找 ret 行
+4. 函数体内每个 `bl` 收集子调用 PC
+5. 对 64 次调用循环 → 数百次 daemon round trip + 大量手工正则
+
+`trace_function` 一次调用做完，返回每次 invocation 的 `(entry_line, caller_pc, args[x0..x7], ret_line, ret_x0, ret_x1, subcall_sites[], instruction_count, exit_kind)`。
+
+#### 用法（典型 5 次 HMAC helper 分析）
+
+```
+trace_function(pc="0x27ecf44", max_invocations=32)
+```
+
+→ 一次返回 5 条 invocation 记录。每条记录 `args` 已经做了 R9 prev/new 区分（**取入口窗口内 reg 的首次出现值** = AArch64 PCS caller 传入值）。`unique_callers` 立刻告诉你这个 helper 被哪些上层函数调用。
+
+#### 参数
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `pc` | required | RVA (`"0x27ecf44"`) 或 abs vaddr (`"0x10543cf44"`) |
+| `pc_kind` | `"auto"` | `"auto"` 探测 trace 用哪种形式；`"rva"` / `"abs"` 强制 |
+| `arg_regs` | `["x0".."x7"]` | AArch64 PCS；token 紧时缩到 `["x0","x1","x2"]` |
+| `capture_ret` | `true` | 追到 `ret` 提取 `ret_x0` / `ret_x1`；`false` 只看入口（更快） |
+| `capture_subcalls` | `true` | 收集函数体内 `bl`/`blr` 目标 |
+| `max_invocations` | 32 | 上限 256；对超热函数按需调高 |
+| `max_function_size` | `0x2000` (8KB) | PC range 校验阈值，tail-call 检测时用 |
+
+#### exit_kind 三态
+
+- `ret` — depth-counter 回到 0，干净的 `ret` 出口
+- `tail_b` — 函数末尾通过 `b` / `br xN` 跳到 PC 范围外（典型尾调用优化）
+- `truncated` — daemon page 上限触发，函数体超 50000 指令或扫描窗口已耗尽。这种情况增大 `max_function_size` 或缩小 `from_line` 窗口
+
+#### 与其他工具的关系
+
+- `trace_callgraph` 用 **ObjC/Swift 符号** 数 caller/callee。stripped binary 或纯 PC 跳转的 helper 看不到 → 用 `trace_function`。
+- `trace_hexblock` 用于 `call func:` **显式块**（Frida-stalker 已标注的 boundary）。纯 ARM64 `bl` 没有这种标注 → 用 `trace_function`。
+- `trace_immseq` 抽**单一 anchor 指令的 prev_val 序列**（适合表驱动算法）；`trace_function` 抽**整个函数的 invocation 结构**（适合 HMAC/round helper 等需要 caller/args/ret 关系的场景）。两者互补。
+
+#### 何时不要用 trace_function
+
+- 你只想数命中次数（不要 args / ret / subcall） → 直接 `trace_search(anchor=f"!{pc} ", limit=...)` 更快
+- 函数被调用 1 次但函数体超 50k 指令 → `trace_function` 默认会被 `truncated`，需要拆段
+- PC 是 trampoline / PLT stub（无标准 prologue/epilogue） → 入参提取窗口里看不到有意义 reg state，结果稀疏
+
 ---
 
 ### 字段含义分析方法

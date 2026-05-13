@@ -116,7 +116,7 @@ TOOLS: list[dict[str, Any]] = [
                 "query": {"type": "string", "description": "Exact substring to find. ASCII case-insensitive."},
                 "from_line": {"type": "integer", "minimum": 1, "description": "1-based file line to start searching from (forward)."},
                 "before_line": {"type": "integer", "minimum": 1, "description": "1-based file line; search only lines strictly before this (backward)."},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Maximum number of matching lines to return."},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 500, "description": "Maximum number of matching lines to return (v0.9.7: raised from 100 to 500 for large-table extraction)."},
             },
             "required": ["query", "limit"],
         },
@@ -427,6 +427,90 @@ TOOLS: list[dict[str, Any]] = [
                 "with_text": {"type": "boolean", "description": "Include the matched instruction line text (default false)."},
             },
             "required": ["query"],
+        },
+    },
+    {
+        "name": "trace_function",
+        "description": (
+            "PC-level function invocation analyzer. Given a function entry PC "
+            "(RVA like `0x27ecf44` or absolute vaddr like `0x10543cf44`), find "
+            "every invocation in the bound trace and report per-invocation "
+            "(entry_line, caller_pc, args x0-x7, ret_line, ret_x0/x1, "
+            "subcall_sites, instruction_count, exit_kind).\n\n"
+            "Designed for stripped binaries where trace_callgraph cannot "
+            "resolve `bl <addr>` jumps to symbol names — specifically the "
+            "OLLVM-flattened helper functions (HMAC dispatch, generate_nsig, "
+            "cipher round helpers) where the same function PC is hit 5+ times "
+            "with different arg patterns. Without this tool the analyst is "
+            "forced into a manual trace_search + trace_context loop (one "
+            "round trip per invocation × hundreds of lines).\n\n"
+            "Algorithm: call-depth counter. Entry sets depth=1; every `bl` / "
+            "`blr` encountered in the function body increments depth; every "
+            "`ret` decrements. The ret that brings depth back to 0 is THIS "
+            "function's ret (correctly nested across subcalls). PC sanity "
+            "check: if PC jumps outside [entry_pc, entry_pc + 0x2000] via "
+            "`b`/`br xN` while depth==1, it's a tail call — `exit_kind` is "
+            "set to `tail_b` and the analysis stops there.\n\n"
+            "Argument extraction (R9-aware): scans the entry window (entry "
+            "line through entry+40) for trace lines with `reg_state` fields "
+            "between `;` and `->`. The FIRST observed value for each "
+            "arg_reg (x0-x7 by default) is reported — that's the value the "
+            "caller placed there per AArch64 PCS (NOT a stale residue from a "
+            "previous unrelated invocation). Indirect `blr xN` callees are "
+            "recorded as `{kind: 'indirect', via_reg: 'xN'}`.\n\n"
+            "Use cases: 'how many times is HMAC helper @ 0x27ecf44 called', "
+            "'what was x2 (msg_len) each time', 'list all subcalls inside "
+            "generate_nsig', 'which distinct callers ever invoked this PC'."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pc": {"type": "string", "description": "Function entry PC as 0x-hex. Either RVA (e.g. '0x27ecf44') or absolute vaddr (e.g. '0x10543cf44'); pc_kind='auto' detects which."},
+                "pc_kind": {"type": "string", "enum": ["auto", "rva", "abs"], "description": "PC interpretation. Default 'auto': probes both forms in the trace and picks whichever has hits."},
+                "arg_regs": {"type": "array", "items": {"type": "string"}, "description": "Argument registers to extract per invocation. Default ['x0','x1','x2','x3','x4','x5','x6','x7'] (AArch64 PCS). Use a narrower list for token economy."},
+                "capture_ret": {"type": "boolean", "description": "Detect ret line + ret_x0 / ret_x1. Default true. Set false for entry-only sweep (much cheaper)."},
+                "capture_subcalls": {"type": "boolean", "description": "Collect bl/blr targets inside the function body. Default true."},
+                "max_invocations": {"type": "integer", "minimum": 1, "maximum": 256, "description": "Cap on entry-hit invocations analyzed (default 32). For wildly-popular functions, increase incrementally."},
+                "max_function_size": {"type": "integer", "minimum": 16, "maximum": 65536, "description": "PC-range guard for tail-call detection (bytes). Default 0x2000 (8KB) — typical helper functions are well under that. Increase only for genuinely large funcs."},
+                "from_line": {"type": "integer", "minimum": 1, "description": "Start the entry-search scan at this trace line (default 1)."},
+            },
+            "required": ["pc"],
+        },
+    },
+    {
+        "name": "trace_immseq",
+        "description": (
+            "Extract the immediate-value sequence consumed by a recurring anchor "
+            "instruction across a trace region. Designed for table reconstruction "
+            "in OLLVM-flattened binaries where static `pdf` cannot recover the "
+            "ordered table (jump-table dispatcher shreds the control flow).\n\n"
+            "How it works: walks `trace_search` over the requested line range "
+            "looking for every occurrence of `anchor` (e.g. `mov w8, #0x1b;` — "
+            "the GF(2^8) mod-reduce constant load), and for each hit parses the "
+            "destination register's PREV value (the `regN=PREV -> regN=NEW` "
+            "old-value field). For `mov w?, #imm` anchors that PREV is whatever "
+            "the loop just consumed BEFORE the new immediate overwrote — i.e. "
+            "the previous matrix coefficient / table index in extraction order.\n\n"
+            "Canonical use case (verified in v0.9.7 retro): a generate_nsig "
+            "function inlined 128 GF(2^8) multiplications with `mov w8, #0x1b` "
+            "as the per-mult mod-reduce constant. Each anchor's prev_val of w8 "
+            "is the multiplier (matrix coefficient) just finished consuming. "
+            "Ordering by trace line reconstructs MAT_A→MAT_B→MAT_C→MAT_D byte "
+            "by byte. Two inlined copies of the same function are mutually "
+            "corroborating evidence.\n\n"
+            "Returns a `sequence` list of records, each with `line / pc / op / "
+            "dst / imm / prev_val`. `prev_val` is the R9 'PREV old register "
+            "value' (NOT what the instruction read — see R9 in critical-rules)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "anchor": {"type": "string", "description": "Exact substring identifying the per-iteration anchor instruction. ASCII case-insensitive. Examples: 'mov w8, #0x1b;' (GF-2^8), 'aese ' (AES round), 'sha256h ' (SHA-256 round)."},
+                "from_line": {"type": "integer", "minimum": 1, "description": "1-based start line for the scan (default 1)."},
+                "to_line": {"type": "integer", "minimum": 1, "description": "Optional 1-based end line (inclusive). When omitted, scans to EOF or until `limit` hits collected."},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 4096, "description": "Maximum number of anchor hits to collect (default 256). Higher than trace_search's 100-row cap because this tool is built for table extraction."},
+            },
+            "required": ["anchor"],
         },
     },
     {

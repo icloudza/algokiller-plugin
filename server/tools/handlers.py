@@ -10,7 +10,8 @@ Tools group conceptually:
   * Binding + low-level search       — bind_trace, trace_search, trace_context
   * Data flow                        — trace_regflow, trace_producer, trace_semop
   * Call / module graphs             — trace_callgraph, trace_modgraph, trace_hexblock
-  * Crypto detection                 — trace_constscan, trace_cryptoinstr, trace_bytes
+  * Crypto detection                 — trace_constscan, trace_cryptoinstr, trace_bytes, trace_immseq
+  * Function-level analysis          — trace_function (PC-driven invocation analyzer)
   * Trace health / volume            — trace_lint, trace_fold
   * Artifacts + static-analysis      — write_artifact, list_artifacts,
                                        read_artifact, run_static_tool
@@ -318,8 +319,12 @@ def tool_trace_search(args: dict[str, Any]) -> dict:
         limit = int(args.get("limit", 0))
     except (TypeError, ValueError):
         return {"status": "error", "error": "limit must be an integer"}
-    if not (1 <= limit <= 100):
-        return {"status": "error", "error": "limit must be in [1, 100]"}
+    # v0.9.7: raised from 100 → 500 to support real-world large-table
+    # extraction (sig+nsig generate_nsig has 128+128 anchor hits across
+    # two inlined copies; matrix reconstruction needs the full sequence
+    # in one shot, not paginated).
+    if not (1 <= limit <= 500):
+        return {"status": "error", "error": "limit must be in [1, 500]"}
 
     # FIX F-1: removed silent hex byte-reversal / leading-zero-strip fallback.
     # Previously when a 0x-hex query had zero hits, the server quietly retried
@@ -461,11 +466,38 @@ def tool_write_artifact(args: dict[str, Any]) -> dict:
                         "ledger entry — that's exactly what the FIX#1-#7 scaffold "
                         "is built to prevent."),
                     }
+    # v0.9.7: cross-session [H<n>] references are no longer hard errors —
+    # they become non-blocking warnings attached to the artifact write
+    # result. Rationale: hypothesis_ledger.jsonl persists across sessions
+    # but the in-memory ledger is per-session. Forcing the agent to
+    # re-add identical hypotheses in every continuation session is wasted
+    # work and breaks legitimate v6-cites-v5's-H2 narratives.
+    unresolved_refs: list[str] = []
+    if STATE.ledger is not None:
+        # Re-fetch the validation result (cached above as `check` if
+        # the ledger guard branch executed; otherwise compute it here).
+        if 'check' not in locals():
+            check = STATE.ledger.validate_artifact_references(content)
+        unresolved_refs = list(check.get("unresolved_references", []) or [])
+
     store = ArtifactStore(STATE.artifacts_dir, mode=STATE.mode)
-    return store.write(
+    result = store.write(
         rel_path=str(args.get("path", "")),
         content=content,
     )
+    if unresolved_refs and isinstance(result, dict):
+        result["warning_unresolved_h_refs"] = unresolved_refs
+        result["warning_note"] = (
+            f"{len(unresolved_refs)} [H<n>] citation(s) — {unresolved_refs} — "
+            "are not in THIS session's in-memory ledger. The artifact was "
+            "written assuming they reference hypotheses concluded in a "
+            "prior session (whose state is persisted in hypothesis_ledger.jsonl "
+            "but not re-loaded into memory). If you intended these citations "
+            "to point to current-session hypotheses, you probably forgot to "
+            "hypothesis_add + hypothesis_conclude them in this session — "
+            "otherwise this warning is informational only."
+        )
+    return result
 
 
 def tool_list_artifacts(_args: dict[str, Any]) -> dict:
@@ -1495,6 +1527,710 @@ def tool_trace_bytes(args: dict[str, Any]) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# trace_function — PC-level function invocation analyzer (v0.9.7)
+#
+# Charter: given a function entry PC, find every invocation in the trace and
+# produce one structured record per invocation (entry_line, caller_pc, args,
+# ret_line, ret_x0/x1, subcalls, exit_kind). Replaces the manual
+# trace_search + trace_context loop that prior sessions used to investigate
+# stripped/obfuscated helper functions (HMAC dispatch, generate_nsig).
+#
+# Boundary detection is a call-depth counter: entry=1, `bl`/`blr` +1,
+# `ret` -1. The ret that brings depth back to 0 is THIS function's ret.
+# PC sanity guard (entry_pc + max_function_size) catches tail-call exits
+# via `b`/`br xN`.
+#
+# Argument extraction is R9-aware: scans the entry window for trace lines
+# with `regN=HEX` fields between `;` and `->`. The FIRST value seen for
+# each arg_reg is the caller-supplied PCS value, NOT a stale residue.
+# ---------------------------------------------------------------------------
+
+# Parsers compiled once. Trace line format:
+#   [module] 0xABS!0xREL <opcode> ...; reg=hex ... -> reg=hex
+_FN_PC_RE = re.compile(r"(0x[0-9a-fA-F]+)!(0x[0-9a-fA-F]+)\s+([a-zA-Z][a-zA-Z0-9.]*)")
+_FN_BL_TARGET_RE = re.compile(r"\bbl\s+#?(0x[0-9a-fA-F]+)\b")
+_FN_BLR_REG_RE = re.compile(r"\bblr\s+(x[0-9]+)\b")
+_FN_BR_REG_RE = re.compile(r"\bbr\s+(x[0-9]+)\b")
+_FN_B_TARGET_RE = re.compile(r"\bb(?:\.[a-z]+)?\s+#?(0x[0-9a-fA-F]+)\b")
+_FN_RET_RE = re.compile(r"\bret\b")
+
+
+def _fn_parse_trace_line(text: str) -> dict:
+    """Parse a single GumTrace line into structured fields.
+
+    Returns dict with keys: `abs_pc`, `rel_pc`, `op`, `inst_body`, `tail_body`.
+    Returns empty dict when the line doesn't match the expected shape (e.g.
+    NDJSON header lines, blank rows, hexdump markers, etc.).
+    """
+    pc_m = _FN_PC_RE.search(text)
+    if not pc_m:
+        return {}
+    abs_pc = pc_m.group(1)
+    rel_pc = pc_m.group(2)
+    op = pc_m.group(3).lower()
+    sep = text.find(";")
+    inst_body = text[:sep] if sep >= 0 else text
+    tail_body = text[sep + 1:] if sep >= 0 else ""
+    return {
+        "abs_pc": abs_pc,
+        "rel_pc": rel_pc,
+        "op": op,
+        "inst_body": inst_body,
+        "tail_body": tail_body,
+    }
+
+
+def _fn_extract_reg_state(tail_body: str, arg_regs: list[str]) -> dict:
+    """Extract `regN=HEX` values from the BEFORE-arrow portion of tail_body.
+
+    Per R9: the segment of trace text between `;` and `->` is the input-side
+    register state (i.e. the value the register held BEFORE the instruction
+    wrote). For mov/ldp/ldr etc. that's the value the caller PCS-handed-in
+    (when read in the entry window). Returns dict[reg_name -> hex_string].
+    """
+    before_arrow = tail_body.split("->", 1)[0]
+    found = {}
+    for reg in arg_regs:
+        m = re.search(rf"\b{re.escape(reg)}=(0x[0-9a-fA-F]+)\b", before_arrow)
+        if m:
+            found[reg] = m.group(1)
+    return found
+
+
+def _fn_extract_after_arrow_reg(tail_body: str, reg: str) -> Optional[str]:
+    """Extract a single register's NEW value (right side of `->`).
+    Used for capturing ret-time x0/x1.
+    """
+    after_arrow = tail_body.split("->", 1)
+    if len(after_arrow) < 2:
+        return None
+    m = re.search(rf"\b{re.escape(reg)}=(0x[0-9a-fA-F]+)\b", after_arrow[1])
+    return m.group(1) if m else None
+
+
+def _fn_iter_context_lines(start_line: int, page_size: int = 100):
+    """Yield (line_no, text) for trace lines starting at `start_line`, in
+    chronological order, paged from the daemon's context command.
+
+    Stops yielding when daemon returns an empty/error page.
+    """
+    cursor = start_line
+    pages_yielded = 0
+    HARD_PAGE_LIMIT = 200  # 200 × 100 = 20k lines is plenty for any single function
+    while pages_yielded < HARD_PAGE_LIMIT:
+        # Use context-after-only so we walk strictly forward.
+        # We request `cursor` itself + after lines; the daemon includes the
+        # cursor as the "target" line plus the requested `after` count.
+        resp = STATE.daemon.request(f"context\t{cursor}\t0\t{page_size}")
+        if resp.get("status") != "ok":
+            return
+        stdout = resp.get("stdout") or ""
+        if not stdout.strip():
+            return
+        emitted_any = False
+        last_line = cursor
+        for raw in stdout.splitlines():
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                obj = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if obj.get("type") != "context":
+                continue
+            ln = obj.get("line")
+            if not isinstance(ln, int):
+                continue
+            if ln < cursor:
+                # daemon includes lines before the target if before>0; we set
+                # before=0 so this shouldn't happen, but defend anyway.
+                continue
+            yield ln, obj.get("text", "")
+            last_line = ln
+            emitted_any = True
+        pages_yielded += 1
+        if not emitted_any:
+            return
+        cursor = last_line + 1
+
+
+def _fn_resolve_pc_mode(pc: str, pc_kind: str, from_line: int) -> tuple[str, str]:
+    """Probe the trace for the PC under both RVA and abs forms; return
+    (kind_used, anchor_substring). pc is normalized to lowercase 0x-hex.
+    """
+    pc_lower = pc.lower()
+    if not pc_lower.startswith("0x"):
+        pc_lower = "0x" + pc_lower
+
+    rva_anchor = f"!{pc_lower} "
+    abs_anchor = f"{pc_lower}!"
+
+    if pc_kind == "rva":
+        return "rva", rva_anchor
+    if pc_kind == "abs":
+        return "abs", abs_anchor
+
+    # auto: probe both with limit=1
+    rva_hit = _search_once(rva_anchor, from_line=from_line, limit=1)
+    rva_has = bool((rva_hit.get("stdout") or "").strip())
+    if rva_has:
+        return "rva", rva_anchor
+    abs_hit = _search_once(abs_anchor, from_line=from_line, limit=1)
+    abs_has = bool((abs_hit.get("stdout") or "").strip())
+    if abs_has:
+        return "abs", abs_anchor
+    return "rva", rva_anchor  # fall back; final result will show 0 invocations
+
+
+def _fn_find_entry_lines(anchor: str, from_line: int, limit: int) -> list[tuple[int, str]]:
+    """Find all anchor hits forward from `from_line`, paginated up to `limit`."""
+    PAGE = 100
+    cursor = from_line
+    seen: set[int] = set()
+    results: list[tuple[int, str]] = []
+    while len(results) < limit:
+        batch = _search_once(anchor, from_line=cursor, limit=PAGE)
+        if batch.get("status") != "ok":
+            return results  # surface partial result; caller can still use it
+        stdout = batch.get("stdout") or ""
+        if not stdout.strip():
+            break
+        added_in_batch = 0
+        last_line = cursor
+        for raw in stdout.splitlines():
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                obj = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if obj.get("type") != "match":
+                continue
+            ln = obj.get("line")
+            if not isinstance(ln, int) or ln in seen:
+                continue
+            seen.add(ln)
+            results.append((ln, obj.get("text", "")))
+            last_line = ln
+            added_in_batch += 1
+            if len(results) >= limit:
+                break
+        if added_in_batch == 0:
+            break
+        cursor = last_line + 1
+    return results
+
+
+def _fn_analyze_one_invocation(
+    entry_line: int,
+    entry_text: str,
+    arg_regs: list[str],
+    capture_ret: bool,
+    capture_subcalls: bool,
+    pc_kind: str,
+    max_function_size: int,
+) -> dict:
+    """Analyze a single invocation starting at entry_line.
+
+    Returns the invocation record. Even on partial failure (truncated trace,
+    daemon page limit hit) returns the partial dict so the agent can use
+    whatever was recovered.
+    """
+    # Step 1: caller line (entry_line - 1) — caller's `bl`/`blr`/`br` PC.
+    caller_pc = None
+    caller_line = None
+    if entry_line > 1:
+        # Use context-before to grab just the immediately-prior line.
+        resp = STATE.daemon.request(f"context\t{entry_line}\t1\t0")
+        if resp.get("status") == "ok":
+            stdout = resp.get("stdout") or ""
+            for raw in stdout.splitlines():
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    obj = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("type") != "context":
+                    continue
+                ln = obj.get("line")
+                if ln == entry_line - 1:
+                    caller_text = obj.get("text", "")
+                    caller_parsed = _fn_parse_trace_line(caller_text)
+                    if caller_parsed:
+                        op = caller_parsed["op"]
+                        if op in ("bl", "blr", "br", "b"):
+                            caller_pc = (caller_parsed["rel_pc"]
+                                         if pc_kind == "rva"
+                                         else caller_parsed["abs_pc"])
+                            caller_line = ln
+                    break
+
+    # Parse entry PC for tail-call PC-range guard.
+    entry_parsed = _fn_parse_trace_line(entry_text)
+    if not entry_parsed:
+        return {
+            "entry_line": entry_line,
+            "error": "entry line did not match GumTrace format",
+            "raw": entry_text[:200],
+        }
+    entry_pc_field = (entry_parsed["rel_pc"]
+                      if pc_kind == "rva" else entry_parsed["abs_pc"])
+    try:
+        entry_pc_int = int(entry_pc_field, 16)
+    except ValueError:
+        entry_pc_int = 0  # disables tail-call guard but doesn't crash
+
+    # Step 2: scan forward for args + ret + subcalls.
+    args: dict[str, str] = {}
+    ret_line: Optional[int] = None
+    ret_pc: Optional[str] = None
+    ret_x0: Optional[str] = None
+    ret_x1: Optional[str] = None
+    exit_kind = "truncated"
+    depth = 1
+    inst_count = 0
+    subcall_sites: list[dict] = []
+    ARG_WINDOW = 40  # lines after entry within which arg-extraction trusts
+    arg_window_remaining = ARG_WINDOW
+    last_seen_line = entry_line
+
+    for ln, text in _fn_iter_context_lines(entry_line + 1):
+        parsed = _fn_parse_trace_line(text)
+        if not parsed:
+            last_seen_line = ln
+            continue
+        last_seen_line = ln
+        inst_count += 1
+        op = parsed["op"]
+        tail_body = parsed["tail_body"]
+
+        # Args: capture reg state in the first ARG_WINDOW post-entry lines.
+        if arg_window_remaining > 0:
+            extracted = _fn_extract_reg_state(tail_body, arg_regs)
+            for r, v in extracted.items():
+                if r not in args:
+                    args[r] = v
+            arg_window_remaining -= 1
+
+        # Subcall collection (depth >= 1 means we're inside the function).
+        if capture_subcalls and depth >= 1:
+            blm = _FN_BL_TARGET_RE.search(parsed["inst_body"])
+            if blm:
+                subcall_sites.append({
+                    "line": ln,
+                    "kind": "direct",
+                    "callee_pc": blm.group(1),
+                })
+            else:
+                blrm = _FN_BLR_REG_RE.search(parsed["inst_body"])
+                if blrm:
+                    subcall_sites.append({
+                        "line": ln,
+                        "kind": "indirect",
+                        "via_reg": blrm.group(1),
+                    })
+
+        # Call-depth bookkeeping.
+        if op == "bl" or op == "blr":
+            depth += 1
+        elif op == "ret":
+            depth -= 1
+            if depth <= 0:
+                ret_line = ln
+                ret_pc = (parsed["rel_pc"]
+                          if pc_kind == "rva" else parsed["abs_pc"])
+                exit_kind = "ret"
+                # Capture ret values if requested.
+                if capture_ret:
+                    ret_x0 = _fn_extract_reg_state(tail_body, ["x0"]).get("x0")
+                    ret_x1 = _fn_extract_reg_state(tail_body, ["x1"]).get("x1")
+                break
+
+        # Tail-call detection: depth==1, op is unconditional `b` / `br`,
+        # and the target jumps OUTSIDE [entry_pc, entry_pc + max_function_size].
+        # If we're depth==1 and PC goes wild, the function exited via tail
+        # call. Conditional `b.cond` is excluded (it stays in-function).
+        if depth == 1 and op in ("b", "br"):
+            target_pc_int = None
+            if op == "b":
+                bm = _FN_B_TARGET_RE.search(parsed["inst_body"])
+                if bm:
+                    try:
+                        target_pc_int = int(bm.group(1), 16)
+                    except ValueError:
+                        pass
+            # For `br xN` we can't statically know the target without a
+            # runtime register value; only honour it if PC of *next* line
+            # leaves the range. To keep this simple, just check the current
+            # line's PC against the range — if THIS line is already outside
+            # the function's PC range, we must have left via prior b/br.
+            cur_pc_int = None
+            try:
+                cur_pc_field = (parsed["rel_pc"]
+                                if pc_kind == "rva" else parsed["abs_pc"])
+                cur_pc_int = int(cur_pc_field, 16)
+            except ValueError:
+                pass
+            if (entry_pc_int > 0
+                    and cur_pc_int is not None
+                    and abs(cur_pc_int - entry_pc_int) > max_function_size):
+                exit_kind = "tail_b"
+                ret_line = ln
+                ret_pc = (parsed["rel_pc"]
+                          if pc_kind == "rva" else parsed["abs_pc"])
+                break
+            # Also break on direct b to a wildly different target.
+            if (target_pc_int is not None and entry_pc_int > 0
+                    and abs(target_pc_int - entry_pc_int) > max_function_size):
+                exit_kind = "tail_b"
+                ret_line = ln
+                ret_pc = (parsed["rel_pc"]
+                          if pc_kind == "rva" else parsed["abs_pc"])
+                break
+
+        # Safety: a runaway scan past max_function_size lines is unusual.
+        # Functions > 20k lines exist but are exotic; cap to bound runtime.
+        if inst_count > 50000:
+            exit_kind = "truncated"
+            break
+
+    return {
+        "entry_line": entry_line,
+        "caller_line": caller_line,
+        "caller_pc": caller_pc,
+        "args": args,
+        "ret_line": ret_line,
+        "ret_pc": ret_pc,
+        "ret_x0": ret_x0,
+        "ret_x1": ret_x1,
+        "subcall_sites": subcall_sites,
+        "instruction_count": inst_count,
+        "exit_kind": exit_kind,
+    }
+
+
+def tool_trace_function(args: dict[str, Any]) -> dict:
+    err = _require_bound()
+    if err is not None:
+        return err
+
+    pc_arg = args.get("pc")
+    if not pc_arg or not isinstance(pc_arg, str):
+        return {"status": "error", "error": "pc is required (0x-hex string)"}
+
+    pc_kind = str(args.get("pc_kind", "auto")).lower()
+    if pc_kind not in ("auto", "rva", "abs"):
+        return {"status": "error",
+                "error": "pc_kind must be one of: auto, rva, abs"}
+
+    arg_regs = args.get("arg_regs")
+    if arg_regs is None:
+        arg_regs = ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"]
+    if not isinstance(arg_regs, list) or not all(
+            isinstance(r, str) and re.fullmatch(r"[wxqsd][0-9]+", r)
+            for r in arg_regs):
+        return {"status": "error",
+                "error": "arg_regs must be a list of register names like 'x0'..'x7'"}
+
+    capture_ret = bool(args.get("capture_ret", True))
+    capture_subcalls = bool(args.get("capture_subcalls", True))
+
+    try:
+        max_invocations = int(args.get("max_invocations", 32))
+    except (TypeError, ValueError):
+        return {"status": "error", "error": "max_invocations must be an integer"}
+    if not (1 <= max_invocations <= 256):
+        return {"status": "error", "error": "max_invocations must be in [1, 256]"}
+
+    try:
+        max_function_size = int(args.get("max_function_size", 0x2000))
+    except (TypeError, ValueError):
+        return {"status": "error",
+                "error": "max_function_size must be an integer"}
+    if not (16 <= max_function_size <= 65536):
+        return {"status": "error",
+                "error": "max_function_size must be in [16, 65536]"}
+
+    try:
+        from_line = int(args.get("from_line", 1))
+    except (TypeError, ValueError):
+        return {"status": "error", "error": "from_line must be an integer"}
+    if from_line < 1:
+        return {"status": "error", "error": "from_line must be >= 1"}
+
+    # Resolve PC mode (auto-detect rva vs abs).
+    pc_kind_resolved, anchor = _fn_resolve_pc_mode(
+        str(pc_arg), pc_kind, from_line)
+
+    # Find entry-hit lines.
+    entries = _fn_find_entry_lines(anchor, from_line, max_invocations)
+
+    if not entries:
+        return {
+            "status": "ok",
+            "pc": pc_arg,
+            "pc_kind_resolved": pc_kind_resolved,
+            "anchor_used": anchor,
+            "invocations": [],
+            "total_invocations_found": 0,
+            "unique_callers": [],
+            "note": (
+                f"No trace lines matched PC anchor `{anchor}`. If you "
+                f"supplied a RVA but the trace is in abs-PC mode (or vice "
+                f"versa), explicitly set pc_kind. If the function genuinely "
+                f"wasn't invoked in the bound trace window, this is a "
+                f"correct empty result."
+            ),
+        }
+
+    # Analyze each invocation.
+    invocations = []
+    unique_callers: list[str] = []
+    for entry_line, entry_text in entries:
+        inv = _fn_analyze_one_invocation(
+            entry_line=entry_line,
+            entry_text=entry_text,
+            arg_regs=arg_regs,
+            capture_ret=capture_ret,
+            capture_subcalls=capture_subcalls,
+            pc_kind=pc_kind_resolved,
+            max_function_size=max_function_size,
+        )
+        invocations.append(inv)
+        cp = inv.get("caller_pc")
+        if cp and cp not in unique_callers:
+            unique_callers.append(cp)
+
+    # Summary: collect the per-arg sequences for quick pattern spotting.
+    arg_sequences: dict[str, list[Optional[str]]] = {r: [] for r in arg_regs}
+    for inv in invocations:
+        a = inv.get("args", {}) or {}
+        for r in arg_regs:
+            arg_sequences[r].append(a.get(r))
+
+    # Trim zero-info arg rows (an arg_reg that's None for every invocation
+    # just clutters the response).
+    arg_sequences = {r: seq for r, seq in arg_sequences.items()
+                     if any(v is not None for v in seq)}
+
+    return {
+        "status": "ok",
+        "pc": pc_arg,
+        "pc_kind_resolved": pc_kind_resolved,
+        "anchor_used": anchor,
+        "invocations": invocations,
+        "total_invocations_found": len(invocations),
+        "unique_callers": unique_callers,
+        "arg_sequences": arg_sequences,
+        "note": (
+            "args[r] is the FIRST observed value for register r in the "
+            "post-entry window — that's the AArch64-PCS caller-supplied "
+            "value (NOT a stale residue; see R9). exit_kind=`ret` means a "
+            "depth-counter ret matched cleanly; `tail_b` means the function "
+            "exited via unconditional `b` / `br` jumping outside its PC "
+            "range (max_function_size); `truncated` means the daemon page "
+            "limit hit before either signal — increase max_function_size or "
+            "narrow from_line if you see this. subcall_sites[].kind: "
+            "`direct` (bl 0xN) vs `indirect` (blr xN)."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# trace_immseq — anchor-driven prev_reg sequence extraction (v0.9.7)
+#
+# Use case: OLLVM control-flow flattening shreds generate_nsig / table-driven
+# transforms so `pdf` cannot recover the ordered table. But the trace IS
+# linear runtime execution — every per-iteration `mov w?, #const` writes a
+# constant to a destination register, and the GumTrace text records
+# `regN=PREV -> regN=NEW`. PREV is whatever the loop just consumed: the
+# table coefficient, the matrix element, the s-box index, etc.
+#
+# R9 calls this out as the canonical "prev/new" extraction pattern. This
+# tool batches the trace_search + parse + sequence-by-line work into a
+# single call that returns the reconstructed table.
+#
+# Verified attack (v2.2.13 XHS mini-sign GF MixColumns): anchoring on
+# `mov w8, #0x1b;` (GF-2^8 mod-reduce constant) and reading w8's prev_val
+# byte-by-byte produced MAT_A → MAT_B → MAT_C → MAT_D in consumption order
+# across 128 invocations, with two inlined copies of generate_nsig mutually
+# corroborating the read.
+# ---------------------------------------------------------------------------
+
+# Pre-compiled parsers. Trace text format:
+#   [module] <abs_pc>!<rel_pc> <opcode> <dst>, [#imm | [src,...]]; <regN>=<HEX> ... -> <regN>=<HEX>
+_IMMSEQ_PC_RE = re.compile(r"!(0x[0-9a-fA-F]+)\b")
+_IMMSEQ_INST_RE = re.compile(
+    r"!\s*0x[0-9a-fA-F]+\s+"          # rel_pc separator
+    r"([a-zA-Z][a-zA-Z0-9.]*)\s+"     # opcode (mov / ldr / aese / sha256h ...)
+    r"([wxqsd][0-9]+|sp|fp|wzr|xzr)"  # destination register
+    r"(?:\s*,\s*(#[^,;]+|\[[^\]]+\][^;,]*|[^,;]+))?"  # optional operand
+)
+_IMMSEQ_REG_STATE_RE_TEMPLATE = r"\b{reg}=(0x[0-9a-fA-F]+)\b"
+
+
+def tool_trace_immseq(args: dict[str, Any]) -> dict:
+    err = _require_bound()
+    if err is not None:
+        return err
+
+    anchor = str(args.get("anchor") or "").strip()
+    if not anchor:
+        return {"status": "error", "error": "anchor must not be empty"}
+
+    try:
+        from_line = int(args.get("from_line", 1))
+    except (TypeError, ValueError):
+        return {"status": "error", "error": "from_line must be an integer"}
+    if from_line < 1:
+        return {"status": "error", "error": "from_line must be >= 1"}
+
+    to_line_arg = args.get("to_line")
+    if to_line_arg is None:
+        to_line = 0
+    else:
+        try:
+            to_line = int(to_line_arg)
+        except (TypeError, ValueError):
+            return {"status": "error", "error": "to_line must be an integer when provided"}
+        if to_line < from_line:
+            return {"status": "error", "error": "to_line must be >= from_line"}
+
+    try:
+        limit = int(args.get("limit", 256))
+    except (TypeError, ValueError):
+        return {"status": "error", "error": "limit must be an integer"}
+    if not (1 <= limit <= 4096):
+        return {"status": "error", "error": "limit must be in [1, 4096]"}
+
+    # Walk daemon in 100-row pages until we have `limit` anchor hits or run
+    # past `to_line` / EOF. trace_search caps each call at 100, but this
+    # tool exists to gather longer sequences for table reconstruction.
+    PAGE = 100
+    cursor = from_line
+    seen_lines: set[int] = set()
+    hits: list[tuple[int, str]] = []
+
+    while len(hits) < limit:
+        batch = _search_once(anchor, from_line=cursor, limit=PAGE)
+        if batch.get("status") != "ok":
+            # Surface daemon-level error verbatim (preserves status + stderr).
+            return batch
+        stdout = batch.get("stdout") or ""
+        if not stdout.strip():
+            break
+
+        added_in_batch = 0
+        last_line_in_batch = cursor
+        for raw in stdout.splitlines():
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                obj = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if obj.get("type") != "match":
+                continue
+            ln = obj.get("line")
+            if not isinstance(ln, int):
+                continue
+            if to_line and ln > to_line:
+                # Past the requested window — stop walking.
+                cursor = (to_line or 0) + 1
+                break
+            if ln in seen_lines:
+                continue
+            seen_lines.add(ln)
+            hits.append((ln, obj.get("text", "")))
+            last_line_in_batch = ln
+            added_in_batch += 1
+            if len(hits) >= limit:
+                break
+
+        if added_in_batch == 0:
+            # No new lines emerged; daemon either exhausted or returned the
+            # same window. Either way: stop, otherwise we loop forever.
+            break
+        # Advance one past the last accepted line; daemon's from_line is
+        # inclusive so +1 strictly forward-progresses.
+        cursor = last_line_in_batch + 1
+        if to_line and cursor > to_line:
+            break
+
+    # Parse each hit into a structured record. Best-effort: rows that don't
+    # fit the canonical form are still returned with whatever fields we
+    # could parse, so downstream agents can recover even from edge cases
+    # (NEON multi-reg lds, etc.).
+    sequence = []
+    for line_no, text in hits:
+        sep = text.find(";")
+        inst_body = text[:sep] if sep >= 0 else text
+        tail_body = text[sep + 1:] if sep >= 0 else ""
+
+        pc_m = _IMMSEQ_PC_RE.search(inst_body)
+        pc = pc_m.group(1) if pc_m else ""
+
+        inst_m = _IMMSEQ_INST_RE.search(inst_body)
+        if inst_m:
+            op = inst_m.group(1)
+            dst = inst_m.group(2)
+            imm_raw = inst_m.group(3) or ""
+            imm = imm_raw.lstrip("#").strip().rstrip(",").strip() if imm_raw else ""
+        else:
+            op = ""
+            dst = ""
+            imm = ""
+
+        prev_val: str | None = None
+        if dst:
+            # PREV is the dst register's value BEFORE the arrow (`-> dst=NEW`).
+            # Per R9, what's on the LEFT of `->` is the OLD value.
+            before_arrow = tail_body.split("->", 1)[0]
+            reg_re = re.compile(_IMMSEQ_REG_STATE_RE_TEMPLATE.format(reg=re.escape(dst)))
+            pm = reg_re.search(before_arrow)
+            if pm:
+                prev_val = pm.group(1)
+
+        sequence.append({
+            "line": line_no,
+            "pc": pc,
+            "op": op,
+            "dst": dst,
+            "imm": imm,
+            "prev_val": prev_val,
+        })
+
+    # Stats summary for the agent: how many hits, how many had a parseable
+    # prev_val (the actual deliverable byte for table reconstruction).
+    parseable = sum(1 for s in sequence if s["prev_val"] is not None)
+
+    return {
+        "status": "ok",
+        "anchor": anchor,
+        "from_line": from_line,
+        "to_line": to_line or None,
+        "hits": len(sequence),
+        "parseable_prev_val": parseable,
+        "limit": limit,
+        "exhausted": len(sequence) < limit,
+        "sequence": sequence,
+        "note": (
+            "Each entry's `prev_val` is the destination register's OLD value "
+            "BEFORE this instruction wrote (R9 semantics — NOT what the "
+            "instruction read). For `mov w?, #imm` anchors, `prev_val` is the "
+            "constant the loop just finished consuming: matrix coefficient, "
+            "table index, s-box page, etc. Read `prev_val` byte-by-byte in "
+            "trace-line order to reconstruct the consumed table."
+        ),
+    }
+
+
 def tool_trace_cryptoinstr(args: dict[str, Any]) -> dict:
     err = _require_bound()
     if err is not None:
@@ -1788,6 +2524,8 @@ HANDLERS = {
     "trace_hexblock": tool_trace_hexblock,
     "trace_constscan": tool_trace_constscan,
     "trace_bytes": tool_trace_bytes,
+    "trace_immseq": tool_trace_immseq,
+    "trace_function": tool_trace_function,
     "trace_cryptoinstr": tool_trace_cryptoinstr,
     "hypothesis_add": tool_hypothesis_add,
     "hypothesis_update": tool_hypothesis_update,

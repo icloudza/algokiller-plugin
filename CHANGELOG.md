@@ -4,6 +4,178 @@ All notable changes to **algokiller-plugin** are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] — Obfuscated-binary extraction tools + ledger gate refinements
+
+Real-world XHS v2.2.13 mini-sign reversal exposed a gap between trace
+evidence collection and OLLVM-flattened binary analysis: BinaryNinja
+plugin MCP servers (fosdickio/binary_ninja_mcp on port 9009 and
+jtang613/BinAssistMCP on port 8000) both share the BN GUI main thread,
+so when BN is analyzing a 383 MB Mach-O the HTTP/SSE side falls into
+5-second timeout. An entire `generate_nsig` function (OLLVM `-fla` with
+jump-table dispatcher + state machine) had to be reverse-engineered
+through trace-only evidence because the static pipeline was blocked.
+
+v1.2.0 ships the trace tools that emerged from that work, formalizes
+the prev/new register-state semantics that misled four prior report
+versions of the same task, and loosens five gates whose enforcement
+fired during legitimate workflow (cross-session [H<n>] references,
+trace_search → trace_bytes fallback, and a too-broad algorithm-name
+keyword list).
+
+### Added — two new MCP tools (26 → 28)
+
+- **`trace_function`** — PC-level invocation analyzer. Given a function
+  entry PC (RVA or absolute vaddr), find every invocation in the bound
+  trace and report per-invocation `(entry_line, caller_pc, args[x0..x7],
+  ret_line, ret_x0, ret_x1, subcall_sites[], instruction_count,
+  exit_kind)`. Boundary detection is a call-depth counter: entry sets
+  depth=1, `bl`/`blr` +1, `ret` -1, depth==0 is this function's ret.
+  PC sanity guard catches tail-call exits via unconditional `b` / `br`.
+  Designed for stripped binaries where `trace_callgraph` cannot resolve
+  `bl <addr>` jumps to symbol names — replaces the manual `trace_search`
+  + `trace_context` loop that HMAC-helper / `generate_nsig` analysis
+  previously required (5+ invocations × hundreds of lines = N daemon
+  round trips per investigation).
+
+- **`trace_immseq`** — anchor-driven prev_reg sequence extraction. When
+  OLLVM control-flow flattening shreds the static execution order of
+  table-driven transforms (jump-table dispatcher hides matrix /
+  S-box consumption order), anchor on a per-iteration constant load
+  (e.g. `mov w8, #0x1b` for GF(2^8) mod-reduce) and read the
+  destination register's `prev_val` — the value the loop just consumed
+  BEFORE the new immediate overwrote (the R9 semantics, see below).
+  The XHS v2.2.13 retro proved this out: 128 anchor hits across two
+  inlined `generate_nsig` copies reconstructed `MAT_A → MAT_B → MAT_C
+  → MAT_D` byte-by-byte in consumption order; two copies' first 12
+  values matched exactly, mutually corroborating the read.
+
+### Added — R9 prev/new register-state semantics
+
+- **`context/critical-rules.md` §2 R9:** GumTrace lines of the shape
+  `<inst>; regN=X ... -> regN=Y` mean `regN` carried value `X` INTO
+  the instruction and now carries `Y` AFTER. The instruction's actual
+  *input* is on the right-hand side of the operands (memory address /
+  source register), NOT `regN=X`. This is the single most common LLM
+  mis-read in OLLVM control-flow-flattened code — a real-world XHS
+  reversal (this session) misread `ldp q0, q1, [x0]; q1=0x2 ...` as
+  "msg_len=2" and derived an entire false "v2.x changed HMAC msg
+  to 2B short binary tag" narrative across reports v4 through v7.
+  R9 also adds the inverse-use insight: for `mov w?, #imm; w?=PREV`
+  anchors, `PREV` is whatever the loop just wrote — extractable as
+  a table coefficient via `trace_immseq`.
+- **`server/discipline.py`:** added two reminders to both general &
+  ciphertext pools so R9 surfaces every ~20 tool calls during long
+  analysis (PREV/NEW + OBFUSCATED EXTRACTION pattern).
+
+### Added — FIX #8 algorithm-name guard
+
+- **`server/hypothesis.py` `_can_conclude(medium/high)`:** when the
+  hypothesis statement names a standard primitive (X25519, Curve25519,
+  AES, ChaCha20, RSA, ECDH, HKDF, PBKDF2, SHA-1/224/256/384/512/3, MD4/5,
+  SM2/3/4, 3DES/DES, Blake2/3 — 27 keywords), supporting evidence must
+  include at least one item from `trace_cryptoinstr` / `trace_constscan`
+  / `trace_immseq` / `trace_function`. Otherwise `conclude` is rejected
+  with three remediation options inline: (a) add fingerprint evidence,
+  (b) reword statement without the algorithm name, (c) downgrade to
+  `low` confidence. Catches the "I read 32B of buffer, therefore X25519
+  shared_secret" failure mode that misled v4-v7 of the XHS retro — the
+  32B was actually `derive_key1()` output from a hardcoded constant
+  table, never ECDH.
+- HMAC / GMAC / CMAC deliberately excluded from the keyword list (they
+  are constructions, not primitives; already protected by R5 SIMD-
+  broadcast evidence and the underlying hash name still triggers).
+
+### Changed — loosened five over-strict gates
+
+- **`trace_search` limit 100 → 500** (`server/tools/handlers.py` +
+  `schemas.py`). Real-world large-table extraction (128+ anchor hits
+  spanning two inlined copies of `generate_nsig`) had to be paginated
+  artificially. The daemon supports it, the validator was the only
+  bottleneck.
+
+- **B2 softening** (`context/critical-rules.md`). The "do not re-run
+  with same arguments" rule fired on the legitimate `trace_search
+  → hint → trace_bytes` fallback chain (v0.9.1 explicitly removed
+  the implicit byte-reverse fallback from `trace_search`, so the
+  follow-up `trace_bytes` call with the same hex query is now the
+  documented path). Rule reworded to "same arguments AND no new
+  context", with explicit exemption for hint-driven format-aware
+  retries.
+
+- **Cross-session `[H<n>]` references** (`server/hypothesis.py`
+  `validate_artifact_references` + `server/tools/handlers.py`
+  `tool_write_artifact`). Hypothesis IDs that don't resolve in THIS
+  session's in-memory ledger are no longer hard errors; they become
+  a non-blocking `warning_unresolved_h_refs` field on the artifact
+  write response. Rationale: `hypothesis_ledger.jsonl` persists
+  across sessions but the in-memory `_by_id` dict is per-session.
+  A continuation report (v6 cites v5's H2/H3/H4) should not require
+  re-adding identical hypotheses. The artifact still writes; the
+  agent gets a clear warning listing the unresolved IDs.
+
+- **FIX #8 keyword tightened**: removed HMAC/GMAC/CMAC; widened
+  `_ALGO_EVIDENCE_TOOLS` to include `trace_immseq` and `trace_function`
+  alongside the original `cryptoinstr` / `constscan`. Reconstructed
+  matrix coefficients (from `trace_immseq`) and HMAC-helper invocation
+  pattern (from `trace_function`) are now first-class algorithm
+  evidence.
+
+### Added — methodology updates
+
+- **`skills/trace-analysis/SKILL.md`:** new top-level section
+  "OLLVM control-flow-flattened binary 的常量提取（`trace_immseq`）"
+  walks through the anchor pattern + the dual-inline-copy mutual
+  corroboration check. New "PC 函数级分析（`trace_function`）" section
+  documents `arg_regs` / `exit_kind` 三态 (`ret` / `tail_b` /
+  `truncated`) / what NOT to use it for. Added 陷阱 4 (R9 prev/new)
+  to the existing 证据陷阱清单 in §2.
+
+- **`agents/binary-static-inspector.md`:** new "RVA 容错" section
+  documents multi-image-base candidate probing + first-bytes-anchor
+  relocation via `otool -l` segment map (real incident this session:
+  a vaddr `0x1153269be` was off by 0x100000000 from the actual
+  `0x11424e9be` after a Mach-O segment shift, blocking 14 of 30 agent
+  tool calls). New "Fallback: static blocked → trace pivot"
+  recommendation format explicitly points the main agent at
+  `trace_immseq` when BN MCP times out or OLLVM flattens the body.
+  New "OLLVM Control-Flow Flattening Pre-pass" section: if
+  `ltlly/MikuCffHelper` BN plugin is installed (GUI only), recommend
+  right-click → `Function Analysis` → `workflow_patch_mlil_auto`
+  BEFORE the decompile request — 95% success rate (37/39 ARM64
+  OLLVM functions in author benchmark) turns flattened functions
+  into readable `switch-case` HLIL.
+
+### Tests
+
+- 21 new unit tests (`tests/python/test_trace_function.py`) cover
+  the trace_function parse helpers: line tokenizer for canonical
+  `mov` / `ldp` (NEON double-dest) / `bl` / `blr` / conditional vs
+  unconditional `b` / `ret`, R9-aware `reg_state` extraction (verifies
+  `mov w8, #0x1b; w8=0x5f -> w8=0x1b` returns `0x5f` as PREV, not
+  `0x1b` as NEW), after-arrow reg extraction for ret_x0 capture,
+  `bl` vs `blr` regex disambiguation.
+- Existing tests updated:
+  - `test_e2e_mcp.py::test_01_tools_list_returns_28` (was 26).
+  - `test_hypothesis.py::TestConflictGraph._add` tool_pool rotated
+    to `trace_constscan / trace_cryptoinstr / trace_callgraph /
+    trace_search` so MD5 / SHA-256 hypotheses can clear the FIX #8
+    algorithm-name gate when concluding at medium.
+- Total native test count: 128 → **149 PASS** (2.36 s suite).
+
+### Out-of-scope (separate plugin)
+
+The session also produced a one-line bug fix + escape-hatch env var
+for the **`pua-skills` PUA Integrity Guard** hook
+(`hooks/integrity-guard.sh`): the `MUTATING_BASH` regex's `>[^&]`
+trailing alternative matched stderr-redirect `2>/dev/null` because
+the digit prefix wasn't excluded, causing ~10 false-positive fires
+per session on benign `grep tests/ ... 2>/dev/null` commands. Fixed
+by negative-lookbehind `(?<![0-9&])>[^&]`. Also added
+`PUA_INTEGRITY_OFF=1` env var as a user-level disable. These are
+NOT part of algokiller-plugin and won't be released via this
+changelog — they live in the upstream `tanweai/pua` repo and the
+patch will be lost on `git pull` unless mirrored upstream.
+
 ## [1.1.0] — Anti-hallucination SSOT + compact work-semantics rebuild
 
 Harness Engineering audit pass against the
