@@ -220,7 +220,7 @@ scp -P 2222 root@localhost:'/var/mobile/Containers/Data/Application/*/Documents/
             ~/captures/targetapp-startup.trace.log
 
 # 4) 喂给 algokiller
-# 在 Claude Desktop 里调 algokiller.bind_trace(path=..., mode='general')
+# 在 Claude Code / Claude Desktop 里调 algokiller.bind_trace(path=..., mode='general')
 ```
 
 > 用 `(sleep 35; echo) | frida ...` 给 stdin 喂超时管道 —— 避免 frida REPL 收 EOF 立即退出导致 setTimeout 没机会跑完。
@@ -245,7 +245,7 @@ const opt = Memory.alloc(8); opt.writeU64(<mode>)
 
 ## 8. trace 喂给 AlgoKiller plugin
 
-trace 文件落到 macOS 后,在 Claude Desktop 里:
+trace 文件落到 macOS 后,在 Claude Code / Claude Desktop 里:
 
 ```
 algokiller.bind_trace(path="/Users/<you>/captures/targetapp-startup.trace.log", mode="ciphertext")

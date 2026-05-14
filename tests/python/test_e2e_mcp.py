@@ -2,7 +2,7 @@
 
 Spawns `python3 server/algokiller_mcp.py` as a real subprocess, sends
 JSON-RPC 2.0 frames over its stdin, and parses the JSON-RPC responses
-on stdout — exactly how Claude Desktop drives the plugin.
+on stdout — exactly how Claude clients (Claude Code / Claude Desktop) drive the plugin.
 
 Covers two test surfaces the unit tests cannot reach:
 

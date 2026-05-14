@@ -2,11 +2,11 @@
 
 **语言**：**中文** | [English](README.en.md)
 
-面向 ARM64 trace 证据分析与算法/密文还原的 **Claude Desktop plugin**。把 AlgoKiller 方法论打包为 skill，配本地 MCP server 驱动 native `ak_search` 引擎（14 个 subcommand，专攻 GB 级 trace）。
+面向 ARM64 trace 证据分析与算法/密文还原的 **Claude 插件**（同时兼容 Claude Code CLI 与 Claude Desktop App）。把 AlgoKiller 方法论打包为 skill，配本地 MCP server 驱动 native `ak_search` 引擎（14 个 subcommand，专攻 GB 级 trace）。
 
 > **方法论 + ak_search 引擎原作**：[AlgoKiller](https://github.com/lidongyooo/AlgoKiller) by [@lidongyooo](https://github.com/lidongyooo)
 > 上游贡献 `match` / `context` / `daemon` 三个核心子命令（mmap + BMH + 行号索引 + tab 协议 daemon）以及原始方法论 harness。
-> 本仓库在此之上额外扩展了 11 个 native 子命令（`regflow` / `producer` / `semop` / `lint` / `fold` / `callgraph` / `modgraph` / `hexblock` / `constscan` / `cryptoinstr` / `bytes`，详见 [tools/search/README.md](tools/search/README.md)）并把整套打包为 Claude Desktop plugin。原始代码版权归上游作者；plugin 自身的扩展代码 MIT。
+> 本仓库在此之上额外扩展了 11 个 native 子命令（`regflow` / `producer` / `semop` / `lint` / `fold` / `callgraph` / `modgraph` / `hexblock` / `constscan` / `cryptoinstr` / `bytes`，详见 [tools/search/README.md](tools/search/README.md)）并把整套打包为 Claude 插件（Claude Code / Desktop 都能加载）。原始代码版权归上游作者；plugin 自身的扩展代码 MIT。
 
 ---
 
@@ -89,7 +89,9 @@ cp ak_search ../../server/bin/ak_search
 
 > 一行装机命令见顶部 [🚀 快速安装](#-快速安装)。
 
-**手动安装（备选）**：克隆仓库后在 Claude Desktop → `+` → **Plugins** → **Add plugin** → 选本地目录。
+**手动安装（备选）**：克隆仓库后
+- **Claude Desktop**：`+` → **Plugins** → **Add plugin** → 选本地目录
+- **Claude Code**：在仓库根目录跑 `claude plugin install .`（或把仓库路径加进 `claude plugin marketplace add <local>`）
 
 ```bash
 git clone https://github.com/icloudza/algokiller-plugin
@@ -129,7 +131,7 @@ frida -U -f com.example.app -l example.js
 # 4. 拉回 trace 文件到 macOS
 adb pull /data/data/com.example.app/trace.log ~/captures/login.trace.log
 
-# 5. 喂给本 plugin（在 Claude Desktop 自然语言触发或敲 slash）
+# 5. 喂给本 plugin（在 Claude Code / Claude Desktop 自然语言触发或敲 slash）
 #    例如："用 algokiller ciphertext 模式分析 ~/captures/login.trace.log，还原 X-Sign 密文 a3b2c1..."
 ```
 
@@ -210,7 +212,7 @@ algokiller-plugin/
 
 ---
 
-## 本地 smoke test（不进 Claude Desktop）
+## 本地 smoke test（不进任何 Claude 客户端）
 
 ```bash
 printf '%s\n' \
@@ -279,7 +281,7 @@ trace 看"发生了什么"，BN 看"代码长什么样"。装任一 BN MCP 自�
 }
 ```
 
-查 Claude Desktop MCP server 日志，找 `[algokiller-mcp]` 开头的 stderr 行定位。
+查 Claude 客户端的 MCP server 日志（Claude Desktop 在应用日志里，Claude Code 在 session stderr），找 `[algokiller-mcp]` 开头的 stderr 行定位。
 
 ### `bind_trace` 报 binary not found / Permission denied
 

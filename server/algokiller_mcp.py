@@ -2,7 +2,8 @@
 """algokiller MCP server — JSON-RPC 2.0 over stdio, zero external deps.
 
 Speaks MCP 2024-11-05 directly (initialize / tools/list / tools/call / ping).
-Designed to be launched by Claude Desktop's plugin runtime via .mcp.json.
+Designed to be launched by a Claude client's plugin runtime (Claude Code
+or Claude Desktop) via .mcp.json.
 
 The tool layer (schemas + handlers + dispatch table) lives in
 `server/tools/`; this module is now a thin JSON-RPC plumbing layer plus

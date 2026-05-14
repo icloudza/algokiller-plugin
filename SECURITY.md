@@ -23,11 +23,12 @@ release within **30 days** of confirmation.
 
 ## Threat model
 
-`algokiller-plugin` is invoked by Claude Desktop with the user's local
-privileges. It does **not** open network sockets, fetch remote content,
-or accept input from anywhere other than:
+`algokiller-plugin` is invoked by a Claude client (Claude Code or
+Claude Desktop) with the user's local privileges. It does **not** open
+network sockets, fetch remote content, or accept input from anywhere
+other than:
 
-1. The Claude Desktop MCP runtime (JSON-RPC 2.0 over stdio).
+1. The Claude client's MCP runtime (JSON-RPC 2.0 over stdio).
 2. The bound trace file (mmap, read-only).
 3. The user's local static-analysis CLIs invoked via
    `algokiller.run_static_tool` (argv list — never `/bin/sh`).

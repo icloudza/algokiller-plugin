@@ -25,7 +25,7 @@ Thanks for taking the time to look. Quick rules first, rationale below.
 
 ```
 algokiller-plugin/
-├── .claude-plugin/plugin.json   # Claude Desktop plugin manifest
+├── .claude-plugin/plugin.json   # Claude plugin manifest (Code + Desktop)
 ├── .mcp.json                    # MCP server declaration (stdio)
 ├── server/                      # Python MCP server (stdlib only)
 │   ├── algokiller_mcp.py        # JSON-RPC 2.0 router + tool handlers

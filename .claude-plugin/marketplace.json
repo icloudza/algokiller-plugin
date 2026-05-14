@@ -1,6 +1,6 @@
 {
     "name": "ak-suite",
-    "description": "AlgoKiller suite — ARM64 trace evidence analysis & cipher algorithm recovery. Claude Desktop plugin packaging the AlgoKiller methodology as skills + a local MCP server driving the native ak_search engine (15 subcommands) over GB-scale trace files.",
+    "description": "AlgoKiller suite — ARM64 trace evidence analysis & cipher algorithm recovery. Claude plugin (loadable from both Claude Code and Claude Desktop) packaging the AlgoKiller methodology as skills + a local MCP server driving the native ak_search engine (15 subcommands) over GB-scale trace files.",
     "owner": {
         "name": "cloudza",
         "url": "https://github.com/icloudza"

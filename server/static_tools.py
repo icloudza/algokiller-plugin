@@ -1,7 +1,7 @@
 """Allow-listed read-only static-analysis CLI runner.
 
 Why this module exists:
-    Claude Desktop has a Bash tool, but exposing arbitrary shell to a plugin
+    Claude clients (Claude Code / Claude Desktop) have a Bash tool, but exposing arbitrary shell to a plugin
     is risky and prompt-hard. This wrapper exposes a CURATED set of read-only
     binary-analysis CLIs (radare2 family, GNU binutils, LLVM tools, Mach-O /
     iOS specific, ripgrep, jq) through ONE MCP tool — `algokiller.run_static_tool`.
