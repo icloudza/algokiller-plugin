@@ -2,11 +2,11 @@
 
 **Language**: [中文](README.md) | **English**
 
-Claude Desktop plugin for ARM64 trace evidence analysis and cipher/algorithm recovery. Bundles the AlgoKiller methodology as skills, with a local MCP server driving the native `ak_search` engine (14 subcommands) over GB-scale traces.
+Claude plugin (works in both Claude Code CLI and Claude Desktop) for ARM64 trace evidence analysis and cipher/algorithm recovery. Bundles the AlgoKiller methodology as skills, with a local MCP server driving the native `ak_search` engine (14 subcommands) over GB-scale traces.
 
 > **Methodology + ak_search engine origin**: [AlgoKiller](https://github.com/lidongyooo/AlgoKiller) by [@lidongyooo](https://github.com/lidongyooo)
 > Upstream contributes the three core subcommands (`match` / `context` / `daemon` — mmap + BMH + line index + tab-protocol daemon) and the original methodology harness.
-> This repo extends the native engine with 11 additional subcommands (`regflow` / `producer` / `semop` / `lint` / `fold` / `callgraph` / `modgraph` / `hexblock` / `constscan` / `cryptoinstr` / `bytes` — see [tools/search/README.md](tools/search/README.md)) and packages everything as a Claude Desktop plugin. Original code copyright belongs to upstream; plugin extensions are MIT.
+> This repo extends the native engine with 11 additional subcommands (`regflow` / `producer` / `semop` / `lint` / `fold` / `callgraph` / `modgraph` / `hexblock` / `constscan` / `cryptoinstr` / `bytes` — see [tools/search/README.md](tools/search/README.md)) and packages everything as a Claude plugin (loadable from both Claude Code and Claude Desktop). Original code copyright belongs to upstream; plugin extensions are MIT.
 
 ---
 
@@ -74,7 +74,9 @@ cp ak_search ../../server/bin/ak_search
 
 > One-line install is at the top under [🚀 Quick install](#-quick-install).
 
-**Manual install (fallback)**: clone the repo, then Claude Desktop → `+` → **Plugins** → **Add plugin** → pick the directory.
+**Manual install (fallback)**: clone the repo, then
+- **Claude Desktop**: `+` → **Plugins** → **Add plugin** → pick the directory
+- **Claude Code**: run `claude plugin install .` from the repo root (or register it as a local marketplace via `claude plugin marketplace add <local-path>`)
 
 ```bash
 git clone https://github.com/icloudza/algokiller-plugin
@@ -114,7 +116,7 @@ frida -U -f com.example.app -l example.js
 # 4. Pull the trace back to macOS
 adb pull /data/data/com.example.app/trace.log ~/captures/login.trace.log
 
-# 5. Feed it to this plugin (free-form or slash in Claude Desktop)
+# 5. Feed it to this plugin (free-form or slash in Claude Code / Claude Desktop)
 #    e.g. "Use algokiller ciphertext mode on ~/captures/login.trace.log to recover the X-Sign cipher a3b2c1..."
 ```
 
@@ -197,7 +199,7 @@ algokiller-plugin/
 
 ---
 
-## Local smoke test (no Claude Desktop)
+## Local smoke test (no Claude client needed)
 
 ```bash
 printf '%s\n' \
@@ -266,7 +268,7 @@ Most likely cause: `${CLAUDE_PLUGIN_ROOT}` was not expanded by your Desktop buil
 }
 ```
 
-Check the Claude Desktop MCP server logs and grep for `[algokiller-mcp]` stderr lines.
+Check the Claude client MCP server logs (Claude Desktop's application logs, or Claude Code session stderr) and grep for `[algokiller-mcp]` stderr lines.
 
 ### `bind_trace` fails with "binary not found" / "Permission denied"
 

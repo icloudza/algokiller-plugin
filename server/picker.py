@@ -1,7 +1,8 @@
 """Cross-platform native directory picker for the `pick_output_dir` MCP tool.
 
-The plugin's primary battleground is GUI clients (Claude Desktop, Cursor,
-Codex). When the user wants to choose a report destination interactively,
+The plugin's primary battleground is GUI clients (Claude Code, Claude
+Desktop, Cursor, Codex). When the user wants to choose a report
+destination interactively,
 they say so; the agent calls `pick_output_dir(initial_dir=...)`, which
 shells out to the host's native folder picker:
 
@@ -37,7 +38,7 @@ PICKER_TIMEOUT_SECONDS = 120
 def _macos_pick(initial_dir: Optional[Path]) -> dict:
     """osascript folder picker. `initial_dir` becomes the default location
     when the dialog opens. We `activate` first to bring the dialog in
-    front of Claude Desktop / the calling app."""
+    front of the Claude client / calling app."""
     if initial_dir is not None and initial_dir.is_dir():
         default_loc = f' default location (POSIX file "{initial_dir}")'
     else:

@@ -79,8 +79,9 @@ def _find_latest_session() -> Path | None:
     written session directory by scanning the user's likely artifact
     roots in order.
 
-    The hook runs in the parent shell of Claude Desktop, which spawned
-    the MCP server; we don't have a reliable IPC channel back to it,
+    The hook runs in the parent shell of the Claude client (Claude Code
+    or Claude Desktop), which spawned the MCP server; we don't have a
+    reliable IPC channel back to it,
     so the disk is our only source of truth. The 5-priority routing
     means sessions can land in several places.
     """
